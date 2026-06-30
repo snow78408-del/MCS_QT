@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import threading
 import time
+from dataclasses import replace
 from typing import Any, Callable, Protocol, runtime_checkable
 
 try:
@@ -11,6 +12,8 @@ except Exception:  # pragma: no cover - handled at runtime for local video only
     cv2 = None
 
 from .models import RecognitionSnapshot
+
+INDUSTRIAL_CAMERA_BACKENDS = {"hikrobot", "basler", "daheng", "flir", "allied_vision", "gentl"}
 
 
 @runtime_checkable
@@ -71,6 +74,7 @@ class PipelineVisionService:
         self._worker: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._last_processed_frame_id = 0
+        self._last_processed_frame_timestamp = 0.0
         self._latest = self._empty_snapshot("当前无有效液滴通过")
 
     def _ensure_pipeline(self):
@@ -115,7 +119,33 @@ class PipelineVisionService:
             frame_height=0,
             video_source_type=self._video_source_type,
             video_source=self._video_source,
+            frame_id=0,
+            frame_single_cell_count=0,
+            frame_diameters=[],
+            frame_diameter_sum=0.0,
+            frame_avg_diameter=None,
+            frame_single_cell_rate=None,
+            frame_diameter_std=None,
+            frame_diameter_cv=None,
+            uniformity_valid=False,
+            uniformity_status="当前无液滴",
+            uniformity_reason=reason,
         )
+
+    def _snapshot_with_error(self, reason: str) -> RecognitionSnapshot:
+        with self._lock:
+            current = self._latest
+        if current.frame_png_base64:
+            return replace(
+                current,
+                valid_for_control=False,
+                timestamp=time.time(),
+                reason=reason,
+                control_reason=reason,
+                uniformity_valid=False,
+                uniformity_reason=reason,
+            )
+        return self._empty_snapshot(reason)
 
     def set_mvs_sdk_path(self, sdk_path: str) -> None:
         self._camera_service.set_mvs_sdk_path(sdk_path)
@@ -150,12 +180,20 @@ class PipelineVisionService:
             self._video_source = str(video_source or "0")
             self._pixel_to_micron = float(pixel_to_micron) if float(pixel_to_micron) > 0 else 1.0
             self._last_processed_frame_id = 0
+            self._last_processed_frame_timestamp = 0.0
             self._ensure_pipeline().reset()
             self._latest = self._empty_snapshot("视频输入已准备，等待识别")
 
         if self._is_realtime_mode():
             backend = self._selected_backend or _backend_from_mode(self._video_source_type)
-            self._camera_service.select_camera(self._video_source, backend or None)
+            selected = self._camera_service.select_camera(self._video_source, backend or None)
+            _require_industrial_camera(selected)
+            self._log(
+                "[VISION][CAMERA][SELECTED] "
+                f"source=industrial_camera backend={selected.get('selected_backend') or selected.get('backend_name')} "
+                f"vendor={selected.get('manufacturer')} model={selected.get('model')} "
+                f"serial={selected.get('serial_number')} unique_id={selected.get('unique_id')}"
+            )
             self._camera_service.open_camera()
             self._camera_service.start_camera_stream()
             deadline = time.time() + 3.0
@@ -165,6 +203,21 @@ class PipelineVisionService:
                 packet = self._camera_service.get_latest_frame()
             if not packet.valid or packet.image is None:
                 raise RuntimeError(packet.error or "实时相机未产生有效帧")
+            self._log(
+                "[VISION][CAMERA][FRAME][OK] "
+                f"backend={packet.source_backend} frame_id={packet.frame_id} "
+                f"width={packet.width} height={packet.height} pixel_format={packet.pixel_format}"
+            )
+            try:
+                snapshot = self._snapshot_from_frame(packet.image)
+                with self._lock:
+                    self._latest = snapshot
+                    self._last_processed_frame_id = int(packet.frame_id or 0)
+                    self._last_processed_frame_timestamp = float(packet.timestamp or time.time())
+            except Exception as exc:
+                self._log(f"[VISION][PREVIEW][WARN] initial frame process failed: {exc}")
+            self.start()
+            self._log("[VISION][PREVIEW][START] realtime preview loop started")
 
     def _open_capture(self):
         if cv2 is None:
@@ -217,9 +270,17 @@ class PipelineVisionService:
             packet = self._camera_service.get_latest_frame()
             if not packet.valid or packet.image is None:
                 return False, None, packet.error or "相机取帧异常"
-            if packet.frame_id == self._last_processed_frame_id:
+            frame_id = int(packet.frame_id or 0)
+            timestamp = float(packet.timestamp or 0.0)
+            if (
+                frame_id > 0
+                and timestamp > 0.0
+                and frame_id == self._last_processed_frame_id
+                and timestamp <= self._last_processed_frame_timestamp
+            ):
                 return False, None, ""
-            self._last_processed_frame_id = int(packet.frame_id)
+            self._last_processed_frame_id = frame_id
+            self._last_processed_frame_timestamp = timestamp or time.time()
             return True, packet.image, ""
 
         with self._lock:
@@ -233,19 +294,31 @@ class PipelineVisionService:
 
     def _snapshot_from_frame(self, frame) -> RecognitionSnapshot:
         result = self._ensure_pipeline().process_frame(frame)
-        avg_px = result.metrics.control.average_diameter
+        control = result.metrics.control
+        avg_px = control.frame_avg_diameter
         active_count = int(result.metrics.control.frame_droplet_count)
         total_count = int(result.metrics.control.total_droplet_count)
         new_cross = int(result.metrics.control.new_crossing_count)
         has_droplet = active_count > 0
         control_reason = str(result.metrics.control.reason or "")
         frame_b64, width, height = self._encode_png_base64(result.annotated_frame)
+        if frame_b64 is None:
+            frame_b64, width, height = self._encode_png_base64(frame)
+        scale = float(self._pixel_to_micron)
+        frame_diameters = [float(value) * scale for value in control.frame_diameters]
+        frame_avg_diameter = (float(avg_px) * scale) if avg_px is not None else None
+        frame_diameter_sum = float(control.frame_diameter_sum) * scale
+        frame_diameter_std = (
+            float(control.frame_diameter_std) * scale
+            if control.frame_diameter_std is not None
+            else None
+        )
         return RecognitionSnapshot(
             frame_droplet_count=active_count,
             total_droplet_count=total_count,
             new_crossing_count=new_cross,
-            avg_diameter=(float(avg_px) * self._pixel_to_micron) if avg_px is not None else None,
-            single_cell_rate=float(result.metrics.analysis.single_bead_rate),
+            avg_diameter=frame_avg_diameter,
+            single_cell_rate=float(control.frame_single_cell_rate or 0.0),
             valid_for_control=bool(result.metrics.control.valid_for_control and has_droplet),
             timestamp=time.time(),
             reason=control_reason,
@@ -258,6 +331,17 @@ class PipelineVisionService:
             frame_height=height,
             video_source_type=self._video_source_type,
             video_source=self._video_source,
+            frame_id=int(result.frame_index),
+            frame_single_cell_count=int(control.frame_single_cell_count),
+            frame_diameters=frame_diameters,
+            frame_diameter_sum=frame_diameter_sum,
+            frame_avg_diameter=frame_avg_diameter,
+            frame_single_cell_rate=control.frame_single_cell_rate,
+            frame_diameter_std=frame_diameter_std,
+            frame_diameter_cv=control.frame_diameter_cv,
+            uniformity_valid=bool(control.uniformity_valid),
+            uniformity_status=str(control.uniformity_status or ""),
+            uniformity_reason=str(control.uniformity_reason or ""),
         )
 
     def _loop(self) -> None:
@@ -266,7 +350,7 @@ class PipelineVisionService:
             if not ok:
                 if error and self._is_realtime_mode():
                     with self._lock:
-                        self._latest = self._empty_snapshot(error)
+                        self._latest = self._snapshot_with_error(error)
                 elif error:
                     break
                 time.sleep(0.03)
@@ -305,6 +389,17 @@ class PipelineVisionService:
                 frame_height=self._latest.frame_height,
                 video_source_type=self._latest.video_source_type,
                 video_source=self._latest.video_source,
+                frame_id=self._latest.frame_id,
+                frame_single_cell_count=self._latest.frame_single_cell_count,
+                frame_diameters=list(self._latest.frame_diameters),
+                frame_diameter_sum=self._latest.frame_diameter_sum,
+                frame_avg_diameter=self._latest.frame_avg_diameter,
+                frame_single_cell_rate=self._latest.frame_single_cell_rate,
+                frame_diameter_std=self._latest.frame_diameter_std,
+                frame_diameter_cv=self._latest.frame_diameter_cv,
+                uniformity_valid=self._latest.uniformity_valid,
+                uniformity_status=self._latest.uniformity_status,
+                uniformity_reason=self._latest.uniformity_reason,
             )
 
     def run_once(self) -> RecognitionSnapshot:
@@ -316,3 +411,14 @@ def _backend_from_mode(mode: str) -> str:
     aliases = {"alliedvision": "allied_vision"}
     value = aliases.get(value, value)
     return value if value in {"hikrobot", "basler", "daheng", "flir", "allied_vision", "gentl", "opencv"} else ""
+
+
+def _require_industrial_camera(device: dict[str, Any]) -> None:
+    backend = str(device.get("selected_backend", "") or device.get("backend_name", "") or "").strip().lower()
+    device_type = str(device.get("device_type", "") or "").strip().lower()
+    if backend in INDUSTRIAL_CAMERA_BACKENDS and device_type == "industrial_camera":
+        return
+    raise RuntimeError(
+        "Realtime video must use an industrial camera. "
+        f"Selected backend={backend or '--'}, device_type={device_type or '--'}."
+    )

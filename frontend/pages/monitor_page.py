@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import base64
 import tkinter as tk
@@ -34,23 +34,32 @@ class MonitorPage(ttk.Frame):
         self.ch2_exec_var = tk.StringVar(value="--")
         self.reason_var = tk.StringVar(value="--")
 
+        self.pid_mode_var = tk.StringVar(value="--")
+        self.pid_gains_var = tk.StringVar(value="--")
+        self.adaptive_var = tk.StringVar(value="--")
+        self.feedforward_var = tk.StringVar(value="--")
+        self.pid_output_var = tk.StringVar(value="--")
+        self.feedforward_output_var = tk.StringVar(value="--")
+        self.final_output_var = tk.StringVar(value="--")
+        self.model_state_var = tk.StringVar(value="--")
+        self.model_confidence_var = tk.StringVar(value="--")
+        self.predicted_change_var = tk.StringVar(value="--")
+        self.model_version_var = tk.StringVar(value="--")
+        self.model_sample_count_var = tk.StringVar(value="--")
         self.video_mode_var = tk.StringVar(value="--")
         self.video_source_var = tk.StringVar(value="--")
         self.video_res_var = tk.StringVar(value="--")
 
         self._canvas: tk.Canvas | None = None
         self._content: ttk.Frame | None = None
-        self._scrollbar: ttk.Scrollbar | None = None
         self._content_window_id: int | None = None
-
         self._build()
 
     def _build(self) -> None:
         self._canvas = tk.Canvas(self, highlightthickness=0, borderwidth=0)
-        self._scrollbar = ttk.Scrollbar(self, orient="vertical", command=self._canvas.yview)
-        self._canvas.configure(yscrollcommand=self._scrollbar.set)
-
-        self._scrollbar.pack(side="right", fill="y")
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
         self._canvas.pack(side="left", fill="both", expand=True)
 
         self._content = ttk.Frame(self._canvas)
@@ -74,62 +83,76 @@ class MonitorPage(ttk.Frame):
             on_stop=self._on_stop,
         )
 
-        video_frame = ttk.LabelFrame(self._content, text="视频画面")
-        video_frame.pack(fill="x", padx=10, pady=6)
+        main = ttk.Frame(self._content)
+        main.pack(fill="both", expand=True, padx=10, pady=6)
+        main.columnconfigure(0, weight=3)
+        main.columnconfigure(1, weight=2)
 
-        self.video_label = ttk.Label(video_frame, text="等待视频帧...")
-        self.video_label.pack(anchor="w", padx=6, pady=6)
+        video_frame = ttk.LabelFrame(main, text="工业相机实时视频画面")
+        video_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=0)
+        self.video_label = ttk.Label(video_frame, text="等待开始", anchor="center")
+        self.video_label.pack(fill="both", expand=True, padx=6, pady=6)
 
         meta = ttk.Frame(video_frame)
-        meta.pack(fill="x", padx=6, pady=2)
+        meta.pack(fill="x", padx=6, pady=(0, 6))
         ttk.Label(meta, text="视频模式:").grid(row=0, column=0, sticky="w", padx=3, pady=1)
         ttk.Label(meta, textvariable=self.video_mode_var).grid(row=0, column=1, sticky="w", padx=3, pady=1)
-        ttk.Label(meta, text="视频源:").grid(row=0, column=2, sticky="w", padx=3, pady=1)
+        ttk.Label(meta, text="视频来源:").grid(row=0, column=2, sticky="w", padx=3, pady=1)
         ttk.Label(meta, textvariable=self.video_source_var).grid(row=0, column=3, sticky="w", padx=3, pady=1)
         ttk.Label(meta, text="分辨率:").grid(row=0, column=4, sticky="w", padx=3, pady=1)
         ttk.Label(meta, textvariable=self.video_res_var).grid(row=0, column=5, sticky="w", padx=3, pady=1)
+        meta.columnconfigure(3, weight=1)
 
-        info_row = ttk.Frame(self._content)
-        info_row.pack(fill="x", padx=10, pady=6)
+        right = ttk.Frame(main)
+        right.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=0)
+        self.recognition_panel = RecognitionPanel(right)
+        self.recognition_panel.pack(fill="x", expand=False, pady=(0, 6))
+        self.pump_panel = PumpPanel(right)
+        self.pump_panel.pack(fill="x", expand=False, pady=(6, 0))
 
-        self.recognition_panel = RecognitionPanel(info_row)
-        self.recognition_panel.pack(side="left", fill="both", expand=True, padx=3)
+        lower = ttk.Frame(self._content)
+        lower.pack(fill="x", padx=10, pady=6)
+        self.status_panel = StatusPanel(lower)
+        self.status_panel.pack(side="left", fill="both", expand=True, padx=(0, 4))
 
-        self.pump_panel = PumpPanel(info_row)
-        self.pump_panel.pack(side="left", fill="both", expand=True, padx=3)
-
-        self.status_panel = StatusPanel(info_row)
-        self.status_panel.pack(side="left", fill="both", expand=True, padx=3)
-
-        ctrl_frame = ttk.LabelFrame(self._content, text="PID 控制结果")
-        ctrl_frame.pack(fill="x", padx=10, pady=(6, 10))
+        ctrl_frame = ttk.LabelFrame(lower, text="PID 控制结果")
+        ctrl_frame.pack(side="left", fill="both", expand=True, padx=(4, 0))
         rows = [
-            ("直径误差", self.err_var),
+            ("PID mode", self.pid_mode_var),
+            ("kp / ki / kd", self.pid_gains_var),
+            ("adaptive active", self.adaptive_var),
+            ("feedforward active", self.feedforward_var),
+            ("PID output", self.pid_output_var),
+            ("feedforward output", self.feedforward_output_var),
+            ("final output", self.final_output_var),
+            ("model state", self.model_state_var),
+            ("model confidence", self.model_confidence_var),
+            ("predicted diameter change", self.predicted_change_var),
+            ("model version", self.model_version_var),
+            ("recorded samples", self.model_sample_count_var),            ("直径误差", self.err_var),
             ("PID 调节量", self.adjust_var),
             ("反馈冻结", self.freeze_var),
             ("建议停机", self.stop_var),
             ("Q1 指令", self.q1_cmd_var),
-            ("Q1 实时灌注速度", self.q1_actual_var),
+            ("Q1 回读流速", self.q1_actual_var),
             ("CH1执行状态", self.ch1_exec_var),
             ("Q2 指令", self.q2_cmd_var),
-            ("Q2 实时灌注速度", self.q2_actual_var),
+            ("Q2 回读流速", self.q2_actual_var),
             ("CH2执行状态", self.ch2_exec_var),
             ("原因", self.reason_var),
         ]
         for i, (name, var) in enumerate(rows):
             ttk.Label(ctrl_frame, text=f"{name}:").grid(row=i, column=0, padx=4, pady=2, sticky="w")
-            ttk.Label(ctrl_frame, textvariable=var).grid(row=i, column=1, padx=4, pady=2, sticky="w")
+            ttk.Label(ctrl_frame, textvariable=var, wraplength=360).grid(row=i, column=1, padx=4, pady=2, sticky="w")
         ctrl_frame.columnconfigure(1, weight=1)
 
     def _on_content_configure(self, _event=None) -> None:
-        if self._canvas is None:
-            return
-        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+        if self._canvas is not None:
+            self._canvas.configure(scrollregion=self._canvas.bbox("all"))
 
     def _on_canvas_configure(self, event) -> None:
-        if self._canvas is None or self._content_window_id is None:
-            return
-        self._canvas.itemconfigure(self._content_window_id, width=event.width)
+        if self._canvas is not None and self._content_window_id is not None:
+            self._canvas.itemconfigure(self._content_window_id, width=event.width)
 
     def _bind_mousewheel(self) -> None:
         if self._canvas is None:
@@ -193,17 +216,25 @@ class MonitorPage(ttk.Frame):
             return "失败"
         return "已执行"
 
+    @staticmethod
+    def _channel_flow(snapshot, name: str) -> str:
+        state = snapshot.pump_state if snapshot is not None else None
+        if state is None or not state.channels:
+            return "--"
+        channel = state.channels.get(name)
+        if channel is None or channel.actual_flow_rate is None:
+            return "--"
+        return f"{float(channel.actual_flow_rate):.6f}"
+
     def _poll_once(self) -> None:
+        # Monitor refresh is read-only: one snapshot read, then UI formatting only.
         snap = self.app.orchestrator.get_snapshot()
         self.recognition_panel.update_snapshot(snap)
         self.pump_panel.update_snapshot(snap)
         self.status_panel.update_snapshot(snap)
-        if snap.pump_state is not None:
-            self.q1_actual_var.set(f"{float(snap.pump_state.q1):.6f}")
-            self.q2_actual_var.set(f"{float(snap.pump_state.q2):.6f}")
-        else:
-            self.q1_actual_var.set("--")
-            self.q2_actual_var.set("--")
+
+        self.q1_actual_var.set(self._channel_flow(snap, "Q1"))
+        self.q2_actual_var.set(self._channel_flow(snap, "Q2"))
 
         rec = snap.recognition
         if rec is not None:
@@ -217,8 +248,19 @@ class MonitorPage(ttk.Frame):
 
         ctrl = snap.control
         if ctrl is not None:
+            self.pid_mode_var.set(str(getattr(ctrl, "control_mode", "--") or "--"))
+            self.pid_gains_var.set(
+                f"{float(getattr(ctrl, 'kp', 0.0)):.6f} / "
+                f"{float(getattr(ctrl, 'ki', 0.0)):.6f} / "
+                f"{float(getattr(ctrl, 'kd', 0.0)):.6f}"
+            )
+            self.adaptive_var.set("yes" if bool(getattr(ctrl, "adaptive_active", False)) else "no")
+            self.feedforward_var.set("yes" if bool(getattr(ctrl, "feedforward_active", False)) else "no")
             self.err_var.set(f"{ctrl.diameter_error:.6f}")
             self.adjust_var.set(f"{ctrl.adjustment:.6f}")
+            self.pid_output_var.set(f"{float(getattr(ctrl, 'pid_output', 0.0)):.6f}")
+            self.feedforward_output_var.set(f"{float(getattr(ctrl, 'feedforward_output', 0.0)):.6f}")
+            self.final_output_var.set(f"{float(getattr(ctrl, 'final_output', ctrl.adjustment)):.6f}")
             self.freeze_var.set("是" if ctrl.freeze_feedback else "否")
             self.stop_var.set("是" if ctrl.suggested_stop else "否")
             self.q1_cmd_var.set(f"{ctrl.q1_command:.6f}")
@@ -227,9 +269,23 @@ class MonitorPage(ttk.Frame):
             self.ch1_exec_var.set(self._parse_channel_status(ctrl.reason or "", 1))
             self.ch2_exec_var.set(self._parse_channel_status(ctrl.reason or "", 2))
 
+        model_status = getattr(snap, "disturbance_model", None) or {}
+        prediction = getattr(snap, "disturbance_prediction", None) or {}
+        if model_status:
+            self.model_state_var.set(str(model_status.get("state", "--")))
+            self.model_confidence_var.set(f"{float(model_status.get('confidence', 0.0) or 0.0):.3f}")
+            self.model_version_var.set(str(model_status.get("model_version", "") or "--"))
+            self.model_sample_count_var.set(str(model_status.get("sample_count", "--")))
+        if prediction:
+            value = prediction.get("predicted_diameter_change_um")
+            self.predicted_change_var.set("--" if value is None else f"{float(value):.3f} um")
         state_val = snap.system_state.value if hasattr(snap.system_state, "value") else str(snap.system_state)
-        self.buttons.update_by_state(SystemState(state_val))
-        self._poll_job = self.after(self.app.refresh_interval_ms, self._poll_once)
+        try:
+            self.buttons.update_by_state(SystemState(state_val))
+        except Exception:
+            pass
+        interval_ms = max(200, min(500, int(getattr(self.app, "refresh_interval_ms", 300))))
+        self._poll_job = self.after(interval_ms, self._poll_once)
 
     def _on_init(self) -> None:
         self.app.show_page("init")

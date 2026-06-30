@@ -11,7 +11,7 @@ class InitPage(ttk.Frame):
         self.app = app
         self.q1_var = tk.StringVar(value="100")
         self.q2_var = tk.StringVar(value="100")
-        self.port_var = tk.StringVar(value="COM3")
+        self.port_var = tk.StringVar(value="COM12")
         self.addr_var = tk.StringVar(value="1")
         self.baud_var = tk.StringVar(value="1200")
         self.parity_var = tk.StringVar(value="E")
@@ -24,9 +24,11 @@ class InitPage(ttk.Frame):
 
         ttk.Label(card, text="初始 Q1 流速").grid(row=0, column=0, padx=8, pady=8, sticky="w")
         ttk.Entry(card, textvariable=self.q1_var, width=24).grid(row=0, column=1, padx=8, pady=8, sticky="w")
+        ttk.Label(card, text="uL/min").grid(row=0, column=2, padx=8, pady=8, sticky="w")
 
         ttk.Label(card, text="初始 Q2 流速").grid(row=1, column=0, padx=8, pady=8, sticky="w")
         ttk.Entry(card, textvariable=self.q2_var, width=24).grid(row=1, column=1, padx=8, pady=8, sticky="w")
+        ttk.Label(card, text="uL/min").grid(row=1, column=2, padx=8, pady=8, sticky="w")
 
         ttk.Label(card, text="泵串口号").grid(row=2, column=0, padx=8, pady=8, sticky="w")
         ttk.Entry(card, textvariable=self.port_var, width=24).grid(row=2, column=1, padx=8, pady=8, sticky="w")
@@ -65,13 +67,13 @@ class InitPage(ttk.Frame):
             q1 = float(self.q1_var.get().strip())
             q2 = float(self.q2_var.get().strip())
             if q1 <= 0:
-                raise ValueError("初始 Q1 流速必须大于 0")
+                raise ValueError("初始 Q1 流速必须大于 0，单位为 uL/min")
             if q2 <= 0:
-                raise ValueError("初始 Q2 流速必须大于 0")
+                raise ValueError("初始 Q2 流速必须大于 0，单位为 uL/min")
 
             port = self.port_var.get().strip().upper()
             if not port:
-                raise ValueError("泵串口号不能为空，例如 COM3")
+                raise ValueError("泵串口号不能为空，例如 COM12")
 
             addr = int(self.addr_var.get().strip())
             if not (0 <= addr <= 255):
@@ -108,7 +110,8 @@ class InitPage(ttk.Frame):
             self.status_var.set("初始化失败")
             detail = str(err)
             diagnose = (
-                f"当前参数: port={port}, addr={addr}, baud={baud}, parity={parity}, q1={q1}, q2={q2}\n\n"
+                f"当前参数: port={port}, addr={addr}, baud={baud}, parity={parity}, "
+                f"q1={q1} uL/min, q2={q2} uL/min\n\n"
                 "建议检查:\n"
                 "1. 串口号是否正确且未被其他软件占用\n"
                 "2. 泵地址/波特率/校验位是否与设备一致\n"

@@ -14,6 +14,20 @@ class PumpConnectionState:
 
 
 @dataclass(slots=True)
+class PumpChannelState:
+    logical_name: str
+    physical_channel: str
+    enabled: bool
+    running: bool
+    communication_ok: bool
+    target_flow_rate: float | None
+    actual_flow_rate: float | None
+    flow_rate_unit: str = "uL/min"
+    last_readback_time: float | None = None
+    error: str = ""
+
+
+@dataclass(slots=True)
 class SystemSetup:
     enable_mask: int
     copy_mask: int

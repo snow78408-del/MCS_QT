@@ -21,3 +21,24 @@
 - 单胞率仅识别和显示，不参与控制。
 - 当样本不足时，应冻结控制输出。
 - 当任一关键流速小于等于 0 时，应触发停机逻辑。
+# PID Control
+
+`pid_control` owns all feedback-control math. The orchestrator passes a
+`PIDInput` and receives a `PIDCommand`; it does not calculate PID gains or
+feedforward compensation itself.
+
+Supported modes:
+
+- `CLASSIC_PID`: fixed base `kp/ki/kd`, no feedforward.
+- `ADAPTIVE_PID`: bounded, interval-based `kp/ki/kd` adaptation.
+- `ADAPTIVE_PID_WITH_FEEDFORWARD`: adaptive PID plus disturbance-model
+  feedforward.
+
+Safety behavior is internal to this package:
+
+- invalid vision or pump communication freezes feedback,
+- repeated `frame_id` is rejected,
+- integral/output/feedforward are bounded,
+- output rate changes are limited,
+- feedforward falls back to zero when the model is stale, invalid, or low
+  confidence.

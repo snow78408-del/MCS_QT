@@ -26,6 +26,16 @@ class ControlMetrics:
     frame_droplet_count: int
     total_droplet_count: int
     new_crossing_count: int
+    frame_single_cell_count: int
+    frame_diameters: list[float]
+    frame_diameter_sum: float
+    frame_avg_diameter: float | None
+    frame_single_cell_rate: float | None
+    frame_diameter_std: float | None
+    frame_diameter_cv: float | None
+    uniformity_valid: bool
+    uniformity_status: str
+    uniformity_reason: str
 
 
 @dataclass
@@ -41,6 +51,16 @@ class AnalysisMetrics:
     multi_bead_rate: float
     frame_droplet_count: int
     new_crossing_count: int
+    frame_single_cell_count: int
+    frame_diameters: list[float]
+    frame_diameter_sum: float
+    frame_avg_diameter: float | None
+    frame_single_cell_rate: float | None
+    frame_diameter_std: float | None
+    frame_diameter_cv: float | None
+    uniformity_valid: bool
+    uniformity_status: str
+    uniformity_reason: str
 
 
 @dataclass
@@ -90,18 +110,18 @@ class MetricsCalculator:
         if crossed and age_ok and disp_ok:
             state.counted = True
             self._counted_track_ids.add(track.id)
-            self._log(f"[VISION][COUNT] 新增真实液滴计数: track_id={track.id}, total={len(self._counted_track_ids)}")
+            self._log(
+                f"[VISION][COUNT] new real droplet count: track_id={track.id}, "
+                f"total={len(self._counted_track_ids)}"
+            )
             return True
         return False
 
     def update(self, tracking: TrackingResult, beads: BeadResult, frame_height: int) -> MetricsResult:
         line_y = float(max(1, frame_height) * float(self._config.count_line_ratio))
 
-        # 仅统计“本帧真实观测到”的轨迹：
-        # - matched_pairs: 旧轨迹在本帧有检测匹配
-        # - new_track_ids: 本帧新建轨迹
-        # 避免把 unmatched 的预测轨迹计入当前帧液滴数。
-        observed_track_ids: set[int] = set(track_id for track_id, _ in tracking.matched_pairs)
+        # Only tracks observed in this exact frame are allowed into current-frame statistics.
+        observed_track_ids: set[int] = set(int(track_id) for track_id, _ in tracking.matched_pairs)
         observed_track_ids.update(int(track_id) for track_id in tracking.new_track_ids)
 
         valid_tracks: list[DropletTrack] = [
@@ -110,6 +130,7 @@ class MetricsCalculator:
             if int(track.id) in observed_track_ids
             and int(track.age) >= int(self._config.min_track_age_for_count)
         ]
+        valid_track_ids = {int(track.id) for track in valid_tracks}
         frame_droplet_count = len(valid_tracks)
 
         frame_diameters: list[float] = []
@@ -120,20 +141,24 @@ class MetricsCalculator:
             if self._update_crossing_count(track, line_y):
                 new_crossing_count += 1
 
-        # 清理已删除轨迹状态，避免状态泄漏导致误判。
         for track_id in tracking.removed_track_ids:
             self._track_state.pop(int(track_id), None)
             self._track_bead_max.pop(int(track_id), None)
 
-        if frame_droplet_count > 0 and frame_diameters:
+        if frame_diameters:
             self._diameter_history.extend(frame_diameters)
         else:
-            self._log("[VISION][NO_DROPLET] 当前无有效液滴通过，不计数")
+            self._log("[VISION][NO_DROPLET] current frame has no valid droplets")
 
+        frame_bead_counts: dict[int, int] = {}
         for droplet in beads.droplets:
-            prev_max = self._track_bead_max.get(int(droplet.droplet_id), 0)
-            if int(droplet.bead_count) > prev_max:
-                self._track_bead_max[int(droplet.droplet_id)] = int(droplet.bead_count)
+            droplet_id = int(droplet.droplet_id)
+            bead_count = int(droplet.bead_count)
+            if droplet_id in valid_track_ids:
+                frame_bead_counts[droplet_id] = bead_count
+            prev_max = self._track_bead_max.get(droplet_id, 0)
+            if bead_count > prev_max:
+                self._track_bead_max[droplet_id] = bead_count
 
         counted_ids = sorted(self._counted_track_ids)
         bead_counts = [self._track_bead_max.get(track_id, 0) for track_id in counted_ids]
@@ -143,23 +168,58 @@ class MetricsCalculator:
         single_count = sum(1 for value in bead_counts if value == 1)
         multi_count = sum(1 for value in bead_counts if value >= 2)
 
-        average_diameter = float(np.mean(frame_diameters)) if frame_diameters else None
-        sample_size = len(self._diameter_history)
+        frame_single_cell_count = sum(1 for value in frame_bead_counts.values() if int(value) == 1)
+        frame_single_cell_rate = (
+            (float(frame_single_cell_count) / float(frame_droplet_count)) * 100.0
+            if frame_droplet_count > 0
+            else None
+        )
 
+        frame_diameter_sum = float(sum(frame_diameters)) if frame_diameters else 0.0
+        frame_avg_diameter = float(np.mean(frame_diameters)) if frame_diameters else None
+        frame_diameter_std = float(np.std(frame_diameters, ddof=0)) if frame_diameters else None
+        if frame_avg_diameter is not None and frame_avg_diameter > 0.0 and frame_diameter_std is not None:
+            frame_diameter_cv = float(frame_diameter_std / frame_avg_diameter * 100.0)
+        else:
+            frame_diameter_cv = None
+
+        uniformity_valid = False
+        uniformity_status = "样本不足"
+        uniformity_reason = ""
+        if frame_droplet_count <= 0:
+            uniformity_status = "当前无液滴"
+            uniformity_reason = "当前帧无有效液滴"
+        elif len(frame_diameters) <= 1:
+            uniformity_status = "样本不足"
+            uniformity_reason = "当前帧仅有一个液滴，均匀程度样本不足"
+        elif frame_diameter_cv is None:
+            uniformity_status = "样本不足"
+            uniformity_reason = "当前帧平均直径无效，无法计算均匀程度"
+        else:
+            uniformity_valid = True
+            if frame_diameter_cv <= float(self._config.uniformity_good_threshold):
+                uniformity_status = "均匀"
+            elif frame_diameter_cv <= float(self._config.uniformity_normal_threshold):
+                uniformity_status = "一般"
+            else:
+                uniformity_status = "波动较大"
+
+        average_diameter = frame_avg_diameter
+        sample_size = len(frame_diameters)
         valid_for_control = True
         reason = "ok"
-        if total_droplets <= 0 or frame_droplet_count == 0:
+        if frame_droplet_count == 0:
             valid_for_control = False
-            reason = "当前无有效液滴通过，不计数"
-        elif sample_size < int(self._config.min_samples_for_control):
+            reason = "当前帧无有效液滴"
+        elif average_diameter is None or average_diameter <= 0.0:
             valid_for_control = False
-            reason = "有效样本不足"
+            reason = "当前帧平均直径无效"
         elif frame_droplet_count < int(self._config.min_active_for_control):
             valid_for_control = False
-            reason = "当前有效液滴不足"
-        elif average_diameter is None:
+            reason = "当前帧有效液滴数量不足"
+        elif sample_size < int(self._config.min_samples_for_control):
             valid_for_control = False
-            reason = "当前无有效直径样本"
+            reason = "当前帧控制样本数不足"
 
         denom = float(total_droplets) if total_droplets > 0 else 1.0
         analysis = AnalysisMetrics(
@@ -167,13 +227,23 @@ class MetricsCalculator:
             average_diameter=average_diameter,
             current_valid_droplets=frame_droplet_count,
             single_bead_count=single_count,
-            single_bead_rate=(single_count / denom) * 100.0 if total_droplets else 0.0,
+            single_bead_rate=frame_single_cell_rate if frame_single_cell_rate is not None else 0.0,
             empty_count=empty_count,
             empty_rate=(empty_count / denom) * 100.0 if total_droplets else 0.0,
             multi_bead_count=multi_count,
             multi_bead_rate=(multi_count / denom) * 100.0 if total_droplets else 0.0,
             frame_droplet_count=frame_droplet_count,
             new_crossing_count=new_crossing_count,
+            frame_single_cell_count=frame_single_cell_count,
+            frame_diameters=list(frame_diameters),
+            frame_diameter_sum=frame_diameter_sum,
+            frame_avg_diameter=frame_avg_diameter,
+            frame_single_cell_rate=frame_single_cell_rate,
+            frame_diameter_std=frame_diameter_std,
+            frame_diameter_cv=frame_diameter_cv,
+            uniformity_valid=uniformity_valid,
+            uniformity_status=uniformity_status,
+            uniformity_reason=uniformity_reason,
         )
 
         control = ControlMetrics(
@@ -185,6 +255,16 @@ class MetricsCalculator:
             frame_droplet_count=frame_droplet_count,
             total_droplet_count=total_droplets,
             new_crossing_count=new_crossing_count,
+            frame_single_cell_count=frame_single_cell_count,
+            frame_diameters=list(frame_diameters),
+            frame_diameter_sum=frame_diameter_sum,
+            frame_avg_diameter=frame_avg_diameter,
+            frame_single_cell_rate=frame_single_cell_rate,
+            frame_diameter_std=frame_diameter_std,
+            frame_diameter_cv=frame_diameter_cv,
+            uniformity_valid=uniformity_valid,
+            uniformity_status=uniformity_status,
+            uniformity_reason=uniformity_reason,
         )
 
         return MetricsResult(control=control, analysis=analysis)

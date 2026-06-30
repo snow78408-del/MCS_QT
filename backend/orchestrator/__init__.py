@@ -9,6 +9,8 @@ from .config import (
 )
 from .models import (
     ControlSnapshot,
+    FrameSnapshot,
+    PumpChannelState,
     PumpRuntimeState,
     RecognitionSnapshot,
     SystemConfig,
@@ -24,6 +26,8 @@ __all__ = [
     "SystemState",
     "SystemConfig",
     "RecognitionSnapshot",
+    "FrameSnapshot",
+    "PumpChannelState",
     "PumpRuntimeState",
     "ControlSnapshot",
     "SystemSnapshot",

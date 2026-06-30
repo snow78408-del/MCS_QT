@@ -135,12 +135,30 @@ class GenTLCameraAdapter(BaseCameraAdapter):
         self.close()
         _prepare_harvesters_xml_dir(self.config)
         self._harvester = Harvester()
-        for path in _cti_paths(self.config):
-            self._harvester.add_file(str(path))
-        self._harvester.update()
-        index = int(device_info.device_id.split(":", 1)[1])
-        self._ia = self._harvester.create(index)
-        self._device = device_info
+        try:
+            paths = _cti_paths(self.config)
+            if not paths:
+                raise CameraBackendError("No GenTL Producer .cti file was found.")
+            for path in paths:
+                self._harvester.add_file(str(path))
+            self._harvester.update()
+            index = _resolve_device_index(device_info, self._harvester.device_info_list)
+            self._ia = self._harvester.create(index)
+            self._device = device_info
+        except CameraBackendError:
+            self.close()
+            raise
+        except IndexError as exc:
+            self.close()
+            raise CameraBackendError(
+                "The selected GenTL camera is no longer available. Refresh the camera list and try again."
+            ) from exc
+        except UnicodeDecodeError as exc:
+            self.close()
+            raise CameraBackendError(_gentl_xml_encoding_error(exc)) from exc
+        except Exception as exc:
+            self.close()
+            raise CameraBackendError(f"Failed to open GenTL camera: {exc}") from exc
 
     def close(self) -> None:
         self.stop_stream()
@@ -342,3 +360,41 @@ def _unique_id(manufacturer: str, model: str, serial: str, fallback: str) -> str
     if manufacturer and model and serial:
         return f"{manufacturer}:{model}:{serial}"
     return f"gentl:{fallback}"
+
+
+def _gentl_xml_encoding_error(exc: UnicodeDecodeError) -> str:
+    return (
+        "The GenTL camera description XML is not valid UTF-8, so Harvester cannot open this camera. "
+        "Try the camera vendor backend/SDK first, or update/reinstall the vendor GenTL Producer (.cti). "
+        f"Original decode error: {exc}"
+    )
+
+
+def _resolve_device_index(device_info: CameraDeviceInfo, device_info_list: Any) -> int:
+    devices = list(device_info_list or [])
+    if not devices:
+        raise CameraBackendError("No GenTL camera was found. Check the camera connection, then refresh the device list.")
+
+    selected_serial = str(device_info.serial_number or "")
+    selected_unique_id = str(device_info.unique_id or "")
+    for index, info in enumerate(devices):
+        manufacturer = str(getattr(info, "vendor", "") or getattr(info, "manufacturer", "") or "GenTL")
+        model = str(getattr(info, "model", "") or "")
+        serial = str(getattr(info, "serial_number", "") or getattr(info, "serial", "") or "")
+        producer = str(getattr(info, "tl_type", "") or "")
+        if selected_serial and serial == selected_serial:
+            return index
+        if selected_unique_id and _unique_id(manufacturer, model, serial, producer or f"index:{index}") == selected_unique_id:
+            return index
+
+    try:
+        selected_index = int(str(device_info.device_id).split(":", 1)[1])
+    except (IndexError, ValueError) as exc:
+        raise CameraBackendError(f"Invalid GenTL device id: {device_info.device_id}") from exc
+    if 0 <= selected_index < len(devices):
+        return selected_index
+
+    raise CameraBackendError(
+        f"The selected GenTL camera index {selected_index} is unavailable; {len(devices)} camera(s) were found. "
+        "Refresh the camera list and try again."
+    )

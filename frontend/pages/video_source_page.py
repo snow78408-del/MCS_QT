@@ -318,6 +318,16 @@ class VideoSourcePage(ttk.Frame):
     def _selected_device(self) -> dict[str, object] | None:
         return self._display_to_device.get(self.device_var.get())
 
+    def _selected_industrial_error(self, device: dict[str, object]) -> str:
+        dtype = str(device.get("device_type", "") or "").strip().lower()
+        backend = str(self.backend_var.get() or device.get("selected_backend", "") or device.get("backend_name", ""))
+        backend = backend.strip().lower()
+        if dtype != "industrial_camera":
+            return f"Realtime monitoring must use an industrial camera; selected device_type={dtype or '--'}."
+        if backend == "opencv":
+            return "Realtime monitoring must use the Hikrobot MVS SDK backend, not OpenCV/USB."
+        return ""
+
     def _on_device_selected(self) -> None:
         device = self._selected_device()
         self._mark_untested()
@@ -409,6 +419,10 @@ class VideoSourcePage(ttk.Frame):
             if device is None:
                 messagebox.showerror("输入错误", "请先扫描并选择相机设备")
                 return
+            industrial_error = self._selected_industrial_error(device)
+            if industrial_error:
+                messagebox.showerror("Camera source error", industrial_error)
+                return
             if not self._selected_test_ok:
                 messagebox.showerror("输入错误", "请先执行测试取帧，成功后才能进入实时监控")
                 return
@@ -417,6 +431,13 @@ class VideoSourcePage(ttk.Frame):
             self.app.frontend_config["camera_backend"] = self.backend_var.get().strip()
             self.app.frontend_config["camera_device"] = dict(device)
             self.app.frontend_config["camera_parameters"] = self._camera_params()
+            logger = getattr(self.app, "runtime_logger", None)
+            if callable(logger):
+                logger(
+                    "[UI][CAMERA][CONFIRMED] "
+                    f"backend={self.app.frontend_config['camera_backend']} "
+                    f"unique_id={self.app.frontend_config['video_source']}"
+                )
         else:
             path = self.file_var.get().strip()
             if not path or not os.path.isfile(path):

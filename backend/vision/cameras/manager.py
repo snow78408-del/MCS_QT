@@ -183,6 +183,10 @@ class CameraManager:
                 "[CAMERA][OPEN][OK] "
                 f"vendor={device.manufacturer} model={device.model} sn={device.serial_number} backend={device.selected_backend}"
             )
+        except CameraBackendError as exc:
+            self._last_error = str(exc)
+            self._log(f"[CAMERA][OPEN][FAIL] backend={device.selected_backend} error={exc}")
+            raise
         except Exception as exc:
             logging.exception("camera open failed")
             self._last_error = str(exc)

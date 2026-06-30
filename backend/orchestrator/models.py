@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Any, Optional
 
+from ..pump_hardware.models import PumpChannelState
 from .state import SystemState
 
 
@@ -43,6 +44,28 @@ class RecognitionSnapshot:
     frame_height: int = 0
     video_source_type: str = ""
     video_source: str = ""
+    frame_id: int = 0
+    frame_single_cell_count: int = 0
+    frame_diameters: list[float] = field(default_factory=list)
+    frame_diameter_sum: float = 0.0
+    frame_avg_diameter: float | None = None
+    frame_single_cell_rate: float | None = None
+    frame_diameter_std: float | None = None
+    frame_diameter_cv: float | None = None
+    uniformity_valid: bool = False
+    uniformity_status: str = "样本不足"
+    uniformity_reason: str = ""
+
+
+@dataclass(slots=True)
+class FrameSnapshot:
+    frame_id: int
+    timestamp: float
+    width: int
+    height: int
+    valid: bool
+    frame_png_base64: Optional[str] = None
+    reason: str = ""
 
 
 @dataclass(slots=True)
@@ -54,8 +77,12 @@ class PumpRuntimeState:
     q2: float
     running: bool
     last_error: str
+    q1_actual: float | None = None
+    q2_actual: float | None = None
     last_update_ok: bool = False
     last_update_reason: str = ""
+    channels: dict[str, PumpChannelState] = field(default_factory=dict)
+    last_readback_time: float | None = None
 
 
 @dataclass(slots=True)
@@ -68,6 +95,19 @@ class ControlSnapshot:
     suggested_stop: bool
     reason: str
     timestamp: float
+    p_term: float = 0.0
+    i_term: float = 0.0
+    d_term: float = 0.0
+    pid_output: float = 0.0
+    feedforward_output: float = 0.0
+    final_output: float = 0.0
+    kp: float = 0.0
+    ki: float = 0.0
+    kd: float = 0.0
+    adaptive_active: bool = False
+    feedforward_active: bool = False
+    control_mode: str = "CLASSIC_PID"
+    frame_id: int = 0
 
 
 @dataclass(slots=True)
@@ -79,3 +119,7 @@ class SystemSnapshot:
     control: Optional[ControlSnapshot]
     message: str
     error: str
+    frame: Optional[FrameSnapshot] = None
+    timestamp: float = 0.0
+    disturbance_model: Optional[dict[str, Any]] = None
+    disturbance_prediction: Optional[dict[str, Any]] = None

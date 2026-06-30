@@ -15,6 +15,7 @@ from ..models import (
     DEVICE_TYPE_INDUSTRIAL,
     FrameData,
 )
+from .hikrobot_direct import DirectHikrobotDllCamera
 
 
 class HikrobotCameraAdapter(BaseCameraAdapter):
@@ -26,6 +27,8 @@ class HikrobotCameraAdapter(BaseCameraAdapter):
         super().__init__(config=config, logger=logger)
         sdk_path = _sdk_search_path(config)
         self._legacy = LegacyHikrobotAdapter(CameraConfig(mvs_sdk_path=sdk_path), logger=logger, sdk_path=sdk_path)
+        self._direct = DirectHikrobotDllCamera(config=config, logger=logger)
+        self._active = "legacy"
         self._device: CameraDeviceInfo | None = None
 
     @classmethod
@@ -36,7 +39,10 @@ class HikrobotCameraAdapter(BaseCameraAdapter):
             loader.load()
             return True, "HIKROBOT MVS SDK available"
         except Exception:
-            return False, loader.error or "HIKROBOT MVS SDK unavailable"
+            direct_ok, direct_reason, _dll_path = DirectHikrobotDllCamera.is_available(config)
+            if direct_ok:
+                return True, direct_reason
+            return False, loader.error or direct_reason or "HIKROBOT MVS SDK unavailable"
 
     @classmethod
     def check_backend(cls, config: Any | None = None, logger=None):
@@ -52,7 +58,9 @@ class HikrobotCameraAdapter(BaseCameraAdapter):
                 loaded = True
             except Exception:
                 loaded = False
-        elif logger:
+        direct_ok, direct_reason, direct_dll = DirectHikrobotDllCamera.is_available(config)
+        available = bool(loaded or direct_ok)
+        if not found and logger:
             logger(f"[HIKROBOT][INSTALL] MVS installation found={loader.mvs_installation_found}")
             logger(f"[HIKROBOT][PYTHON] MvCameraControl_class.py path={loader.python_interface_path or ''}")
             logger(f"[HIKROBOT][DLL] MvCameraControl.dll path={loader.dll_path or ''}")
@@ -60,16 +68,16 @@ class HikrobotCameraAdapter(BaseCameraAdapter):
         return CameraBackendStatus(
             backend_name=cls.backend_name,
             display_name="HIKROBOT MVS",
-            sdk_loaded=loaded,
+            sdk_loaded=available,
             sdk_path=str(loader.sdk_root or ""),
             python_module_loaded=loaded,
             python_module_path=str(loader.import_dir or loader.python_interface_path or ""),
-            dll_loaded=bool(loaded and loader.dll_path),
-            dll_path=str(loader.dll_path.parent if loader.dll_path else ""),
+            dll_loaded=bool((loaded and loader.dll_path) or direct_dll),
+            dll_path=str((loader.dll_path.parent if loader.dll_path else "") or (direct_dll.parent if direct_dll else "")),
             cti_loaded=bool(loader.cti_paths),
             cti_paths=[str(path) for path in loader.cti_paths],
-            backend_available=loaded,
-            error="" if loaded else (loader.error or "HIKROBOT MVS SDK unavailable"),
+            backend_available=available,
+            error="" if available else (loader.error or direct_reason or "HIKROBOT MVS SDK unavailable"),
         )
 
     @classmethod
@@ -77,22 +85,27 @@ class HikrobotCameraAdapter(BaseCameraAdapter):
         sdk_path = _sdk_search_path(config)
         loader = HikrobotSdkLoader(configured_path=sdk_path, extra_paths=getattr(config, "sdk_paths", ()) or ())
         found = loader.find_sdk()
+        direct_ok, direct_reason, direct_dll = DirectHikrobotDllCamera.is_available(config)
         return {
             "display_name": "HIKROBOT MVS",
-            "sdk_loaded": found,
+            "sdk_loaded": bool(found or direct_ok),
             "sdk_path": str(loader.sdk_root or ""),
             "python_module_loaded": False,
             "python_module_path": str(loader.import_dir or loader.python_interface_path or ""),
-            "dll_loaded": False,
-            "dll_path": str(loader.dll_path.parent if loader.dll_path else ""),
+            "dll_loaded": bool(loader.dll_path or direct_dll),
+            "dll_path": str((loader.dll_path.parent if loader.dll_path else "") or (direct_dll.parent if direct_dll else "")),
             "cti_loaded": bool(loader.cti_paths),
             "cti_paths": [str(path) for path in loader.cti_paths],
-            "error": "" if found else loader.error,
+            "error": "" if found or direct_ok else (loader.error or direct_reason),
         }
     @classmethod
     def discover_devices(cls, config: Any | None = None, logger=None) -> list[CameraDeviceInfo]:
         sdk_path = _sdk_search_path(config)
         devices = LegacyHikrobotAdapter.discover_devices(sdk_path=sdk_path, logger=logger)
+        if _legacy_needs_direct_fallback(devices):
+            direct_devices = DirectHikrobotDllCamera.discover_devices(config, logger=logger)
+            if any(device.available for device in direct_devices):
+                return direct_devices
         result: list[CameraDeviceInfo] = []
         for device in devices:
             unique = _unique_id(device.manufacturer, device.model, device.serial_number, device.current_ip, device.device_id)
@@ -136,18 +149,25 @@ class HikrobotCameraAdapter(BaseCameraAdapter):
 
     def open(self, device_info: CameraDeviceInfo) -> None:
         self._device = device_info
+        if _is_direct_device(device_info):
+            self._active = "direct"
+            self._direct.open(device_info)
+            return
+        self._active = "legacy"
         self._legacy.open(device_info.device_id)
 
     def close(self) -> None:
-        self._legacy.close()
+        self._active_adapter().close()
 
     def start_stream(self) -> None:
-        self._legacy.start_stream()
+        self._active_adapter().start_stream()
 
     def stop_stream(self) -> None:
-        self._legacy.stop_stream()
+        self._active_adapter().stop_stream()
 
     def read_frame(self, timeout_ms: int = 1000) -> FrameData:
+        if self._active == "direct":
+            return self._direct.read_frame(timeout_ms)
         deadline = time.time() + max(0.001, timeout_ms / 1000.0)
         packet = None
         while time.time() < deadline:
@@ -180,10 +200,15 @@ class HikrobotCameraAdapter(BaseCameraAdapter):
         return self._device.capabilities if self._device else CameraCapabilities()
 
     def get_feature(self, name: str) -> Any:
+        if self._active == "direct":
+            return self._direct.get_feature(name)
         info = self._legacy.get_parameter_info(_feature_name(name))
         return info.current_value
 
     def set_feature(self, name: str, value: Any) -> None:
+        if self._active == "direct":
+            self._direct.set_feature(name, value)
+            return
         if name in {"exposure", "exposure_time"}:
             self._legacy.set_exposure(float(value))
         elif name == "gain":
@@ -203,13 +228,18 @@ class HikrobotCameraAdapter(BaseCameraAdapter):
             self._legacy.set_trigger_mode(str(value))
 
     def is_open(self) -> bool:
-        return self._legacy.is_open()
+        return self._active_adapter().is_open()
 
     def is_streaming(self) -> bool:
-        return self._legacy.is_streaming()
+        return self._active_adapter().is_streaming()
 
     def get_last_error(self) -> str:
+        if self._active == "direct":
+            return self._last_error or self._direct.get_last_error()
         return self._last_error or self._legacy.get_status().last_camera_error
+
+    def _active_adapter(self):
+        return self._direct if self._active == "direct" else self._legacy
 
 
 def _unique_id(manufacturer: str, model: str, serial: str, ip: str, fallback: str) -> str:
@@ -245,3 +275,14 @@ def _feature_name(name: str) -> str:
         "pixel_format": "PixelFormat",
         "trigger_mode": "TriggerMode",
     }.get(name, name)
+
+
+def _legacy_needs_direct_fallback(devices: list[Any]) -> bool:
+    if not devices:
+        return True
+    return not any(bool(getattr(device, "available", False)) for device in devices)
+
+
+def _is_direct_device(device: CameraDeviceInfo) -> bool:
+    raw = device.raw_info if isinstance(device.raw_info, dict) else {}
+    return str(raw.get("sdk_mode", "")).lower() == "direct_dll" or str(device.device_id).startswith("hikrobot:direct:")

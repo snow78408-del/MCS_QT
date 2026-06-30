@@ -72,12 +72,14 @@ class BeadConfig:
 
 @dataclass
 class MetricsConfig:
-    min_active_for_control: int = 2
-    min_samples_for_control: int = 12
+    min_active_for_control: int = 1
+    min_samples_for_control: int = 1
     rolling_window: int = 120
     count_line_ratio: float = 0.6
     min_track_age_for_count: int = 3
     min_track_displacement_for_count: float = 8.0
+    uniformity_good_threshold: float = 5.0
+    uniformity_normal_threshold: float = 10.0
 
 
 @dataclass
@@ -130,21 +132,9 @@ class CameraSystemConfig:
     )
     enabled_camera_backends: tuple[str, ...] = (
         "hikrobot",
-        "basler",
-        "daheng",
-        "flir",
-        "allied_vision",
-        "gentl",
-        "opencv",
     )
     preferred_backend_order: tuple[str, ...] = (
         "hikrobot",
-        "basler",
-        "daheng",
-        "flir",
-        "allied_vision",
-        "gentl",
-        "opencv",
     )
     gentl_producer_paths: tuple[str, ...] = tuple(
         p for p in os.environ.get("GENICAM_GENTL64_PATH", "").split(os.pathsep) if p
