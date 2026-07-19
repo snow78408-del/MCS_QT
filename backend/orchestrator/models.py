@@ -19,7 +19,7 @@ class SystemConfig:
     pump_port: str = ""
     pump_address: int = 1
     pump_baudrate: int = 1200
-    pump_parity: str = "E"
+    pump_parity: str = "N"
     mvs_sdk_path: str = ""
     camera_backend: str = ""
 

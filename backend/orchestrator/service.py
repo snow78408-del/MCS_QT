@@ -149,17 +149,9 @@ class OrchestratorService:
 
     @staticmethod
     def _flow_from_channel_params(params: ChannelParams | None) -> float | None:
-        if params is None:
-            return None
-        try:
-            infuse_time = float(params.infuse_time_value)
-            if infuse_time <= 0.0:
-                return None
-            return float(params.dispense_value) / infuse_time
-        except Exception:
-            return None
+        return PumpHardwareService.flow_from_channel_params(params)
 
-    def _sync_pump_flow_readback(self, source: str) -> bool:
+    def _sync_pump_flow_readback(self, source: str, *, update_command: bool = True) -> bool:
         try:
             q1, q2 = self.pump_service.get_current_q_state()
         except Exception as exc:
@@ -172,8 +164,9 @@ class OrchestratorService:
 
         self._pump_state.q1_actual = float(q1)
         self._pump_state.q2_actual = float(q2)
-        self._pump_state.q1 = float(q1)
-        self._pump_state.q2 = float(q2)
+        if update_command:
+            self._pump_state.q1 = float(q1)
+            self._pump_state.q2 = float(q2)
         self._pump_state.last_error = ""
         self._refresh_pump_channels(communication_ok=True, error="")
         self._log(f"[PUMP][READBACK][OK] source={source} q1={q1:.6f} q2={q2:.6f}")
@@ -234,13 +227,13 @@ class OrchestratorService:
         system_config.control_interval_ms = interval
 
         if not getattr(system_config, "pump_port", ""):
-            system_config.pump_port = "COM12"
+            raise RuntimeError("pump serial port is empty")
         if not getattr(system_config, "pump_address", None):
             system_config.pump_address = 1
         if not getattr(system_config, "pump_baudrate", None):
             system_config.pump_baudrate = 1200
         if not getattr(system_config, "pump_parity", ""):
-            system_config.pump_parity = "E"
+            system_config.pump_parity = "N"
 
         with self._lock:
             self._cfg = system_config
@@ -293,74 +286,37 @@ class OrchestratorService:
 
     def _apply_pump_serial_config(self, cfg: SystemConfig) -> None:
         serial_cfg = self.pump_service.serial_config
-        serial_cfg.port = str(cfg.pump_port or "COM12").strip()
+        serial_cfg.port = str(cfg.pump_port).strip()
         serial_cfg.address = int(cfg.pump_address)
         serial_cfg.baudrate = int(cfg.pump_baudrate)
-        serial_cfg.parity = str(cfg.pump_parity or "E").strip().upper()
+        serial_cfg.parity = str(cfg.pump_parity or "N").strip().upper()
         if serial_cfg.parity not in {"E", "N"}:
-            serial_cfg.parity = "E"
+            serial_cfg.parity = "N"
 
     def _default_channel_params(self, channel: int, q: float) -> ChannelParams:
-        dispense_value = 1000
-        safe_q = max(float(q), 1e-6)
-        infuse_time_value = max(1, min(65535, int(round(dispense_value / safe_q))))
-        return ChannelParams(
-            channel=channel,
-            mode=1,
-            syringe_code=0x21,
-            dispense_value=dispense_value,
-            dispense_unit=4,
-            infuse_time_value=infuse_time_value,
-            infuse_time_unit=2,
-            withdraw_time_value=1,
-            withdraw_time_unit=2,
-            repeat_count=1,
-            interval_value=0,
-        )
+        return self.pump_service.channel_params_for_flow(channel, q)
 
     def _to_channel_params_with_flow(self, channel: int, q: float) -> ChannelParams:
-        rsp = self.pump_service.read_rsp(channel)
-        if rsp.ok and rsp.parsed_reply is not None:
-            p: ChannelParams = rsp.parsed_reply
-            dispense_value = max(1, int(p.dispense_value))
-            safe_q = max(float(q), 1e-6)
-            infuse_time_value = max(1, min(65535, int(round(dispense_value / safe_q))))
-            return ChannelParams(
-                channel=channel,
-                mode=max(0, int(p.mode)),
-                syringe_code=max(0, int(p.syringe_code)),
-                dispense_value=dispense_value,
-                dispense_unit=int(p.dispense_unit),
-                infuse_time_value=infuse_time_value,
-                infuse_time_unit=int(p.infuse_time_unit),
-                withdraw_time_value=max(0, int(p.withdraw_time_value)),
-                withdraw_time_unit=max(0, int(p.withdraw_time_unit)),
-                repeat_count=max(0, int(p.repeat_count)),
-                interval_value=max(0, int(p.interval_value)),
-            )
-        return self._default_channel_params(channel, q)
+        return self.pump_service.channel_params_for_flow(channel, q)
 
     def _apply_init_flow_rates(self, q1: float, q2: float):
         retries = 3
         last_res = None
         for attempt in range(1, retries + 1):
-            en = self.pump_service.enable_channels_and_verify(0x03)
-            if not en.ok:
-                en2 = self.pump_service.enable_channels(0x03)
-                if en2.ok:
-                    rss = self.pump_service.read_rss()
-                    if rss.ok and rss.parsed_reply is not None:
-                        setup = rss.parsed_reply
-                        effective = (int(setup.enable_mask) | int(setup.copy_mask)) & 0x0F
-                        if (effective & 0x03) == 0x03:
-                            en = en2
-                if not en.ok:
-                    en.reason = en.reason or f"initial flow enable CH1/CH2 failed (attempt {attempt})"
-                    last_res = en
-                    time.sleep(0.12)
-                    continue
+            ready = self.pump_service.prepare_parameter_write(0x03)
+            if not ready.ok:
+                ready.reason = ready.reason or f"initial flow prepare write failed (attempt {attempt})"
+                last_res = ready
+                time.sleep(0.12)
+                continue
 
             p1 = self._to_channel_params_with_flow(1, q1)
+            self._log(
+                "[PUMP][INIT][PARAMS] "
+                f"CH1 target={q1:.6f}uL/min dispense={p1.dispense_value}/unit{p1.dispense_unit} "
+                f"infuse={p1.infuse_time_value}/unit{p1.infuse_time_unit} "
+                f"calc={self._flow_from_channel_params(p1) or 0.0:.6f}uL/min"
+            )
             w1 = self.pump_service.write_wsp_and_verify(1, p1)
             if not w1.ok:
                 w1.reason = w1.reason or f"initial flow CH1 write failed (attempt {attempt})"
@@ -369,6 +325,12 @@ class OrchestratorService:
                 continue
 
             p2 = self._to_channel_params_with_flow(2, q2)
+            self._log(
+                "[PUMP][INIT][PARAMS] "
+                f"CH2 target={q2:.6f}uL/min dispense={p2.dispense_value}/unit{p2.dispense_unit} "
+                f"infuse={p2.infuse_time_value}/unit{p2.infuse_time_unit} "
+                f"calc={self._flow_from_channel_params(p2) or 0.0:.6f}uL/min"
+            )
             w2 = self.pump_service.write_wsp_and_verify(2, p2)
             if not w2.ok:
                 w2.reason = w2.reason or f"initial flow CH2 write failed (attempt {attempt})"
@@ -376,22 +338,64 @@ class OrchestratorService:
                 time.sleep(0.12)
                 continue
 
+            en = self.pump_service.enable_channels_and_verify(0x03)
+            if not en.ok:
+                en.reason = en.reason or f"initial flow enable CH1/CH2 failed (attempt {attempt})"
+                last_res = en
+                time.sleep(0.12)
+                continue
+
+            try:
+                q1_hw, q2_hw = self.pump_service.get_current_q_state()
+            except Exception as exc:
+                last_res = self.pump_service._fail(f"initial flow final hardware readback failed: {exc}")
+                time.sleep(0.12)
+                continue
+
+            ok1, reason1 = self._flow_matches("Q1", q1, q1_hw)
+            ok2, reason2 = self._flow_matches("Q2", q2, q2_hw)
+            if not (ok1 and ok2):
+                reason = "; ".join(part for part in (reason1, reason2) if part)
+                self._log(
+                    "[PUMP][INIT][FLOW][VERIFY_FAIL] "
+                    f"q1_set={q1:.6f} q1_hw={q1_hw:.6f} "
+                    f"q2_set={q2:.6f} q2_hw={q2_hw:.6f} "
+                    f"reason={reason}"
+                )
+                last_res = self.pump_service._fail(f"initial flow final hardware readback mismatch: {reason}")
+                time.sleep(0.12)
+                continue
+
             self._pump_state.q1 = float(q1)
             self._pump_state.q2 = float(q2)
-            self._pump_state.q1_actual = self._flow_from_channel_params(w1.parsed_reply) or float(q1)
-            self._pump_state.q2_actual = self._flow_from_channel_params(w2.parsed_reply) or float(q2)
+            self._pump_state.q1_actual = float(q1_hw)
+            self._pump_state.q2_actual = float(q2_hw)
             self._pump_state.last_update_ok = True
             self._pump_state.last_update_reason = "initial flow update succeeded"
             self._pump_state.last_error = ""
             self._refresh_pump_channels(communication_ok=True, error="")
             self._log(
-                "[PUMP][INIT][FLOW][OK] "
+                "[PUMP][INIT][FLOW][HARDWARE_OK] "
                 f"q1_target={q1:.6f} q2_target={q2:.6f} "
                 f"q1_actual={self._pump_state.q1_actual:.6f} q2_actual={self._pump_state.q2_actual:.6f}"
             )
             return w2
 
         return last_res
+
+    @staticmethod
+    def _flow_matches(name: str, target: float, actual: float) -> tuple[bool, str]:
+        target_f = float(target)
+        actual_f = float(actual)
+        tolerance = max(0.05, abs(target_f) * 0.005)
+        error = abs(actual_f - target_f)
+        if error <= tolerance:
+            return True, ""
+        return (
+            False,
+            f"{name} target={target_f:.6f}uL/min actual={actual_f:.6f}uL/min "
+            f"error={error:.6f} tolerance={tolerance:.6f}",
+        )
 
     def _try_resume_infusion(self, source: str) -> tuple[bool, str]:
         self._log(f"[PUMP][RECOVER] {source}: try resume infusion")
@@ -442,7 +446,7 @@ class OrchestratorService:
                 self._pump_control_enabled = True
                 self._pump_state.last_error = ""
                 self._refresh_pump_channels(communication_ok=True, error="")
-                self._sync_pump_flow_readback("initialize")
+                self._sync_pump_flow_readback("initialize", update_command=False)
             else:
                 self._message = "local video mode: skip pump initialization and PID output"
 
@@ -567,8 +571,8 @@ class OrchestratorService:
                     recognition=rec,
                     pump_state=self._pump_state,
                     control=self._control,
-                    message=self._message,
-                    error=self._error,
+                    message=_clean_runtime_text(self._message, "message"),
+                    error=_clean_runtime_text(self._error, "error"),
                     frame=frame,
                     timestamp=time.time(),
                     disturbance_model=self.disturbance_service.get_status().to_dict(),
@@ -579,6 +583,25 @@ class OrchestratorService:
                     ),
                 )
             )
+
+    def get_video_frame_snapshot(self) -> FrameSnapshot | None:
+        try:
+            raw = self.vision_adapter.get_snapshot()
+            rec = self._build_recognition_snapshot(raw)
+        except Exception:
+            with self._lock:
+                rec = self._recognition
+        if rec is None:
+            return None
+        return FrameSnapshot(
+            frame_id=int(rec.frame_id),
+            timestamp=float(rec.timestamp),
+            width=int(rec.frame_width),
+            height=int(rec.frame_height),
+            valid=bool(rec.frame_png_base64),
+            frame_png_base64=rec.frame_png_base64,
+            reason=rec.reason,
+        )
 
     def _build_recognition_snapshot(self, raw: Any) -> RecognitionSnapshot:
         if isinstance(raw, RecognitionSnapshot):
@@ -927,4 +950,41 @@ class OrchestratorService:
             )
 
         self._update_control_snapshot(ctrl)
+
+
+_RUNTIME_MESSAGE_LABELS = {
+    "": "",
+    "configured": "参数已配置",
+    "video ready": "视频已就绪",
+    "initializing": "正在初始化",
+    "initialized": "初始化完成",
+    "running": "系统运行中",
+    "paused": "系统已暂停",
+    "stopping": "正在停止",
+    "stopped": "系统已停止",
+    "local video mode: skip pump initialization and PID output": "本地视频模式：跳过泵初始化和 PID 输出",
+}
+
+_MOJIBAKE_MARKERS = set("闂閻濞缂婵濠鐎柛梺妞鈧瑜閸閹幋娴瀹绾椤")
+
+
+def _clean_runtime_text(value: object, kind: str) -> str:
+    text = str(value or "").strip()
+    mapped = _RUNTIME_MESSAGE_LABELS.get(text.lower())
+    if mapped is not None:
+        return mapped
+    if _looks_like_mojibake(text):
+        return "发生错误，请查看运行日志" if kind == "error" else "状态信息异常，请查看运行日志"
+    if len(text) > 500:
+        return text[:480] + "..."
+    return text
+
+
+def _looks_like_mojibake(text: str) -> bool:
+    if not text:
+        return False
+    marker_count = sum(1 for ch in text if ch in _MOJIBAKE_MARKERS)
+    if marker_count >= 4:
+        return True
+    return marker_count > 0 and marker_count / max(1, len(text)) > 0.08
 

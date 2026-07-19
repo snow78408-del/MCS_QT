@@ -87,10 +87,10 @@ class FrontendApp(tk.Tk):
             initial_q1=float(self.frontend_config["initial_q1"]),
             initial_q2=float(self.frontend_config["initial_q2"]),
             control_interval_ms=int(self.frontend_config["control_interval_ms"]),
-            pump_port=str(self.frontend_config.get("pump_port", "COM12")).strip(),
+            pump_port=str(self.frontend_config.get("pump_port", "")).strip(),
             pump_address=int(self.frontend_config.get("pump_address", 1)),
             pump_baudrate=int(self.frontend_config.get("pump_baudrate", 1200)),
-            pump_parity=str(self.frontend_config.get("pump_parity", "E")).strip().upper() or "E",
+            pump_parity=str(self.frontend_config.get("pump_parity", "N")).strip().upper() or "N",
             mvs_sdk_path=str(self.frontend_config.get("mvs_sdk_path", "")).strip(),
             camera_backend=str(self.frontend_config.get("camera_backend", "")).strip(),
         )
@@ -101,6 +101,9 @@ class FrontendApp(tk.Tk):
             "[APP][CONFIG] "
             f"video_source_type={cfg.video_source_type} video_source={cfg.video_source} "
             f"camera_backend={cfg.camera_backend} control_interval_ms={cfg.control_interval_ms} "
+            f"magnification={float(self.frontend_config.get('magnification', 0.0) or 0.0):.6f} "
+            f"camera_pixel_size_um={float(self.frontend_config.get('camera_pixel_size_um', 0.0) or 0.0):.6f} "
+            f"pixel_to_micron={cfg.pixel_to_micron:.6f} "
             f"pump_port={cfg.pump_port} pump_addr={cfg.pump_address} "
             f"initial_q1={cfg.initial_q1:.6f}uL/min initial_q2={cfg.initial_q2:.6f}uL/min"
         )

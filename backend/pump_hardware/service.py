@@ -19,6 +19,36 @@ from .models import (
 class PumpHardwareService:
     """TS 注射泵硬件服务层，供 orchestrator / PID 调用。"""
 
+    # The UI and controller use uL/min. Generate WSP parameters in the same
+    # user-facing flow-rate domain first: uL volume over 0.1 min time units.
+    # The write is considered successful only after RSP readback converts back
+    # to the requested uL/min target.
+    _VOLUME_UNIT_TO_UL = {
+        1: 0.001,
+        2: 0.01,
+        3: 0.1,
+        4: 1.0,
+        5: 10.0,
+    }
+    _TIME_UNIT_TO_MIN = {
+        1: 1.0 / 600.0,  # 0.1 s
+        2: 0.1,
+        3: 6.0,
+    }
+    _DEFAULT_SYRINGE_CODE = 0x18
+    _DEFAULT_DISPENSE_VALUE = 1000
+    _DEFAULT_DISPENSE_UNIT = 4
+    _DEFAULT_INFUSE_TIME_UNIT = 2
+    _DEFAULT_WITHDRAW_TIME_VALUE = 100
+    # Withdraw time is unrelated to the requested infusion flow display. Keep
+    # it on the known-good TS time unit; using volume-unit code here makes some
+    # firmware reject the whole WSP command.
+    _DEFAULT_WITHDRAW_TIME_UNIT = 1
+    _DEFAULT_REPEAT_COUNT = 10
+    _DEFAULT_INTERVAL_VALUE = 50
+    _MIN_INFUSE_TIME_VALUE = 10
+    _MAX_PARAM_VALUE = 65535
+
     def __init__(
         self,
         serial_config: SerialConfig | None = None,
@@ -40,6 +70,115 @@ class PumpHardwareService:
 
     def log(self, msg: str) -> None:
         self._logger(msg)
+
+    @classmethod
+    def _volume_unit_to_ul(cls, unit: int) -> float:
+        return float(cls._VOLUME_UNIT_TO_UL.get(int(unit), 1.0))
+
+    @classmethod
+    def _time_unit_to_min(cls, unit: int) -> float:
+        return float(cls._TIME_UNIT_TO_MIN.get(int(unit), 1.0))
+
+    @classmethod
+    def flow_from_channel_params(cls, params: ChannelParams | None) -> float | None:
+        if params is None:
+            return None
+        try:
+            volume_ul = float(params.dispense_value) * cls._volume_unit_to_ul(int(params.dispense_unit))
+            time_min = float(params.infuse_time_value) * cls._time_unit_to_min(int(params.infuse_time_unit))
+            if time_min <= 0.0:
+                return None
+            return volume_ul / time_min
+        except Exception:
+            return None
+
+    @staticmethod
+    def ul_min_to_nl_sec(flow_ul_min: float) -> float:
+        return float(flow_ul_min) * 1000.0 / 60.0
+
+    @classmethod
+    def flow_nl_sec_from_channel_params(cls, params: ChannelParams | None) -> float | None:
+        flow_ul_min = cls.flow_from_channel_params(params)
+        if flow_ul_min is None:
+            return None
+        return cls.ul_min_to_nl_sec(flow_ul_min)
+
+    @classmethod
+    def _infuse_time_value_for_flow(
+        cls,
+        *,
+        dispense_value: int,
+        dispense_unit: int,
+        infuse_time_unit: int,
+        flow_ul_min: float,
+    ) -> int:
+        safe_q = max(float(flow_ul_min), 1e-6)
+        volume_ul = max(1, int(dispense_value)) * cls._volume_unit_to_ul(int(dispense_unit))
+        time_unit_min = cls._time_unit_to_min(int(infuse_time_unit))
+        raw_time_value = volume_ul / safe_q / max(time_unit_min, 1e-9)
+        return max(1, min(cls._MAX_PARAM_VALUE, int(round(raw_time_value))))
+
+    @classmethod
+    def _raw_infuse_time_value_for_flow(
+        cls,
+        *,
+        dispense_value: int,
+        dispense_unit: int,
+        infuse_time_unit: int,
+        flow_ul_min: float,
+    ) -> float:
+        safe_q = max(float(flow_ul_min), 1e-6)
+        volume_ul = max(1, int(dispense_value)) * cls._volume_unit_to_ul(int(dispense_unit))
+        time_unit_min = cls._time_unit_to_min(int(infuse_time_unit))
+        return volume_ul / safe_q / max(time_unit_min, 1e-9)
+
+    @classmethod
+    def _dispense_and_infuse_for_flow(
+        cls,
+        *,
+        dispense_value: int,
+        dispense_unit: int,
+        infuse_time_unit: int,
+        flow_ul_min: float,
+    ) -> tuple[int, int]:
+        safe_q = max(float(flow_ul_min), 1e-6)
+        dispense_unit_ul = cls._volume_unit_to_ul(int(dispense_unit))
+        time_unit_min = cls._time_unit_to_min(int(infuse_time_unit))
+        dispense_value = max(1, min(cls._MAX_PARAM_VALUE, int(dispense_value)))
+
+        raw_time_value = cls._raw_infuse_time_value_for_flow(
+            dispense_value=dispense_value,
+            dispense_unit=dispense_unit,
+            infuse_time_unit=infuse_time_unit,
+            flow_ul_min=safe_q,
+        )
+        if raw_time_value > cls._MAX_PARAM_VALUE:
+            target_dispense = int(
+                safe_q * cls._MAX_PARAM_VALUE * max(time_unit_min, 1e-9) / max(dispense_unit_ul, 1e-9)
+            )
+            dispense_value = max(1, min(cls._MAX_PARAM_VALUE, target_dispense))
+
+        infuse_time_value = cls._infuse_time_value_for_flow(
+            dispense_value=dispense_value,
+            dispense_unit=dispense_unit,
+            infuse_time_unit=infuse_time_unit,
+            flow_ul_min=safe_q,
+        )
+        if infuse_time_value >= cls._MIN_INFUSE_TIME_VALUE:
+            return dispense_value, infuse_time_value
+
+        # Some TS pump firmware ignores very small infuse_time_value fields.
+        # Preserve the requested uL/min by raising dispense volume instead.
+        min_time_value = cls._MIN_INFUSE_TIME_VALUE
+        target_dispense = int(round(safe_q * min_time_value * max(time_unit_min, 1e-9) / max(dispense_unit_ul, 1e-9)))
+        dispense_value = max(1, min(cls._MAX_PARAM_VALUE, target_dispense))
+        infuse_time_value = cls._infuse_time_value_for_flow(
+            dispense_value=dispense_value,
+            dispense_unit=dispense_unit,
+            infuse_time_unit=infuse_time_unit,
+            flow_ul_min=safe_q,
+        )
+        return dispense_value, max(cls._MIN_INFUSE_TIME_VALUE, infuse_time_value)
 
     @staticmethod
     def _ok(parsed=None, raw: bytes | None = None, verified: bool = False, reason: str | None = None):
@@ -75,16 +214,49 @@ class PumpHardwareService:
         )
 
     def connect_and_probe(self) -> PumpConnectionState:
-        state = PumpConnectionState(serial_connected=False, comm_established=False, fully_ready=False)
-        try:
-            self.client.connect()
-            state.serial_connected = self.client.is_connected()
-        except Exception as e:
-            state.failed["serial"] = str(e)
-            self.connection_state = state
-            self.log(f"[CONNECT][FAIL] {e}")
-            return state
+        preferred = str(self.serial_config.parity or "N").strip().upper()
+        candidates: list[str] = []
+        for parity in (preferred, "E", "N"):
+            if parity in {"E", "N"} and parity not in candidates:
+                candidates.append(parity)
 
+        best_state = PumpConnectionState(serial_connected=False, comm_established=False, fully_ready=False)
+        for parity in candidates:
+            self.client.disconnect()
+            self.serial_config.parity = parity
+            state = PumpConnectionState(serial_connected=False, comm_established=False, fully_ready=False)
+            try:
+                self.client.connect()
+                state.serial_connected = self.client.is_connected()
+            except Exception as e:
+                state.failed["serial"] = str(e)
+                self.log(f"[CONNECT][FAIL] parity={parity} {e}")
+                if not best_state.serial_connected:
+                    best_state = state
+                continue
+
+            self.log(f"[CONNECT][PROBE] parity={parity} start")
+            self._probe_current_connection(state)
+            if state.fully_ready:
+                self.connection_state = state
+                self.log(f"[CONNECT][OK] parity={parity} 串口连接、通信建立、设备完全就绪")
+                return state
+            if state.comm_established:
+                self.connection_state = state
+                self.log(f"[CONNECT][OK] parity={parity} 通信已建立但设备未完全就绪: failed={state.failed}")
+                return state
+            self.log(f"[CONNECT][WARN] parity={parity} 串口已开但通信未建立: failed={state.failed}")
+            if not best_state.comm_established:
+                best_state = state
+
+        self.connection_state = best_state
+        if best_state.serial_connected:
+            self.log(f"[CONNECT][FAIL] 串口已开但通信未建立: failed={best_state.failed}")
+        else:
+            self.log(f"[CONNECT][FAIL] 串口打开失败: failed={best_state.failed}")
+        return best_state
+
+    def _probe_current_connection(self, state: PumpConnectionState) -> None:
         probe_results: list[tuple[str, PumpOperationResult]] = []
         probe_results.append(("RSS", self.read_rss()))
         time.sleep(self.runtime_config.probe_step_delay)
@@ -106,15 +278,6 @@ class PumpHardwareService:
             and "RSE" in state.succeeded
             and all(f"RSP{c}" in state.succeeded for c in (1, 2, 3, 4))
         )
-        self.connection_state = state
-
-        if state.fully_ready:
-            self.log("[CONNECT][OK] 串口连接、通信建立、设备完全就绪")
-        elif state.comm_established:
-            self.log(f"[CONNECT][OK] 通信已建立但设备未完全就绪: failed={state.failed}")
-        else:
-            self.log(f"[CONNECT][FAIL] 串口已开但通信未建立: failed={state.failed}")
-        return state
 
     def disconnect(self) -> None:
         self.client.disconnect()
@@ -156,9 +319,12 @@ class PumpHardwareService:
             if params.channel != channel:
                 raise ValueError(f"RSP 通道号不一致: expect={channel}, got={params.channel}")
             self.last_channel_params[channel] = params
+            flow = self.flow_from_channel_params(params)
             self.log(
                 f"[RSP][OK][CH{channel}] mode={params.mode}, sid={params.syringe_code}, "
-                f"dispense={params.dispense_value}/{params.dispense_unit}, infuse={params.infuse_time_value}/{params.infuse_time_unit}"
+                f"dispense={params.dispense_value}/{params.dispense_unit}, "
+                f"infuse={params.infuse_time_value}/{params.infuse_time_unit}, "
+                f"flow={(flow if flow is not None else 0.0):.6f}uL/min"
             )
             return self._ok(parsed=params, raw=rep.raw_frame, verified=True)
         except Exception as e:
@@ -225,8 +391,8 @@ class PumpHardwareService:
             self.log("[WSS][WARN] 主顺序校验失败，尝试 fallback(enable->copy)")
             try:
                 payload = bytearray(protocol.CMD_WSS)
-                payload.append(setup.enable_mask & 0xFF)
                 payload.append(setup.copy_mask & 0xFF)
+                payload.append(setup.enable_mask & 0xFF)
                 for v in setup.delay_values:
                     vv = int(v) & 0xFFFF
                     payload.extend(((vv >> 8) & 0xFF, vv & 0xFF))
@@ -268,9 +434,15 @@ class PumpHardwareService:
             interval_value=params.interval_value,
         )
         try:
+            self.log(f"[WSP][TX][CH{params.channel}] pdu={pdu.hex(' ').upper()}")
             rep = self._send(pdu, expect_cmd="WSP", allow_no_reply=True)
             raw = rep.raw_frame if rep is not None else None
-            self.log(f"[WSP][OK][CH{params.channel}] 命令发送完成")
+            if rep is None:
+                self.log(f"[WSP][NO_REPLY][CH{params.channel}] no ack; will verify by RSP readback")
+            else:
+                raw_text = raw.hex(" ").upper() if raw else "None"
+                reply_text = rep.pdu.hex(" ").upper()
+                self.log(f"[WSP][OK][CH{params.channel}] raw={raw_text} pdu={reply_text}")
             return self._ok(parsed=params, raw=raw, verified=False)
         except Exception as e:
             self.log(f"[WSP][FAIL][CH{params.channel}] {e}")
@@ -280,6 +452,10 @@ class PumpHardwareService:
         wr = self.write_wsp(params)
         if not wr.ok:
             return wr
+
+        commit = self.commit_channel_params(channel)
+        if not commit.ok:
+            self.log(f"[WSP][WARN][CH{channel}] 参数提交触发失败: {commit.reason or commit.error}")
 
         retries = max(1, int(self.runtime_config.wsp_verify_read_retry))
         for idx in range(retries):
@@ -294,13 +470,16 @@ class PumpHardwareService:
             mismatch = []
             strict_fields = [
                 "channel",
-                "dispense_value",
-                "infuse_time_value",
-            ]
-            compat_fields = [
+                "mode",
                 "syringe_code",
+                "dispense_value",
                 "dispense_unit",
+                "infuse_time_value",
                 "infuse_time_unit",
+                "withdraw_time_value",
+                "withdraw_time_unit",
+                "repeat_count",
+                "interval_value",
             ]
 
             for name in strict_fields:
@@ -308,23 +487,28 @@ class PumpHardwareService:
                     mismatch.append(f"{name} expect={getattr(params, name)}, got={getattr(got, name)}")
 
             if not mismatch:
-                compat_mismatch = []
-                for name in compat_fields:
-                    if int(getattr(got, name)) != int(getattr(params, name)):
-                        compat_mismatch.append(
-                            f"{name} expect={getattr(params, name)}, got={getattr(got, name)}"
-                        )
-                if compat_mismatch:
-                    reason = "; ".join(compat_mismatch)
-                    self.log(f"[VERIFY][WARN][CH{channel}] 兼容模式放行(非关键字段不一致): {reason}")
-                    return self._ok(
-                        parsed=got,
-                        raw=rd.raw_reply,
-                        verified=True,
-                        reason=f"WSP 校验通过(兼容模式): {reason}",
-                    )
+                expected_flow = self.flow_from_channel_params(params)
+                actual_flow = self.flow_from_channel_params(got)
+                if expected_flow is None or actual_flow is None:
+                    reason = "无法从 WSP/RSP 参数换算 uL/min 流速"
+                    self.log(f"[VERIFY][FAIL][CH{channel}] {reason}")
+                    return self._fail("WSP 回读校验失败", parsed=got, raw=rd.raw_reply, reason=reason)
 
-                self.log(f"[VERIFY][OK][CH{channel}] WSP 写后读回一致")
+                delta = abs(float(actual_flow) - float(expected_flow))
+                allowed = max(0.01, abs(float(expected_flow)) * 0.002)
+                if delta > allowed:
+                    reason = (
+                        f"flow expect={expected_flow:.6f}uL/min, "
+                        f"got={actual_flow:.6f}uL/min, delta={delta:.6f}"
+                    )
+                    self.log(f"[VERIFY][FAIL][CH{channel}] {reason}")
+                    return self._fail("WSP 回读校验失败", parsed=got, raw=rd.raw_reply, reason=reason)
+
+                self.log(
+                    f"[VERIFY][OK][CH{channel}] WSP 写后读回一致, "
+                    f"flow={actual_flow:.6f}uL/min, "
+                    f"panel_equiv={self.ul_min_to_nl_sec(actual_flow):.6f}nL/sec"
+                )
                 return self._ok(parsed=got, raw=rd.raw_reply, verified=True, reason="WSP 校验通过")
 
             if idx < retries - 1:
@@ -336,6 +520,31 @@ class PumpHardwareService:
             return self._fail("WSP 回读校验失败", parsed=got, raw=rd.raw_reply, reason=reason)
 
         return self._fail("WSP 校验失败：未知错误")
+
+    def commit_channel_params(self, channel: int) -> PumpOperationResult:
+        if not (1 <= int(channel) <= 4):
+            return self._fail(f"非法通道: {channel}")
+        rss = self.read_rss()
+        if not rss.ok or rss.parsed_reply is None:
+            return self._fail(f"参数提交前读取 RSS 失败: {rss.error or rss.reason}")
+
+        setup: SystemSetup = rss.parsed_reply
+        bit = 1 << (int(channel) - 1)
+        req = SystemSetup(
+            enable_mask=int(setup.enable_mask) & 0x0F,
+            copy_mask=(int(setup.copy_mask) | bit) & 0x0F,
+            delay_values=list(setup.delay_values),
+            delay_units=list(setup.delay_units),
+        )
+        res = self.write_wss(req)
+        if res.ok:
+            self.log(
+                f"[WSP][COMMIT][CH{channel}] copy=0x{req.copy_mask:02X}, "
+                f"enable=0x{req.enable_mask:02X}"
+            )
+            time.sleep(float(self.runtime_config.wsp_verify_retry_interval))
+            return res
+        return res
 
     def write_wse(self, sys_runstate: int, q_runstate: int = 0x00) -> PumpOperationResult:
         pdu = protocol.pdu_wse(sys_runstate=sys_runstate, q_runstate=q_runstate)
@@ -489,6 +698,44 @@ class PumpHardwareService:
     def stop_system_and_verify(self) -> PumpOperationResult:
         return self.write_wse_and_verify(sys_runstate=0x00, q_runstate=0x00)
 
+    def prepare_parameter_write(self, mask: int) -> PumpOperationResult:
+        target = int(mask) & 0x0F
+        stop = self.stop_system_and_verify()
+        if not stop.ok:
+            return self._fail(f"参数写入前停泵失败: {stop.reason or stop.error}")
+
+        rss = self.read_rss()
+        if not rss.ok or rss.parsed_reply is None:
+            return self._fail(f"参数写入前读取 RSS 失败: {rss.error or rss.reason}")
+
+        setup: SystemSetup = rss.parsed_reply
+        req = SystemSetup(
+            enable_mask=(int(setup.enable_mask) | target) & 0x0F,
+            copy_mask=(int(setup.copy_mask) | target) & 0x0F,
+            delay_values=list(setup.delay_values),
+            delay_units=list(setup.delay_units),
+        )
+        res = self.write_wss_and_verify(req)
+        rd = self.read_rss()
+        if rd.ok and rd.parsed_reply is not None:
+            got: SystemSetup = rd.parsed_reply
+            effective = (int(got.enable_mask) | int(got.copy_mask)) & 0x0F
+            if (effective & target) == target:
+                self.log(
+                    f"[PUMP][PARAM_WRITE][READY] mask=0x{target:02X} "
+                    f"enable=0x{int(got.enable_mask) & 0x0F:02X} copy=0x{int(got.copy_mask) & 0x0F:02X}"
+                )
+                return self._ok(
+                    parsed=got,
+                    raw=rd.raw_reply,
+                    verified=bool(res.ok),
+                    reason="参数写入前通道已进入可写状态",
+                )
+
+        reason = res.reason or res.error or (rd.reason if rd else None) or "unknown"
+        self.log(f"[PUMP][PARAM_WRITE][FAIL] enable/copy prepare failed: {reason}")
+        return self._fail("参数写入前通道准备失败", parsed=setup, raw=rss.raw_reply, reason=reason)
+
     def start_system(self) -> PumpOperationResult:
         rs = self.read_rss()
         if not rs.ok:
@@ -603,44 +850,67 @@ class PumpHardwareService:
         return self._ok(parsed=rs.parsed_reply, raw=rs.raw_reply, verified=True, reason="启动并确认灌注成功")
 
     def _default_channel_params_for_q(self, channel: int, q: float) -> ChannelParams:
-        dispense_value = 1000
-        safe_q = max(float(q), 1e-6)
-        infuse_time_value = max(1, min(65535, int(round(dispense_value / safe_q))))
+        dispense_value = self._DEFAULT_DISPENSE_VALUE
+        dispense_unit = self._DEFAULT_DISPENSE_UNIT
+        infuse_time_unit = self._DEFAULT_INFUSE_TIME_UNIT
+        dispense_value, infuse_time_value = self._dispense_and_infuse_for_flow(
+            dispense_value=dispense_value,
+            dispense_unit=dispense_unit,
+            infuse_time_unit=infuse_time_unit,
+            flow_ul_min=q,
+        )
         return ChannelParams(
             channel=channel,
             mode=1,
-            syringe_code=0x21,
+            syringe_code=self._DEFAULT_SYRINGE_CODE,
             dispense_value=dispense_value,
-            dispense_unit=4,
+            dispense_unit=dispense_unit,
             infuse_time_value=infuse_time_value,
-            infuse_time_unit=2,
-            withdraw_time_value=1,
-            withdraw_time_unit=2,
-            repeat_count=1,
-            interval_value=0,
+            infuse_time_unit=infuse_time_unit,
+            withdraw_time_value=self._DEFAULT_WITHDRAW_TIME_VALUE,
+            withdraw_time_unit=self._DEFAULT_WITHDRAW_TIME_UNIT,
+            repeat_count=self._DEFAULT_REPEAT_COUNT,
+            interval_value=self._DEFAULT_INTERVAL_VALUE,
+        )
+
+    def _channel_params_preserving_profile(self, current: ChannelParams, q: float) -> ChannelParams:
+        dispense_value = max(1, int(current.dispense_value))
+        infuse_time_value = self._infuse_time_value_for_flow(
+            dispense_value=dispense_value,
+            dispense_unit=int(current.dispense_unit),
+            infuse_time_unit=int(current.infuse_time_unit),
+            flow_ul_min=q,
+        )
+        return ChannelParams(
+            channel=int(current.channel),
+            mode=int(current.mode),
+            syringe_code=int(current.syringe_code),
+            dispense_value=dispense_value,
+            dispense_unit=int(current.dispense_unit),
+            infuse_time_value=infuse_time_value,
+            infuse_time_unit=int(current.infuse_time_unit),
+            withdraw_time_value=int(current.withdraw_time_value),
+            withdraw_time_unit=int(current.withdraw_time_unit),
+            repeat_count=int(current.repeat_count),
+            interval_value=int(current.interval_value),
         )
 
     def _channel_params_with_flow(self, channel: int, q: float) -> ChannelParams:
         rsp = self.read_rsp(channel)
         if rsp.ok and rsp.parsed_reply is not None:
-            p: ChannelParams = rsp.parsed_reply
-            dispense_value = max(1, int(p.dispense_value))
-            safe_q = max(float(q), 1e-6)
-            infuse_time_value = max(1, min(65535, int(round(dispense_value / safe_q))))
-            return ChannelParams(
-                channel=channel,
-                mode=max(0, int(p.mode)),
-                syringe_code=max(0, int(p.syringe_code)),
-                dispense_value=dispense_value,
-                dispense_unit=int(p.dispense_unit),
-                infuse_time_value=infuse_time_value,
-                infuse_time_unit=int(p.infuse_time_unit),
-                withdraw_time_value=max(0, int(p.withdraw_time_value)),
-                withdraw_time_unit=max(0, int(p.withdraw_time_unit)),
-                repeat_count=max(0, int(p.repeat_count)),
-                interval_value=max(0, int(p.interval_value)),
+            current: ChannelParams = rsp.parsed_reply
+            p = self._channel_params_preserving_profile(current, q)
+            self.log(
+                f"[PUMP][PARAM_PROFILE][CH{channel}] preserving pump profile; only flow is updated "
+                f"syringe=0x{p.syringe_code:02X}, volume_unit={p.dispense_unit}, "
+                f"time_unit={p.infuse_time_unit}, repeat={p.repeat_count}, interval={p.interval_value}, "
+                f"user_unit=uL/min"
             )
+            return p
         return self._default_channel_params_for_q(channel, q)
+
+    def channel_params_for_flow(self, channel: int, q: float) -> ChannelParams:
+        return self._channel_params_with_flow(channel, q)
 
     def update_flow_while_running(self, q1: float, q2: float) -> FlowUpdateResult:
         self.log(f"[PUMP][UPDATE] 运行中参数更新: q1={q1:.6f}, q2={q2:.6f}")
@@ -671,6 +941,15 @@ class PumpHardwareService:
 
         p1 = self._channel_params_with_flow(1, q1)
         p2 = self._channel_params_with_flow(2, q2)
+        self.log(
+            "[PUMP][UPDATE][PARAMS] "
+            f"CH1 target={q1:.6f}uL/min dispense={p1.dispense_value}/unit{p1.dispense_unit} "
+            f"infuse={p1.infuse_time_value}/unit{p1.infuse_time_unit} "
+            f"calc={self.flow_from_channel_params(p1) or 0.0:.6f}uL/min; "
+            f"CH2 target={q2:.6f}uL/min dispense={p2.dispense_value}/unit{p2.dispense_unit} "
+            f"infuse={p2.infuse_time_value}/unit{p2.infuse_time_unit} "
+            f"calc={self.flow_from_channel_params(p2) or 0.0:.6f}uL/min"
+        )
 
         wr1 = self.write_wsp_and_verify(1, p1)
         q1_ok = bool(wr1.ok)
@@ -731,9 +1010,10 @@ class PumpHardwareService:
             if not rsp.ok or rsp.parsed_reply is None:
                 raise RuntimeError(f"读取 CH{channel} 参数失败: {rsp.error or rsp.reason}")
             p: ChannelParams = rsp.parsed_reply
-            if int(p.infuse_time_value) <= 0:
+            q = self.flow_from_channel_params(p)
+            if q is None:
                 raise RuntimeError(f"CH{channel} infuse_time_value 非法: {p.infuse_time_value}")
-            return float(p.dispense_value) / float(p.infuse_time_value)
+            return float(q)
 
         q1 = _q_from_rsp(1)
         q2 = _q_from_rsp(2)

@@ -9,6 +9,8 @@ try:
 except Exception:  # pragma: no cover
     from ...backend.orchestrator.models import PumpChannelState, PumpRuntimeState, SystemSnapshot
 
+from .ui_update import set_var_if_changed
+
 
 class PumpPanel(ttk.LabelFrame):
     PUMP_STATE_TIMEOUT_S = 3.0
@@ -92,12 +94,12 @@ class PumpPanel(ttk.LabelFrame):
         unconfigured = physical_channel in {"未配置", "unconfigured"} or error in {"未配置", "unconfigured"}
         communication_ok = bool(channel.communication_ok) and not timeout and not unconfigured
 
-        vars_map["physical_channel"].set("未配置" if physical_channel == "unconfigured" else physical_channel)
-        vars_map["enabled"].set("已启用" if channel.enabled else "未启用")
-        vars_map["running"].set("灌注中" if channel.running else "未运行")
-        vars_map["actual_flow_rate"].set(self._format_flow(channel.actual_flow_rate if communication_ok else None))
-        vars_map["target_flow_rate"].set(self._format_flow(channel.target_flow_rate))
-        vars_map["unit"].set(channel.flow_rate_unit or "uL/min")
+        set_var_if_changed(vars_map["physical_channel"], "未配置" if physical_channel == "unconfigured" else physical_channel)
+        set_var_if_changed(vars_map["enabled"], "已启用" if channel.enabled else "未启用")
+        set_var_if_changed(vars_map["running"], "灌注中" if channel.running else "未运行")
+        set_var_if_changed(vars_map["actual_flow_rate"], self._format_flow(channel.actual_flow_rate if communication_ok else None))
+        set_var_if_changed(vars_map["target_flow_rate"], self._format_flow(channel.target_flow_rate))
+        set_var_if_changed(vars_map["unit"], channel.flow_rate_unit or "uL/min")
         if unconfigured:
             communication_text = "未配置"
         elif timeout:
@@ -106,17 +108,18 @@ class PumpPanel(ttk.LabelFrame):
             communication_text = "正常"
         else:
             communication_text = "异常"
-        vars_map["communication"].set(communication_text)
-        vars_map["last_readback"].set(
-            "--" if channel.last_readback_time is None else f"{float(channel.last_readback_time):.3f}"
+        set_var_if_changed(vars_map["communication"], communication_text)
+        set_var_if_changed(
+            vars_map["last_readback"],
+            "--" if channel.last_readback_time is None else f"{float(channel.last_readback_time):.3f}",
         )
         if error == "unconfigured":
             error = "未配置"
-        vars_map["error"].set(error or "--")
+        set_var_if_changed(vars_map["error"], error or "--")
 
     def update_pump_state(self, state: PumpRuntimeState | None) -> None:
         if state is None:
-            self.summary_var.set("暂无泵状态快照")
+            set_var_if_changed(self.summary_var, "暂无泵状态快照")
             for name in ("Q1", "Q2", "Q3"):
                 self._update_channel(name, self._default_channel(name))
             return
@@ -131,7 +134,7 @@ class PumpPanel(ttk.LabelFrame):
             summary.append(f"最近下发: {'成功' if state.last_update_ok else '失败'} {state.last_update_reason}")
         if state.last_error:
             summary.append(f"异常: {state.last_error}")
-        self.summary_var.set("；".join(summary))
+        set_var_if_changed(self.summary_var, "；".join(summary))
 
         channels = state.channels or {}
         for name in ("Q1", "Q2", "Q3"):

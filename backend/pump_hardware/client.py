@@ -68,14 +68,12 @@ class PumpClient:
         if not self.serial_config.port:
             raise PumpClientError("串口号为空")
 
-        preferred = str(self.serial_config.parity or "E").upper()
+        preferred = str(self.serial_config.parity or "N").upper()
         parities = [preferred]
-        if (
-            self.serial_config.allow_parity_fallback_n
-            and preferred != "N"
-            and "N" not in parities
-        ):
-            parities.append("N")
+        if self.serial_config.allow_parity_fallback_n:
+            for fallback in ("N", "E"):
+                if fallback not in parities:
+                    parities.append(fallback)
 
         parity_map = {
             "E": serial.PARITY_EVEN,
@@ -259,4 +257,3 @@ class PumpClient:
         if last_err is None:
             raise PumpClientError("未知发送失败")
         raise last_err
-

@@ -49,10 +49,16 @@ class FeedforwardCompensator:
             self._last_u_ff = 0.0
             return FeedforwardResult(0.0, False, "prediction stale", confidence)
 
+        weight = float(getattr(prediction, "feedforward_weight", 1.0) or 0.0)
+        if weight <= 0.0:
+            self._last_u_ff = 0.0
+            stage = str(getattr(prediction, "control_stage", "") or "")
+            return FeedforwardResult(0.0, False, f"feedforward gated by stage {stage}".strip(), confidence)
+
         recommended = getattr(prediction, "recommended_feedforward", None)
         if recommended is None:
             change = float(getattr(prediction, "predicted_diameter_change_um", 0.0) or 0.0)
-            recommended = -float(self.config.feedforward_gain) * change
+            recommended = -float(self.config.feedforward_gain) * change * weight
         if not is_finite(recommended):
             self._last_u_ff = 0.0
             return FeedforwardResult(0.0, False, "invalid feedforward value", confidence)

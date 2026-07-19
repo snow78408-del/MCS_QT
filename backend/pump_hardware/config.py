@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 
 DEFAULT_BAUDRATE = 1200
-DEFAULT_PARITY = "E"
+DEFAULT_PARITY = "N"
 DEFAULT_BYTESIZE = 8
 DEFAULT_STOPBITS = 1
 

@@ -3,12 +3,25 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from .models import DisturbanceControlStage
+
 
 @dataclass(slots=True)
 class DisturbanceModelConfig:
     database_path: str = str(Path("data") / "disturbance_model.sqlite3")
     model_path: str = str(Path("data") / "disturbance_model.json")
     sample_interval_ms: int = 200
+    prediction_horizon_ms: int = 200
+    prediction_horizon_tolerance_ms: int = 100
+    minimum_valid_droplets: int = 1
+    deployment_stage: str = DisturbanceControlStage.COLLECT_ONLY.value
+    low_weight_feedforward_weight: float = 0.2
+    full_feedforward_weight: float = 1.0
+    shadow_validation_window: int = 40
+    shadow_min_comparisons: int = 20
+    shadow_max_mae_um: float = 8.0
+    max_consecutive_prediction_errors: int = 3
+    nonlinear_l2_regularization: float = 0.1
     minimum_training_samples: int = 50
     minimum_disturbance_events: int = 1
     training_window_size: int = 1000

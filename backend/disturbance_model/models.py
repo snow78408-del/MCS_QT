@@ -20,6 +20,14 @@ class ModelState(StrEnum):
     ERROR = "ERROR"
 
 
+class DisturbanceControlStage(StrEnum):
+    COLLECT_ONLY = "COLLECT_ONLY"
+    OFFLINE_TRAINING = "OFFLINE_TRAINING"
+    SHADOW = "SHADOW"
+    LOW_WEIGHT_FEEDFORWARD = "LOW_WEIGHT_FEEDFORWARD"
+    FULL_FEEDFORWARD = "FULL_FEEDFORWARD"
+
+
 @dataclass(slots=True)
 class DisturbanceSample:
     timestamp: float
@@ -85,6 +93,10 @@ class DisturbancePrediction:
     predicted_cv: float | None = None
     disturbance_effect: str = "unknown"
     recommended_feedforward: float = 0.0
+    feedforward_weight: float = 0.0
+    control_stage: str = DisturbanceControlStage.COLLECT_ONLY.value
+    shadow_error_um: float | None = None
+    safety_fallback: bool = False
     model_version: str = ""
     reason: str = ""
 
@@ -112,6 +124,10 @@ class ModelStatus:
     model_ready: bool = False
     model_valid: bool = False
     confidence: float = 0.0
+    control_stage: str = DisturbanceControlStage.COLLECT_ONLY.value
+    feedforward_weight: float = 0.0
+    shadow_mae_um: float = 0.0
+    safety_fallback: bool = False
     last_error: str = ""
     metrics: ModelMetrics = field(default_factory=ModelMetrics)
 

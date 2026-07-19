@@ -28,16 +28,36 @@ class ROIConfig:
 
 @dataclass
 class DetectorConfig:
-    min_radius: float = 18.0
-    max_radius: float = 32.0
-    min_center_distance: float = 35.0
+    min_radius: float = 22.0
+    max_radius: float = 50.0
+    min_center_distance: float = 30.0
+    deduplicate_distance_ratio: float = 0.90
+    deduplicate_min_distance: float = 6.0
+    deduplicate_contained_ratio: float = 0.88
     circularity_threshold: float = 0.15
-    min_contour_area: float = 120.0
+    min_contour_area: float = 60.0
     gaussian_blur_size: int = 5
     morphology_open_kernel: int = 3
     morphology_close_kernel: int = 5
-    split_peak_threshold_ratio: float = 0.45
-    split_large_area_ratio: float = 1.35
+    split_peak_threshold_ratio: float = 0.40
+    split_large_area_ratio: float = 1.15
+    enable_hough_candidates: bool = True
+    hough_dp: float = 1.2
+    hough_min_distance: float = 30.0
+    hough_param1: float = 100.0
+    hough_param2: float = 28.0
+    hough_min_radius: float = 22.0
+    hough_max_radius: float = 50.0
+    hough_preferred_radius: float = 30.0
+    hough_edge_support_threshold: float = 0.18
+    hough_edge_neighborhood: int = 2
+    hough_work_max_width: int = 760
+    hough_work_max_height: int = 560
+    hough_max_candidates: int = 120
+    reject_multi_droplet_circles: bool = True
+    multi_droplet_child_radius_ratio: float = 0.82
+    multi_droplet_child_distance_ratio: float = 0.90
+    multi_droplet_child_count: int = 2
     cut_line_ratio: float = 1.0
     detection_mode: DetectionMode = "split_connected"
 
@@ -74,6 +94,7 @@ class BeadConfig:
 class MetricsConfig:
     min_active_for_control: int = 1
     min_samples_for_control: int = 1
+    realtime_window_ms: int = 500
     rolling_window: int = 120
     count_line_ratio: float = 0.6
     min_track_age_for_count: int = 3

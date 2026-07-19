@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import base64
+import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
@@ -13,6 +14,7 @@ from ..components.control_buttons import ControlButtons
 from ..components.pump_panel import PumpPanel
 from ..components.recognition_panel import RecognitionPanel
 from ..components.status_panel import StatusPanel
+from ..components.ui_update import set_var_if_changed
 
 
 class MonitorPage(ttk.Frame):
@@ -21,6 +23,12 @@ class MonitorPage(ttk.Frame):
         self.app = app
         self._poll_job = None
         self._video_photo = None
+        self._last_video_frame_id: int | None = None
+        self._last_video_payload: str | None = None
+        self._last_text_refresh_ts = 0.0
+        self._last_button_state: str | None = None
+        self._scrollregion_pending = False
+        self._video_refresh_interval_ms = 33
 
         self.err_var = tk.StringVar(value="--")
         self.adjust_var = tk.StringVar(value="--")
@@ -90,6 +98,8 @@ class MonitorPage(ttk.Frame):
 
         video_frame = ttk.LabelFrame(main, text="工业相机实时视频画面")
         video_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=0)
+        video_frame.configure(width=760, height=590)
+        video_frame.grid_propagate(False)
         self.video_label = ttk.Label(video_frame, text="等待开始", anchor="center")
         self.video_label.pack(fill="both", expand=True, padx=6, pady=6)
 
@@ -147,6 +157,13 @@ class MonitorPage(ttk.Frame):
         ctrl_frame.columnconfigure(1, weight=1)
 
     def _on_content_configure(self, _event=None) -> None:
+        if self._canvas is None or self._scrollregion_pending:
+            return
+        self._scrollregion_pending = True
+        self.after_idle(self._update_scrollregion)
+
+    def _update_scrollregion(self) -> None:
+        self._scrollregion_pending = False
         if self._canvas is not None:
             self._canvas.configure(scrollregion=self._canvas.bbox("all"))
 
@@ -188,18 +205,26 @@ class MonitorPage(ttk.Frame):
             self.after_cancel(self._poll_job)
             self._poll_job = None
 
-    def _set_video_image(self, frame_png_base64: str | None) -> None:
+    def _set_video_image(self, frame_png_base64: str | None, frame_id: int | None = None) -> None:
         if not frame_png_base64:
+            return
+        if frame_id is not None and frame_id == self._last_video_frame_id:
+            return
+        if frame_id is None and frame_png_base64 == self._last_video_payload:
             return
         try:
             self._video_photo = tk.PhotoImage(data=frame_png_base64)
             self.video_label.configure(image=self._video_photo, text="")
+            self._last_video_frame_id = frame_id
+            self._last_video_payload = frame_png_base64
         except Exception:
             try:
                 raw = base64.b64decode(frame_png_base64)
                 b64 = base64.b64encode(raw).decode("ascii")
                 self._video_photo = tk.PhotoImage(data=b64)
                 self.video_label.configure(image=self._video_photo, text="")
+                self._last_video_frame_id = frame_id
+                self._last_video_payload = frame_png_base64
             except Exception:
                 self.video_label.configure(text="视频帧解码失败")
 
@@ -227,65 +252,84 @@ class MonitorPage(ttk.Frame):
         return f"{float(channel.actual_flow_rate):.6f}"
 
     def _poll_once(self) -> None:
-        # Monitor refresh is read-only: one snapshot read, then UI formatting only.
+        video_frame = None
+        try:
+            video_frame = self.app.orchestrator.get_video_frame_snapshot()
+        except Exception:
+            video_frame = None
+        if video_frame is not None and video_frame.valid:
+            self._set_video_image(video_frame.frame_png_base64, int(video_frame.frame_id))
+
+        now = time.monotonic()
+        text_due = (now - self._last_text_refresh_ts) >= 1.0
+        if not text_due:
+            self._poll_job = self.after(self._video_refresh_interval_ms, self._poll_once)
+            return
+
+        # Full system snapshot is intentionally low-rate so text, pump state and
+        # PID status do not throttle the realtime video path.
         snap = self.app.orchestrator.get_snapshot()
+        self._last_text_refresh_ts = now
         self.recognition_panel.update_snapshot(snap)
         self.pump_panel.update_snapshot(snap)
         self.status_panel.update_snapshot(snap)
 
-        self.q1_actual_var.set(self._channel_flow(snap, "Q1"))
-        self.q2_actual_var.set(self._channel_flow(snap, "Q2"))
+        set_var_if_changed(self.q1_actual_var, self._channel_flow(snap, "Q1"))
+        set_var_if_changed(self.q2_actual_var, self._channel_flow(snap, "Q2"))
 
         rec = snap.recognition
         if rec is not None:
-            self.video_mode_var.set(rec.video_source_type or "--")
-            self.video_source_var.set(rec.video_source or "--")
+            set_var_if_changed(self.video_mode_var, rec.video_source_type or "--")
+            set_var_if_changed(self.video_source_var, rec.video_source or "--")
             if rec.frame_width > 0 and rec.frame_height > 0:
-                self.video_res_var.set(f"{rec.frame_width} x {rec.frame_height}")
+                set_var_if_changed(self.video_res_var, f"{rec.frame_width} x {rec.frame_height}")
             else:
-                self.video_res_var.set("--")
-            self._set_video_image(rec.frame_png_base64)
+                set_var_if_changed(self.video_res_var, "--")
 
         ctrl = snap.control
         if ctrl is not None:
-            self.pid_mode_var.set(str(getattr(ctrl, "control_mode", "--") or "--"))
-            self.pid_gains_var.set(
+            set_var_if_changed(self.pid_mode_var, str(getattr(ctrl, "control_mode", "--") or "--"))
+            set_var_if_changed(
+                self.pid_gains_var,
                 f"{float(getattr(ctrl, 'kp', 0.0)):.6f} / "
                 f"{float(getattr(ctrl, 'ki', 0.0)):.6f} / "
-                f"{float(getattr(ctrl, 'kd', 0.0)):.6f}"
+                f"{float(getattr(ctrl, 'kd', 0.0)):.6f}",
             )
-            self.adaptive_var.set("yes" if bool(getattr(ctrl, "adaptive_active", False)) else "no")
-            self.feedforward_var.set("yes" if bool(getattr(ctrl, "feedforward_active", False)) else "no")
-            self.err_var.set(f"{ctrl.diameter_error:.6f}")
-            self.adjust_var.set(f"{ctrl.adjustment:.6f}")
-            self.pid_output_var.set(f"{float(getattr(ctrl, 'pid_output', 0.0)):.6f}")
-            self.feedforward_output_var.set(f"{float(getattr(ctrl, 'feedforward_output', 0.0)):.6f}")
-            self.final_output_var.set(f"{float(getattr(ctrl, 'final_output', ctrl.adjustment)):.6f}")
-            self.freeze_var.set("是" if ctrl.freeze_feedback else "否")
-            self.stop_var.set("是" if ctrl.suggested_stop else "否")
-            self.q1_cmd_var.set(f"{ctrl.q1_command:.6f}")
-            self.q2_cmd_var.set(f"{ctrl.q2_command:.6f}")
-            self.reason_var.set(ctrl.reason or "--")
-            self.ch1_exec_var.set(self._parse_channel_status(ctrl.reason or "", 1))
-            self.ch2_exec_var.set(self._parse_channel_status(ctrl.reason or "", 2))
+            set_var_if_changed(self.adaptive_var, "yes" if bool(getattr(ctrl, "adaptive_active", False)) else "no")
+            set_var_if_changed(self.feedforward_var, "yes" if bool(getattr(ctrl, "feedforward_active", False)) else "no")
+            set_var_if_changed(self.err_var, f"{ctrl.diameter_error:.6f}")
+            set_var_if_changed(self.adjust_var, f"{ctrl.adjustment:.6f}")
+            set_var_if_changed(self.pid_output_var, f"{float(getattr(ctrl, 'pid_output', 0.0)):.6f}")
+            set_var_if_changed(
+                self.feedforward_output_var, f"{float(getattr(ctrl, 'feedforward_output', 0.0)):.6f}"
+            )
+            set_var_if_changed(self.final_output_var, f"{float(getattr(ctrl, 'final_output', ctrl.adjustment)):.6f}")
+            set_var_if_changed(self.freeze_var, "是" if ctrl.freeze_feedback else "否")
+            set_var_if_changed(self.stop_var, "是" if ctrl.suggested_stop else "否")
+            set_var_if_changed(self.q1_cmd_var, f"{ctrl.q1_command:.6f}")
+            set_var_if_changed(self.q2_cmd_var, f"{ctrl.q2_command:.6f}")
+            set_var_if_changed(self.reason_var, ctrl.reason or "--")
+            set_var_if_changed(self.ch1_exec_var, self._parse_channel_status(ctrl.reason or "", 1))
+            set_var_if_changed(self.ch2_exec_var, self._parse_channel_status(ctrl.reason or "", 2))
 
         model_status = getattr(snap, "disturbance_model", None) or {}
         prediction = getattr(snap, "disturbance_prediction", None) or {}
         if model_status:
-            self.model_state_var.set(str(model_status.get("state", "--")))
-            self.model_confidence_var.set(f"{float(model_status.get('confidence', 0.0) or 0.0):.3f}")
-            self.model_version_var.set(str(model_status.get("model_version", "") or "--"))
-            self.model_sample_count_var.set(str(model_status.get("sample_count", "--")))
+            set_var_if_changed(self.model_state_var, str(model_status.get("state", "--")))
+            set_var_if_changed(self.model_confidence_var, f"{float(model_status.get('confidence', 0.0) or 0.0):.3f}")
+            set_var_if_changed(self.model_version_var, str(model_status.get("model_version", "") or "--"))
+            set_var_if_changed(self.model_sample_count_var, str(model_status.get("sample_count", "--")))
         if prediction:
             value = prediction.get("predicted_diameter_change_um")
-            self.predicted_change_var.set("--" if value is None else f"{float(value):.3f} um")
+            set_var_if_changed(self.predicted_change_var, "--" if value is None else f"{float(value):.3f} um")
         state_val = snap.system_state.value if hasattr(snap.system_state, "value") else str(snap.system_state)
-        try:
-            self.buttons.update_by_state(SystemState(state_val))
-        except Exception:
-            pass
-        interval_ms = max(200, min(500, int(getattr(self.app, "refresh_interval_ms", 300))))
-        self._poll_job = self.after(interval_ms, self._poll_once)
+        if state_val != self._last_button_state:
+            self._last_button_state = state_val
+            try:
+                self.buttons.update_by_state(SystemState(state_val))
+            except Exception:
+                pass
+        self._poll_job = self.after(self._video_refresh_interval_ms, self._poll_once)
 
     def _on_init(self) -> None:
         self.app.show_page("init")

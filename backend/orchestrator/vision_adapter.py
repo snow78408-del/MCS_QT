@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import queue
 import threading
 import time
 from dataclasses import replace
@@ -14,6 +15,10 @@ except Exception:  # pragma: no cover - handled at runtime for local video only
 from .models import RecognitionSnapshot
 
 INDUSTRIAL_CAMERA_BACKENDS = {"hikrobot", "basler", "daheng", "flir", "allied_vision", "gentl"}
+PREVIEW_MAX_WIDTH = 760
+PREVIEW_MAX_HEIGHT = 560
+PREVIEW_TARGET_INTERVAL_S = 1.0 / 30.0
+PROCESS_TARGET_INTERVAL_S = 0.08
 
 
 @runtime_checkable
@@ -72,9 +77,14 @@ class PipelineVisionService:
         self._lock = threading.RLock()
         self._cap = None
         self._worker: threading.Thread | None = None
+        self._process_worker: threading.Thread | None = None
+        self._frame_queue: queue.Queue[tuple[int, float, Any]] = queue.Queue(maxsize=3)
         self._stop_event = threading.Event()
         self._last_processed_frame_id = 0
         self._last_processed_frame_timestamp = 0.0
+        self._capture_frame_id = 0
+        self._last_preview_publish_time = 0.0
+        self._last_processing_submit_time = 0.0
         self._latest = self._empty_snapshot("当前无有效液滴通过")
 
     def _ensure_pipeline(self):
@@ -181,6 +191,9 @@ class PipelineVisionService:
             self._pixel_to_micron = float(pixel_to_micron) if float(pixel_to_micron) > 0 else 1.0
             self._last_processed_frame_id = 0
             self._last_processed_frame_timestamp = 0.0
+            self._capture_frame_id = 0
+            self._last_preview_publish_time = 0.0
+            self._last_processing_submit_time = 0.0
             self._ensure_pipeline().reset()
             self._latest = self._empty_snapshot("视频输入已准备，等待识别")
 
@@ -233,19 +246,26 @@ class PipelineVisionService:
                 return
             if not self._is_realtime_mode():
                 self._cap = self._open_capture()
+            self._frame_queue = queue.Queue(maxsize=3)
             self._stop_event.clear()
-            self._worker = threading.Thread(target=self._loop, name="vision-pipeline-loop", daemon=True)
+            self._worker = threading.Thread(target=self._capture_loop, name="vision-capture-loop", daemon=True)
+            self._process_worker = threading.Thread(target=self._process_loop, name="vision-processing-loop", daemon=True)
             self._worker.start()
+            self._process_worker.start()
 
     def stop(self) -> None:
         self._stop_event.set()
         worker = self._worker
         if worker is not None and worker.is_alive() and worker is not threading.current_thread():
             worker.join(timeout=1.0)
+        process_worker = self._process_worker
+        if process_worker is not None and process_worker.is_alive() and process_worker is not threading.current_thread():
+            process_worker.join(timeout=1.0)
         with self._lock:
             cap = self._cap
             self._cap = None
             self._worker = None
+            self._process_worker = None
         if cap is not None:
             cap.release()
         try:
@@ -258,12 +278,27 @@ class PipelineVisionService:
         if cv2 is None:
             return None, 0, 0
         try:
-            ok, buf = cv2.imencode(".png", frame)
+            preview = self._resize_preview_frame(frame)
+            ok, buf = cv2.imencode(".png", preview, [int(cv2.IMWRITE_PNG_COMPRESSION), 1])
             if not ok:
-                return None, int(frame.shape[1]), int(frame.shape[0])
-            return base64.b64encode(buf.tobytes()).decode("ascii"), int(frame.shape[1]), int(frame.shape[0])
+                return None, int(preview.shape[1]), int(preview.shape[0])
+            return base64.b64encode(buf.tobytes()).decode("ascii"), int(preview.shape[1]), int(preview.shape[0])
         except Exception:
             return None, 0, 0
+
+    def _resize_preview_frame(self, frame):
+        try:
+            height = int(frame.shape[0])
+            width = int(frame.shape[1])
+        except Exception:
+            return frame
+        if width <= 0 or height <= 0:
+            return frame
+        scale = min(1.0, PREVIEW_MAX_WIDTH / float(width), PREVIEW_MAX_HEIGHT / float(height))
+        if scale >= 0.999:
+            return frame
+        target = (max(1, int(width * scale)), max(1, int(height * scale)))
+        return cv2.resize(frame, target, interpolation=cv2.INTER_AREA)
 
     def _read_next_frame(self) -> tuple[bool, Any, str]:
         if self._is_realtime_mode():
@@ -292,7 +327,16 @@ class PipelineVisionService:
             return False, None, "本地视频读取结束"
         return True, frame, ""
 
-    def _snapshot_from_frame(self, frame) -> RecognitionSnapshot:
+    def _snapshot_from_frame(
+        self,
+        frame,
+        *,
+        frame_png_base64: str | None = None,
+        frame_width: int = 0,
+        frame_height: int = 0,
+        frame_id: int | None = None,
+        timestamp: float | None = None,
+    ) -> RecognitionSnapshot:
         result = self._ensure_pipeline().process_frame(frame)
         control = result.metrics.control
         avg_px = control.frame_avg_diameter
@@ -301,7 +345,11 @@ class PipelineVisionService:
         new_cross = int(result.metrics.control.new_crossing_count)
         has_droplet = active_count > 0
         control_reason = str(result.metrics.control.reason or "")
-        frame_b64, width, height = self._encode_png_base64(result.annotated_frame)
+        frame_b64 = frame_png_base64
+        width = int(frame_width or 0)
+        height = int(frame_height or 0)
+        if frame_b64 is None:
+            frame_b64, width, height = self._encode_png_base64(result.annotated_frame)
         if frame_b64 is None:
             frame_b64, width, height = self._encode_png_base64(frame)
         scale = float(self._pixel_to_micron)
@@ -320,7 +368,7 @@ class PipelineVisionService:
             avg_diameter=frame_avg_diameter,
             single_cell_rate=float(control.frame_single_cell_rate or 0.0),
             valid_for_control=bool(result.metrics.control.valid_for_control and has_droplet),
-            timestamp=time.time(),
+            timestamp=float(timestamp or time.time()),
             reason=control_reason,
             droplet_count=total_count,
             active_droplet_count=active_count,
@@ -331,7 +379,7 @@ class PipelineVisionService:
             frame_height=height,
             video_source_type=self._video_source_type,
             video_source=self._video_source,
-            frame_id=int(result.frame_index),
+            frame_id=int(frame_id if frame_id is not None else result.frame_index),
             frame_single_cell_count=int(control.frame_single_cell_count),
             frame_diameters=frame_diameters,
             frame_diameter_sum=frame_diameter_sum,
@@ -343,6 +391,117 @@ class PipelineVisionService:
             uniformity_status=str(control.uniformity_status or ""),
             uniformity_reason=str(control.uniformity_reason or ""),
         )
+
+    def _capture_loop(self) -> None:
+        while not self._stop_event.is_set():
+            ok, frame, error = self._read_next_frame()
+            if not ok:
+                if error and self._is_realtime_mode():
+                    with self._lock:
+                        self._latest = self._snapshot_with_error(error)
+                elif error:
+                    break
+                time.sleep(0.03)
+                continue
+            try:
+                with self._lock:
+                    self._capture_frame_id += 1
+                    frame_id = self._capture_frame_id
+                timestamp = time.time()
+                if self._should_publish_preview(timestamp):
+                    self._publish_video_frame(frame, frame_id, timestamp)
+                if self._should_submit_processing(timestamp):
+                    self._submit_processing_frame(frame_id, timestamp, frame)
+            except Exception as exc:
+                self._log(f"[VISION][WARN] capture frame failed: {exc}")
+                time.sleep(0.02)
+        with self._lock:
+            cap = self._cap
+            self._cap = None
+            self._worker = None
+        if cap is not None:
+            cap.release()
+
+    def _process_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                frame_id, timestamp, frame = self._frame_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            try:
+                with self._lock:
+                    current = self._latest
+                    frame_b64 = current.frame_png_base64
+                    width = int(current.frame_width)
+                    height = int(current.frame_height)
+                snapshot = self._snapshot_from_frame(
+                    frame,
+                    frame_png_base64=frame_b64,
+                    frame_width=width,
+                    frame_height=height,
+                    frame_id=frame_id,
+                    timestamp=timestamp,
+                )
+                with self._lock:
+                    current = self._latest
+                    self._latest = replace(
+                        snapshot,
+                        frame_png_base64=current.frame_png_base64,
+                        frame_width=current.frame_width,
+                        frame_height=current.frame_height,
+                        frame_id=max(int(current.frame_id), int(snapshot.frame_id)),
+                        timestamp=max(float(current.timestamp), float(snapshot.timestamp)),
+                    )
+            except Exception as exc:
+                self._log(f"[VISION][WARN] processing frame failed: {exc}")
+
+    def _publish_video_frame(self, frame, frame_id: int, timestamp: float) -> None:
+        frame_b64, width, height = self._encode_png_base64(frame)
+        if frame_b64 is None:
+            return
+        with self._lock:
+            self._latest = replace(
+                self._latest,
+                frame_png_base64=frame_b64,
+                frame_width=width,
+                frame_height=height,
+                frame_id=int(frame_id),
+                timestamp=float(timestamp),
+                video_source_type=self._video_source_type,
+                video_source=self._video_source,
+            )
+
+    def _submit_processing_frame(self, frame_id: int, timestamp: float, frame) -> None:
+        item = (int(frame_id), float(timestamp), frame)
+        try:
+            self._frame_queue.put_nowait(item)
+            return
+        except queue.Full:
+            pass
+        try:
+            self._frame_queue.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self._frame_queue.put_nowait(item)
+        except queue.Full:
+            pass
+
+    def _should_publish_preview(self, timestamp: float) -> bool:
+        with self._lock:
+            last = float(self._last_preview_publish_time or 0.0)
+            if float(timestamp) - last < PREVIEW_TARGET_INTERVAL_S:
+                return False
+            self._last_preview_publish_time = float(timestamp)
+            return True
+
+    def _should_submit_processing(self, timestamp: float) -> bool:
+        with self._lock:
+            last = float(self._last_processing_submit_time or 0.0)
+            if float(timestamp) - last < PROCESS_TARGET_INTERVAL_S:
+                return False
+            self._last_processing_submit_time = float(timestamp)
+            return True
 
     def _loop(self) -> None:
         while not self._stop_event.is_set():

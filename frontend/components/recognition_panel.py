@@ -9,6 +9,8 @@ try:
 except Exception:  # pragma: no cover
     from ...backend.orchestrator.models import RecognitionSnapshot, SystemSnapshot
 
+from .ui_update import set_var_if_changed
+
 
 class RecognitionPanel(ttk.LabelFrame):
     FRAME_TIMEOUT_S = 2.0
@@ -64,15 +66,15 @@ class RecognitionPanel(ttk.LabelFrame):
         return f"{float(value):.{digits}f}{suffix}"
 
     def _clear_current_frame_metrics(self, reason: str) -> None:
-        self.frame_count_var.set("0")
-        self.single_count_var.set("0")
-        self.avg_diameter_var.set("--")
-        self.single_cell_rate_var.set("--")
-        self.std_var.set("--")
-        self.cv_var.set("--")
-        self.uniformity_var.set(reason)
-        self.valid_var.set("否")
-        self.reason_var.set(reason)
+        set_var_if_changed(self.frame_count_var, "0")
+        set_var_if_changed(self.single_count_var, "0")
+        set_var_if_changed(self.avg_diameter_var, "--")
+        set_var_if_changed(self.single_cell_rate_var, "--")
+        set_var_if_changed(self.std_var, "--")
+        set_var_if_changed(self.cv_var, "--")
+        set_var_if_changed(self.uniformity_var, reason)
+        set_var_if_changed(self.valid_var, "否")
+        set_var_if_changed(self.reason_var, reason)
 
     def update_recognition(self, rec: RecognitionSnapshot | None, *, synced: bool = True) -> None:
         if rec is None:
@@ -80,16 +82,16 @@ class RecognitionPanel(ttk.LabelFrame):
             return
 
         stale = (time.time() - float(rec.timestamp)) > self.FRAME_TIMEOUT_S
-        self.frame_id_var.set(str(rec.frame_id))
-        self.new_crossing_var.set(str(rec.new_crossing_count))
-        self.total_count_var.set(str(rec.total_droplet_count))
-        self.video_mode_var.set(rec.video_source_type or "--")
-        self.video_source_var.set(rec.video_source or "--")
-        self.timestamp_var.set(f"{rec.timestamp:.3f}")
+        set_var_if_changed(self.frame_id_var, str(rec.frame_id))
+        set_var_if_changed(self.new_crossing_var, str(rec.new_crossing_count))
+        set_var_if_changed(self.total_count_var, str(rec.total_droplet_count))
+        set_var_if_changed(self.video_mode_var, rec.video_source_type or "--")
+        set_var_if_changed(self.video_source_var, rec.video_source or "--")
+        set_var_if_changed(self.timestamp_var, f"{rec.timestamp:.3f}")
         if rec.frame_width > 0 and rec.frame_height > 0:
-            self.resolution_var.set(f"{rec.frame_width} x {rec.frame_height}")
+            set_var_if_changed(self.resolution_var, f"{rec.frame_width} x {rec.frame_height}")
         else:
-            self.resolution_var.set("--")
+            set_var_if_changed(self.resolution_var, "--")
 
         if not synced:
             self._clear_current_frame_metrics("数据同步中")
@@ -101,18 +103,18 @@ class RecognitionPanel(ttk.LabelFrame):
             self._clear_current_frame_metrics(rec.reason or "当前无有效液滴")
             return
 
-        self.frame_count_var.set(str(rec.frame_droplet_count))
-        self.single_count_var.set(str(rec.frame_single_cell_count))
-        self.avg_diameter_var.set(self._format_float(rec.frame_avg_diameter, " μm"))
-        self.single_cell_rate_var.set(self._format_float(rec.frame_single_cell_rate, " %"))
-        self.std_var.set(self._format_float(rec.frame_diameter_std, " μm"))
-        self.cv_var.set(self._format_float(rec.frame_diameter_cv, " %"))
+        set_var_if_changed(self.frame_count_var, str(rec.frame_droplet_count))
+        set_var_if_changed(self.single_count_var, str(rec.frame_single_cell_count))
+        set_var_if_changed(self.avg_diameter_var, self._format_float(rec.frame_avg_diameter, " μm"))
+        set_var_if_changed(self.single_cell_rate_var, self._format_float(rec.frame_single_cell_rate, " %"))
+        set_var_if_changed(self.std_var, self._format_float(rec.frame_diameter_std, " μm"))
+        set_var_if_changed(self.cv_var, self._format_float(rec.frame_diameter_cv, " %"))
         uniformity = rec.uniformity_status or ("有效" if rec.uniformity_valid else "样本不足")
         if rec.uniformity_reason:
             uniformity = f"{uniformity}（{rec.uniformity_reason}）"
-        self.uniformity_var.set(uniformity)
-        self.valid_var.set("是" if rec.valid_for_control else "否")
-        self.reason_var.set(rec.reason or rec.control_reason or "--")
+        set_var_if_changed(self.uniformity_var, uniformity)
+        set_var_if_changed(self.valid_var, "是" if rec.valid_for_control else "否")
+        set_var_if_changed(self.reason_var, rec.reason or rec.control_reason or "--")
 
     def update_snapshot(self, snapshot: SystemSnapshot | None) -> None:
         if snapshot is None:

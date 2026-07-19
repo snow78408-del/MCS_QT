@@ -136,10 +136,10 @@ def pdu_rsp(channel: int) -> bytes:
 def pdu_wss(copy_mask: int, enable_mask: int, delay_values: list[int], delay_units: list[int]) -> bytes:
     if len(delay_values) != 4 or len(delay_units) != 4:
         raise ValueError("delay_values / delay_units 必须为长度 4")
-    # 规约顺序: copy_mask -> enable_mask -> 4x delay_value -> 4x delay_unit
+    # TS protocol order: enable_mask -> copy_mask -> 4x delay_value -> 4x delay_unit.
     payload = bytearray(CMD_WSS)
-    payload.append(copy_mask & 0xFF)
     payload.append(enable_mask & 0xFF)
+    payload.append(copy_mask & 0xFF)
     for v in delay_values:
         vv = int(v) & 0xFFFF
         payload.extend(((vv >> 8) & 0xFF, vv & 0xFF))
@@ -194,9 +194,9 @@ def pdu_wse(sys_runstate: int, q_runstate: int) -> bytes:
 def parse_rss_pdu(pdu: bytes) -> SystemSetup:
     if len(pdu) != 17 or pdu[:3] != CMD_RSS:
         raise ValueError("RSS PDU 非法")
-    # 规约顺序: copy_mask -> enable_mask -> 4x delay_value -> 4x delay_unit
-    copy_mask = pdu[3]
-    enable_mask = pdu[4]
+    # TS protocol order: enable_mask -> copy_mask -> 4x delay_value -> 4x delay_unit.
+    enable_mask = pdu[3]
+    copy_mask = pdu[4]
     delay_values = [
         (pdu[5] << 8) | pdu[6],
         (pdu[7] << 8) | pdu[8],
@@ -247,4 +247,3 @@ def parse_rsp_pdu(pdu: bytes) -> ChannelParams:
         repeat_count=(pdu[15] << 8) | pdu[16],
         interval_value=(pdu[17] << 8) | pdu[18],
     )
-

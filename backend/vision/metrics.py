@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Deque, Dict
@@ -81,6 +82,9 @@ class MetricsCalculator:
         self._config = config
         self._log = logger or (lambda _msg: None)
         self._diameter_history: Deque[float] = deque(maxlen=max(1, config.rolling_window))
+        self._realtime_window: Deque[tuple[float, list[float], int, int]] = deque()
+        self._realtime_window_start: float | None = None
+        self._last_realtime_summary: tuple[list[float], int, int] = ([], 0, 0)
         self._track_bead_max: Dict[int, int] = {}
         self._track_state: Dict[int, _TrackState] = {}
         self._counted_track_ids: set[int] = set()
@@ -169,6 +173,14 @@ class MetricsCalculator:
         multi_count = sum(1 for value in bead_counts if value >= 2)
 
         frame_single_cell_count = sum(1 for value in frame_bead_counts.values() if int(value) == 1)
+        window_diameters, window_single_cell_count, window_droplet_count = self._update_realtime_window(
+            frame_diameters=frame_diameters,
+            frame_single_cell_count=frame_single_cell_count,
+            frame_droplet_count=frame_droplet_count,
+        )
+        frame_diameters = window_diameters
+        frame_droplet_count = window_droplet_count
+        frame_single_cell_count = window_single_cell_count
         frame_single_cell_rate = (
             (float(frame_single_cell_count) / float(frame_droplet_count)) * 100.0
             if frame_droplet_count > 0
@@ -269,8 +281,46 @@ class MetricsCalculator:
 
         return MetricsResult(control=control, analysis=analysis)
 
+    def _update_realtime_window(
+        self,
+        *,
+        frame_diameters: list[float],
+        frame_single_cell_count: int,
+        frame_droplet_count: int,
+    ) -> tuple[list[float], int, int]:
+        now = time.monotonic()
+        window_s = max(0.001, float(self._config.realtime_window_ms) / 1000.0)
+        if self._realtime_window_start is None:
+            self._realtime_window_start = now
+        self._realtime_window.append(
+            (
+                now,
+                [float(value) for value in frame_diameters],
+                int(frame_single_cell_count),
+                int(frame_droplet_count),
+            )
+        )
+        if now - self._realtime_window_start < window_s:
+            diameters, single_count, droplet_count = self._last_realtime_summary
+            return list(diameters), int(single_count), int(droplet_count)
+
+        diameters: list[float] = []
+        single_count = 0
+        droplet_count = 0
+        for _, entry_diameters, entry_single_count, entry_droplet_count in self._realtime_window:
+            diameters.extend(entry_diameters)
+            single_count += int(entry_single_count)
+            droplet_count += int(entry_droplet_count)
+        self._last_realtime_summary = (list(diameters), int(single_count), int(droplet_count))
+        self._realtime_window.clear()
+        self._realtime_window_start = None
+        return list(diameters), int(single_count), int(droplet_count)
+
     def reset(self) -> None:
         self._diameter_history.clear()
+        self._realtime_window.clear()
+        self._realtime_window_start = None
+        self._last_realtime_summary = ([], 0, 0)
         self._track_bead_max.clear()
         self._track_state.clear()
         self._counted_track_ids.clear()

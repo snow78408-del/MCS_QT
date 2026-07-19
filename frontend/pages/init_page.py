@@ -9,14 +9,29 @@ class InitPage(ttk.Frame):
     def __init__(self, parent, app):
         super().__init__(parent)
         self.app = app
-        self.q1_var = tk.StringVar(value="100")
-        self.q2_var = tk.StringVar(value="100")
-        self.port_var = tk.StringVar(value="COM12")
+        self.q1_var = tk.StringVar(value="50")
+        self.q2_var = tk.StringVar(value="20")
+        self.port_var = tk.StringVar(value="")
         self.addr_var = tk.StringVar(value="1")
         self.baud_var = tk.StringVar(value="1200")
-        self.parity_var = tk.StringVar(value="E")
+        self.parity_var = tk.StringVar(value="N")
         self.status_var = tk.StringVar(value="未初始化")
         self._build()
+
+    def on_show(self) -> None:
+        self.q1_var.set(str(self.app.frontend_config.get("initial_q1", self.q1_var.get()) or "50"))
+        self.q2_var.set(str(self.app.frontend_config.get("initial_q2", self.q2_var.get()) or "20"))
+        self.addr_var.set(str(self.app.frontend_config.get("pump_address", self.addr_var.get()) or "1"))
+        self.baud_var.set(str(self.app.frontend_config.get("pump_baudrate", self.baud_var.get()) or "1200"))
+        self.parity_var.set(str(self.app.frontend_config.get("pump_parity", self.parity_var.get()) or "N").upper())
+
+        configured_port = str(self.app.frontend_config.get("pump_port", "") or "").strip().upper()
+        detected_ports = self._detect_ports()
+        if configured_port and (not detected_ports or configured_port in detected_ports):
+            self.port_var.set(configured_port)
+            return
+        if detected_ports:
+            self.port_var.set(detected_ports[0])
 
     def _build(self) -> None:
         card = ttk.LabelFrame(self, text="初始化参数设置")
@@ -40,7 +55,7 @@ class InitPage(ttk.Frame):
         ttk.Entry(card, textvariable=self.baud_var, width=24).grid(row=4, column=1, padx=8, pady=8, sticky="w")
 
         ttk.Label(card, text="校验位").grid(row=5, column=0, padx=8, pady=8, sticky="w")
-        ttk.Combobox(card, textvariable=self.parity_var, values=("E", "N"), width=21, state="readonly").grid(
+        ttk.Combobox(card, textvariable=self.parity_var, values=("N", "E"), width=21, state="readonly").grid(
             row=5, column=1, padx=8, pady=8, sticky="w"
         )
 
@@ -73,7 +88,7 @@ class InitPage(ttk.Frame):
 
             port = self.port_var.get().strip().upper()
             if not port:
-                raise ValueError("泵串口号不能为空，例如 COM12")
+                raise ValueError("泵串口号不能为空，请填写设备管理器中的实际 COM 口，例如 COM3")
 
             addr = int(self.addr_var.get().strip())
             if not (0 <= addr <= 255):
@@ -96,6 +111,11 @@ class InitPage(ttk.Frame):
         self.app.frontend_config["pump_address"] = addr
         self.app.frontend_config["pump_baudrate"] = baud
         self.app.frontend_config["pump_parity"] = parity
+        self.app.runtime_logger(
+            "[UI][INIT_SUBMIT] "
+            f"q1={q1:.6f}uL/min q2={q2:.6f}uL/min "
+            f"port={port} addr={addr} baud={baud} parity={parity}"
+        )
         self.status_var.set("初始化中...")
 
         def task():
@@ -121,4 +141,17 @@ class InitPage(ttk.Frame):
             messagebox.showerror("初始化失败", f"{detail}\n\n{diagnose}")
 
         self.app.run_backend_task(task, on_success=ok, on_error=fail)
+
+    @staticmethod
+    def _detect_ports() -> list[str]:
+        try:
+            from serial.tools import list_ports
+
+            ports = [p.device for p in list_ports.comports() if getattr(p, "device", "")]
+        except Exception:
+            ports = []
+        if not ports:
+            return []
+        ports.sort(key=lambda item: (len(str(item)), str(item)))
+        return [str(port).upper() for port in ports]
 
