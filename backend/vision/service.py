@@ -73,16 +73,21 @@ class VisionCameraService:
     def select_camera(self, unique_id: str, backend_name: str | None = None) -> dict[str, Any]:
         return self.manager.select_device(unique_id, backend_name).to_dict()
 
-    def test_camera(self, unique_id: str | None = None, backend_name: str | None = None) -> dict[str, Any]:
+    def test_camera(
+        self,
+        unique_id: str | None = None,
+        backend_name: str | None = None,
+        camera_config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if unique_id:
             self.manager.select_device(unique_id, backend_name)
-        return asdict(self.manager.test_device())
+        return asdict(self.manager.test_device(camera_config))
 
-    def configure_camera(self, camera_config: dict[str, Any] | None = None) -> None:
+    def configure_camera(self, camera_config: dict[str, Any] | None = None) -> dict[str, Any] | None:
         if isinstance(camera_config, str):
             self.manager.select_device(camera_config)
             return
-        self.manager.configure_selected(camera_config or {})
+        return self.manager.configure_selected(camera_config or {})
 
     def open_camera(self, unique_id: str | None = None, backend_name: str | None = None) -> None:
         if unique_id:
@@ -140,12 +145,16 @@ def select_camera(unique_id: str, backend_name: str | None = None) -> dict[str, 
     return _default_service.select_camera(unique_id, backend_name)
 
 
-def test_camera(unique_id: str | None = None, backend_name: str | None = None) -> dict[str, Any]:
-    return _default_service.test_camera(unique_id, backend_name)
+def test_camera(
+    unique_id: str | None = None,
+    backend_name: str | None = None,
+    camera_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return _default_service.test_camera(unique_id, backend_name, camera_config)
 
 
-def configure_camera(camera_config: dict[str, Any] | None = None) -> None:
-    _default_service.configure_camera(camera_config)
+def configure_camera(camera_config: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    return _default_service.configure_camera(camera_config)
 
 
 def open_camera(unique_id: str | None = None, backend_name: str | None = None) -> None:

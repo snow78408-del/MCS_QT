@@ -7,10 +7,10 @@ import numpy as np
 
 try:
     from .config import TrackerConfig
-    from .tracker import BaseTracker, DropletTrack, TrackingResult, as_points, greedy_match
+    from .tracker import BaseTracker, DropletTrack, TrackingResult, as_points, radius_gated_match
 except ImportError:
     from config import TrackerConfig
-    from tracker import BaseTracker, DropletTrack, TrackingResult, as_points, greedy_match
+    from tracker import BaseTracker, DropletTrack, TrackingResult, as_points, radius_gated_match
 
 
 @dataclass
@@ -81,17 +81,23 @@ class KalmanTracker(BaseTracker):
         for track in self._tracks:
             predicted_positions.append(self._predict(track))
 
-        matches, unmatched_tracks, unmatched_dets = greedy_match(
+        matches, unmatched_tracks, unmatched_dets = radius_gated_match(
             predicted_positions,
+            [float(track.radius) for track in self._tracks],
             points,
-            self._config.match_distance,
+            radius_values,
+            max_distance=float(self._config.match_distance),
+            min_distance=float(self._config.min_match_distance),
+            distance_radius_ratio=float(self._config.match_distance_radius_ratio),
+            radius_match_ratio=float(self._config.radius_match_ratio),
         )
 
         matched_pairs: List[Tuple[int, int]] = []
         for track_idx, det_idx in matches:
             track = self._tracks[track_idx]
             self._update_with_measurement(track, points[det_idx])
-            track.radius = float(radius_values[det_idx])
+            alpha = min(1.0, max(0.0, float(self._config.radius_smoothing_alpha)))
+            track.radius = (1.0 - alpha) * float(track.radius) + alpha * float(radius_values[det_idx])
             track.unmatched_frames = 0
             track.age += 1
             matched_pairs.append((track.id, det_idx))
@@ -119,6 +125,7 @@ class KalmanTracker(BaseTracker):
             )
             self._tracks.append(track)
             new_track_ids.append(track.id)
+            matched_pairs.append((track.id, det_idx))
             self._next_id += 1
 
         predicted_lookup = {track.id: self._f @ track.state for track in self._tracks}

@@ -70,14 +70,17 @@ class InitPage(ttk.Frame):
 
     def _initialize(self) -> None:
         try:
-            try:
-                import serial  # noqa: F401
-            except Exception as e:
-                raise ValueError(
-                    "当前 Python 环境缺少 pyserial。\n"
-                    "请使用 D:\\学习\\microfluidic_control_system\\backend\\venv\\Scripts\\python.exe 启动。\n"
-                    f"当前解释器: {sys.executable}"
-                ) from e
+            local_video_mode = str(
+                self.app.frontend_config.get("video_source_type", "") or ""
+            ).strip().lower() == "file"
+            if not local_video_mode:
+                try:
+                    import serial  # noqa: F401
+                except Exception as e:
+                    raise ValueError(
+                        "当前 Python 环境缺少 pyserial。\n"
+                        f"请在当前解释器安装 pyserial: {sys.executable} -m pip install pyserial"
+                    ) from e
 
             q1 = float(self.q1_var.get().strip())
             q2 = float(self.q2_var.get().strip())
@@ -87,7 +90,7 @@ class InitPage(ttk.Frame):
                 raise ValueError("初始 Q2 流速必须大于 0，单位为 uL/min")
 
             port = self.port_var.get().strip().upper()
-            if not port:
+            if not local_video_mode and not port:
                 raise ValueError("泵串口号不能为空，请填写设备管理器中的实际 COM 口，例如 COM3")
 
             addr = int(self.addr_var.get().strip())
@@ -105,12 +108,14 @@ class InitPage(ttk.Frame):
             messagebox.showerror("输入错误", str(e))
             return
 
-        self.app.frontend_config["initial_q1"] = q1
-        self.app.frontend_config["initial_q2"] = q2
-        self.app.frontend_config["pump_port"] = port
-        self.app.frontend_config["pump_address"] = addr
-        self.app.frontend_config["pump_baudrate"] = baud
-        self.app.frontend_config["pump_parity"] = parity
+        self.app.update_frontend_config(
+            initial_q1=q1,
+            initial_q2=q2,
+            pump_port=port,
+            pump_address=addr,
+            pump_baudrate=baud,
+            pump_parity=parity,
+        )
         self.app.runtime_logger(
             "[UI][INIT_SUBMIT] "
             f"q1={q1:.6f}uL/min q2={q2:.6f}uL/min "

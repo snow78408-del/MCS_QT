@@ -7,6 +7,12 @@
 ## 2. 当前目录结构
 ```text
 vision/
+├── camera_profiles.py
+├── cameras/
+│   ├── base.py
+│   ├── registry.py
+│   ├── manager.py
+│   └── adapters/
 ├── detector.py
 ├── tracker.py
 ├── nearest_tracker.py
@@ -31,6 +37,8 @@ vision/
 
 ## 3. 每个文件功能
 - `config.py`：统一管理参数（半径范围、圆度阈值、ROI、匹配距离、最大未匹配帧数、磁珠面积、debug 开关、tracker 类型、Kalman 参数等）。
+- `camera_profiles.py`：按相机厂商/型号提供可编辑的推荐起始参数，并负责下发前的类型和范围预校验。
+- `cameras/`：工业相机统一接口、设备注册表和生命周期管理；当前优先使用海康机器人适配器，其他厂商通过同一适配器接口扩展。
 - `detector.py`：液滴检测模块，统一了“考虑粘连拆分”和“不拆分”两种检测策略，输出圆心、半径、调试图、辅助掩膜。
 - `tracker.py`：统一跟踪接口和数据结构（`DropletTrack`、`TrackingResult`、`BaseTracker`）。
 - `nearest_tracker.py`：最近邻跟踪实现，保留基础行为用于快速基线验证。
@@ -54,7 +62,7 @@ vision/
 - `kalman`：引入运动状态预测（`x,y,vx,vy`），短时丢检时可依赖预测维持轨迹，稳定性更高。
 
 ## 6. 默认版本与切换方式
-- 默认：`nearest`。
+- 默认：`kalman`。
 - 切换方式：运行时通过 `--tracker nearest|kalman` 切换。
 
 ## 7. preprocess 子模块职责
@@ -80,8 +88,18 @@ vision/
 - 提供最近邻与 Kalman 双跟踪器，可按配置切换。
 - 输出数据结构标准化（`VisionResult`、`DropletTrack`、`TrackingResult`、`BeadResult`）。
 - 预处理与识别主流程解耦，便于后续扩展。
+- 预览帧与识别结果分别维护帧号和时间戳，PID 只使用同一次识别产生的数据。
+- 实时统计按轨迹 ID 去重，避免同一液滴停留多帧时被重复计入控制样本。
+- 检测尺寸范围随用户目标直径与标定比例缩放，不绑定固定的 50 μm。
+- 相机测试和正式运行使用同一套参数下发路径；支持的参数写入失败时会终止测试，不静默继续。
 
-## 12. 待改进方向
+## 12. 相机适配边界
+- `cameras/base.py` 定义厂商无关接口，`registry.py` 负责后端注册和优先级。
+- 海康机器人是当前启用和优先后端，保留现有 MVS/直接 SDK 兼容路径。
+- 新相机只需新增适配器并注册，不应把厂商 SDK 调用写入 detector、pipeline、orchestrator 或前端。
+- 海康直接 DLL 路径可确认写入调用是否成功；曝光、增益和帧率的精确回读能力取决于当前 SDK 路径，分辨率会通过实际测试帧再次校验。
+
+## 13. 待改进方向
 - 引入 Hungarian/IoU 等更稳健匹配策略。
 - ROI 自动估计与自适应阈值策略。
 - 多通道融合和光照鲁棒性增强。

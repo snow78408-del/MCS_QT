@@ -56,9 +56,12 @@ frontend/dist/
 frontend/.vite/
 frontend/.cache/
 frontend/coverage/
+data/frontend_settings.json
+data/frontend_settings.json.tmp
 
 # Vision intermediate outputs
 outputs/
+simulation_outputs/
 output/
 results/
 artifacts/

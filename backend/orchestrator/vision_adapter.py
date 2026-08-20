@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from collections import deque
 import queue
 import threading
 import time
@@ -12,13 +13,21 @@ try:
 except Exception:  # pragma: no cover - handled at runtime for local video only
     cv2 = None
 
-from .models import RecognitionSnapshot
+from .models import FrameSnapshot, RecognitionSnapshot
 
 INDUSTRIAL_CAMERA_BACKENDS = {"hikrobot", "basler", "daheng", "flir", "allied_vision", "gentl"}
-PREVIEW_MAX_WIDTH = 760
-PREVIEW_MAX_HEIGHT = 560
+PREVIEW_MAX_WIDTH = 640
+PREVIEW_MAX_HEIGHT = 480
 PREVIEW_TARGET_INTERVAL_S = 1.0 / 30.0
-PROCESS_TARGET_INTERVAL_S = 0.08
+PREVIEW_JPEG_QUALITY = 82
+MOTION_WINDOW_FRAMES = 5
+PROCESSING_BATCH_QUEUE_SIZE = 2
+PREVIEW_QUEUE_SIZE = 1
+SAMPLING_QUEUE_SIZE = 32
+GENERATION_RATE_WINDOW_S = 1.0
+# The detector intentionally prioritizes well-scored, de-duplicated candidates.
+# Matching its measured throughput keeps the queue near-empty and prevents PID
+# decisions from using stale frames, while the independent preview stays 30 FPS.
 
 
 @runtime_checkable
@@ -27,6 +36,7 @@ class VisionAdapterProtocol(Protocol):
     def start(self) -> None: ...
     def stop(self) -> None: ...
     def get_snapshot(self) -> RecognitionSnapshot | dict[str, Any]: ...
+    def get_frame_snapshot(self) -> FrameSnapshot | None: ...
 
 
 class GenericVisionAdapter:
@@ -74,18 +84,53 @@ class PipelineVisionService:
         self._video_source = "0"
         self._selected_backend = ""
         self._pixel_to_micron = 1.0
+        self._expected_diameter_um = 0.0
         self._lock = threading.RLock()
         self._cap = None
         self._worker: threading.Thread | None = None
         self._process_worker: threading.Thread | None = None
-        self._frame_queue: queue.Queue[tuple[int, float, Any]] = queue.Queue(maxsize=3)
+        self._preview_worker: threading.Thread | None = None
+        self._sampling_worker: threading.Thread | None = None
+        # Preserve consecutive frames inside each motion-analysis batch. If the
+        # detector falls behind, an entire old batch is replaced.
+        self._frame_queue: queue.Queue[list[tuple[int, float, Any]]] = queue.Queue(
+            maxsize=PROCESSING_BATCH_QUEUE_SIZE
+        )
+        self._preview_queue: queue.Queue[tuple[int, float, Any]] = queue.Queue(maxsize=PREVIEW_QUEUE_SIZE)
+        self._sampling_queue: queue.Queue[tuple[int, float, Any]] = queue.Queue(maxsize=SAMPLING_QUEUE_SIZE)
+        self._capture_batch: list[tuple[int, float, Any]] = []
+        self._analysis_batch_started_at = 0.0
+        self._next_analysis_batch_time = 0.0
         self._stop_event = threading.Event()
         self._last_processed_frame_id = 0
         self._last_processed_frame_timestamp = 0.0
         self._capture_frame_id = 0
         self._last_preview_publish_time = 0.0
         self._last_processing_submit_time = 0.0
+        self._camera_parameters: dict[str, float | int | str] = {}
+        self._local_frame_interval_s = 0.0
+        self._next_local_frame_time = 0.0
+        self._capture_times: deque[float] = deque(maxlen=240)
+        self._processing_times: deque[float] = deque(maxlen=240)
+        self._replacement_times: deque[float] = deque(maxlen=4000)
+        self._observed_radii: deque[tuple[float, float]] = deque(maxlen=4000)
+        self._calibration_stats: deque[tuple[float, float, float, float, float]] = deque(maxlen=4000)
+        self._replaced_processing_frames = 0
+        self._processed_frame_count = 0
+        self._recognition_latency_ms = 0.0
+        self._algorithm_processing_ms = 0.0
+        self._processing_busy = False
+        self._motion_observations: deque[tuple[float, dict[int, tuple[float, float]]]] = deque(
+            maxlen=MOTION_WINDOW_FRAMES
+        )
+        self._crossing_times: deque[float] = deque(maxlen=1000)
+        self._average_droplet_speed_um_s: float | None = None
+        self._speed_sample_count = 0
+        self._droplet_generation_rate_hz = 0.0
+        self._last_motion_frame_id = 0
+        self._control_interval_ms = 300
         self._latest = self._empty_snapshot("当前无有效液滴通过")
+        self._latest_preview: FrameSnapshot | None = None
 
     def _ensure_pipeline(self):
         if self._pipeline is None:
@@ -130,6 +175,8 @@ class PipelineVisionService:
             video_source_type=self._video_source_type,
             video_source=self._video_source,
             frame_id=0,
+            preview_frame_id=0,
+            preview_timestamp=0.0,
             frame_single_cell_count=0,
             frame_diameters=[],
             frame_diameter_sum=0.0,
@@ -149,7 +196,6 @@ class PipelineVisionService:
             return replace(
                 current,
                 valid_for_control=False,
-                timestamp=time.time(),
                 reason=reason,
                 control_reason=reason,
                 uniformity_valid=False,
@@ -162,6 +208,176 @@ class PipelineVisionService:
 
     def set_selected_backend(self, backend_name: str) -> None:
         self._selected_backend = str(backend_name or "").strip()
+
+    def set_camera_parameters(self, parameters: dict[str, Any] | None) -> None:
+        allowed = {"exposure", "gain", "frame_rate", "width", "height"}
+        normalized: dict[str, float | int | str] = {}
+        for name, value in (parameters or {}).items():
+            if name not in allowed or value in (None, ""):
+                continue
+            normalized[name] = value
+        self._camera_parameters = normalized
+
+    def configure_detection_scale(self, target_diameter_um: float, pixel_to_micron: float) -> None:
+        self._expected_diameter_um = max(0.0, float(target_diameter_um))
+        self._pixel_to_micron = float(pixel_to_micron) if float(pixel_to_micron) > 0.0 else 1.0
+        pipeline = self._ensure_pipeline()
+        # The target is a soft preference only.  The outline radius must come
+        # from the observed droplet edge; otherwise changing the PID setpoint
+        # would also make the recognition circle appear artificially larger or
+        # smaller than the droplet in the camera image.
+        pipeline.config.detector.expected_size_hard_gate = False
+        pipeline.config.detector.hough_work_max_width = 480
+        pipeline.config.detector.hough_work_max_height = 360
+        pipeline.config.detector.hough_max_candidates = 40
+        pipeline.config.detector.intensity_peak_max_candidates = 40
+        # The intensity-peak path scans many radii around many local extrema and
+        # was the dominant full-frame CPU cost. Contours + Hough + tracking give
+        # better realtime coverage for this bright-field stream.
+        pipeline.config.detector.enable_intensity_peak_candidates = False
+        pipeline.config.detector.enable_intensity_peak_fallback = True
+        pipeline.config.detector.hough_fallback_only = True
+        # Recover weaker, partially illuminated droplets, then let geometric
+        # scoring and temporal tracking reject isolated false candidates.
+        pipeline.config.detector.hough_param2 = 22.0
+        pipeline.config.detector.hough_edge_support_threshold = 0.12
+        pipeline.config.detector.candidate_min_edge_support = 0.12
+        pipeline.config.detector.candidate_full_circle_ratio = 0.75
+        # Recognition may run much slower than camera acquisition.  A droplet
+        # can move farther than the old 120 px gate between processed frames.
+        pipeline.config.tracker.match_distance = 180.0
+        pipeline.config.tracker.match_distance_radius_ratio = 4.0
+        pipeline.detector.configure_expected_diameter(
+            self._expected_diameter_um,
+            self._pixel_to_micron,
+        )
+        min_r, preferred_r, max_r = pipeline.detector.runtime_radius_range()
+        self._log(
+            "[VISION][DETECTOR][SCALE] "
+            f"target={self._expected_diameter_um:.3f}um "
+            f"pixel_to_micron={self._pixel_to_micron:.6f} "
+            f"broad_target_size_guard=False "
+            f"radius_px={min_r:.2f}/{preferred_r:.2f}/{max_r:.2f}"
+        )
+
+    def configure_control_interval(self, control_interval_ms: int) -> None:
+        """Use the user-selected control period as the recognition window."""
+        pipeline = self._ensure_pipeline()
+        pipeline.config.metrics.realtime_window_ms = max(1, int(control_interval_ms))
+        self._control_interval_ms = pipeline.config.metrics.realtime_window_ms
+        self._log(
+            "[VISION][METRICS][WINDOW] "
+            f"control_interval_ms={pipeline.config.metrics.realtime_window_ms}"
+        )
+
+    def set_recognition_roi(self, roi: dict[str, Any] | None) -> None:
+        config = self._ensure_pipeline().config.roi
+        values = dict(roi or {})
+        config.enabled = bool(values.get("enabled", False))
+        config.x_start_ratio = max(0.0, min(1.0, float(values.get("x_start_ratio", 0.0))))
+        config.x_end_ratio = max(0.0, min(1.0, float(values.get("x_end_ratio", 1.0))))
+        config.y_start_ratio = max(0.0, min(1.0, float(values.get("y_start_ratio", 0.0))))
+        config.y_end_ratio = max(0.0, min(1.0, float(values.get("y_end_ratio", 1.0))))
+        if config.x_end_ratio <= config.x_start_ratio or config.y_end_ratio <= config.y_start_ratio:
+            raise ValueError("识别 ROI 的结束坐标必须大于开始坐标")
+        config.crop_top_ratio = 0.0
+        self._log(f"[VISION][ROI] enabled={config.enabled} x={config.x_start_ratio:.3f}-{config.x_end_ratio:.3f} y={config.y_start_ratio:.3f}-{config.y_end_ratio:.3f}")
+
+    def auto_calibrate_detection(self, duration_s: float = 3.0) -> dict[str, Any]:
+        started = time.time()
+        with self._lock:
+            baseline = self._processed_frame_count
+            # Ensure calibration does not wait for the next normal control
+            # period before it can collect a fresh five-frame sample.
+            self._next_analysis_batch_time = 0.0
+        while time.time() - started < max(0.5, float(duration_s)) and not self._stop_event.is_set():
+            time.sleep(0.05)
+        with self._lock:
+            radii = [radius for sample_time, radius in self._observed_radii if sample_time >= started]
+            stats = [item for item in self._calibration_stats if item[0] >= started]
+            processed = self._processed_frame_count - baseline
+        if processed < 3 or len(radii) < 3:
+            raise RuntimeError(f"自动标定样本不足：处理 {processed} 帧，仅识别到 {len(radii)} 个液滴样本")
+        sorted_radii = sorted(float(value) for value in radii)
+        radius_median = sorted_radii[len(sorted_radii) // 2]
+        deviations = sorted(abs(value - radius_median) for value in sorted_radii)
+        radius_mad = deviations[len(deviations) // 2]
+        robust_cv = 100.0 * 1.4826 * radius_mad / max(1.0, radius_median)
+        if robust_cv > 35.0:
+            raise RuntimeError(
+                f"自动标定检测到的移动目标尺寸不稳定（稳健 CV={robust_cv:.1f}%），"
+                "请缩小 ROI、排除气泡和反光后重试"
+            )
+        preferred = self._ensure_pipeline().detector.calibrate_preferred_radius(radii)
+        brightness = sorted(item[1] for item in stats)
+        noise = sorted(item[2] for item in stats)
+        center_contrasts = sorted(item[3] for item in stats)
+        ring_contrasts = sorted(item[4] for item in stats)
+        median = lambda values: float(values[len(values) // 2]) if values else 0.0
+        center_median = median(center_contrasts)
+        ring_median = median(ring_contrasts)
+        polarity = "亮心暗边" if center_median >= 0.0 else "暗心亮边"
+        detector_config = self._ensure_pipeline().config.detector
+        # Only enable a polarity threshold when the measured separation is
+        # strong; otherwise retain polarity-neutral detection.
+        detector_config.candidate_min_center_contrast = max(0.01, center_median * 0.35) if center_median >= 0.04 else -1.0
+        detector_config.candidate_min_ring_contrast = max(0.005, ring_median * 0.30) if ring_median >= 0.025 else -1.0
+        result = {
+            "ok": True,
+            "sample_count": len(radii),
+            "processed_frames": processed,
+            "preferred_radius_px": preferred,
+            "preferred_diameter_px": preferred * 2.0,
+            "radius_robust_cv_percent": robust_cv,
+            "background_brightness": median(brightness),
+            "noise_sigma": median(noise),
+            "polarity": polarity,
+            "center_contrast_threshold": detector_config.candidate_min_center_contrast,
+            "ring_contrast_threshold": detector_config.candidate_min_ring_contrast,
+        }
+        self._log(f"[VISION][CALIBRATION] {result}")
+        return result
+
+    @staticmethod
+    def _rate(times: deque[float], now: float) -> float:
+        recent = [value for value in times if now - value <= 1.0]
+        return float(len(recent))
+
+    def _diagnostics(self) -> dict[str, float | int | str]:
+        now = time.time()
+        with self._lock:
+            period_start = now - self._control_interval_ms / 1000.0
+            capture_fps = self._rate(self._capture_times, now)
+            processing_fps = self._rate(self._processing_times, now)
+            period_frames = sum(value >= period_start for value in self._processing_times)
+            period_replaced = sum(value >= period_start for value in self._replacement_times)
+            pending_frames = (
+                int(self._frame_queue.qsize()) * MOTION_WINDOW_FRAMES
+                + (MOTION_WINDOW_FRAMES if self._processing_busy else 0)
+                + len(self._capture_batch)
+            )
+            if capture_fps <= 0.0:
+                status = "相机没有新画面"
+            elif period_frames <= 0:
+                status = "识别线程未完成处理"
+            elif self._recognition_latency_ms > self._control_interval_ms or (capture_fps >= 3.0 and processing_fps < capture_fps * 0.5):
+                status = "识别线程来不及，正在替换旧帧"
+            elif self._latest.frame_droplet_count <= 0:
+                status = "画面正常更新，但当前未识别到液滴"
+            else:
+                status = "视觉性能正常"
+            return {
+                "capture_fps": capture_fps,
+                "processing_fps": processing_fps,
+                "recognition_latency_ms": self._recognition_latency_ms,
+                "algorithm_processing_ms": self._algorithm_processing_ms,
+                "replaced_processing_frames": self._replaced_processing_frames,
+                "pending_processing_frames": pending_frames,
+                "period_replaced_processing_frames": period_replaced,
+                "processed_frame_count": self._processed_frame_count,
+                "period_processed_frames": period_frames,
+                "vision_performance_status": status,
+            }
 
     def discover_cameras_result(self) -> dict[str, Any]:
         return self._camera_service.discover_cameras_result()
@@ -177,8 +393,8 @@ class PipelineVisionService:
         self._selected_backend = str(backend_name or "")
         return self._camera_service.select_camera(unique_id, backend_name)
 
-    def test_camera(self) -> dict[str, Any]:
-        return self._camera_service.test_camera()
+    def test_camera(self, camera_config: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self._camera_service.test_camera(camera_config=camera_config or self._camera_parameters)
 
     def get_camera_status(self) -> dict[str, Any]:
         return self._camera_service.get_camera_status()
@@ -194,8 +410,22 @@ class PipelineVisionService:
             self._capture_frame_id = 0
             self._last_preview_publish_time = 0.0
             self._last_processing_submit_time = 0.0
+            self._analysis_batch_started_at = 0.0
+            self._next_analysis_batch_time = 0.0
+            self._capture_times.clear()
+            self._processing_times.clear()
+            self._observed_radii.clear()
+            self._calibration_stats.clear()
+            self._replaced_processing_frames = 0
+            self._replacement_times.clear()
+            self._processed_frame_count = 0
+            self._recognition_latency_ms = 0.0
+            self._algorithm_processing_ms = 0.0
+            self._local_frame_interval_s = 0.0
+            self._next_local_frame_time = 0.0
             self._ensure_pipeline().reset()
             self._latest = self._empty_snapshot("视频输入已准备，等待识别")
+            self._latest_preview = None
 
         if self._is_realtime_mode():
             backend = self._selected_backend or _backend_from_mode(self._video_source_type)
@@ -208,6 +438,9 @@ class PipelineVisionService:
                 f"serial={selected.get('serial_number')} unique_id={selected.get('unique_id')}"
             )
             self._camera_service.open_camera()
+            if self._camera_parameters:
+                applied = self._camera_service.configure_camera(self._camera_parameters)
+                self._log(f"[VISION][CAMERA][PARAMETERS] {applied}")
             self._camera_service.start_camera_stream()
             deadline = time.time() + 3.0
             packet = self._camera_service.get_latest_frame()
@@ -222,11 +455,11 @@ class PipelineVisionService:
                 f"width={packet.width} height={packet.height} pixel_format={packet.pixel_format}"
             )
             try:
-                snapshot = self._snapshot_from_frame(packet.image)
-                with self._lock:
-                    self._latest = snapshot
-                    self._last_processed_frame_id = int(packet.frame_id or 0)
-                    self._last_processed_frame_timestamp = float(packet.timestamp or time.time())
+                self._publish_video_frame(
+                    packet.image,
+                    frame_id=int(packet.frame_id or 0),
+                    timestamp=float(packet.timestamp or time.time()),
+                )
             except Exception as exc:
                 self._log(f"[VISION][PREVIEW][WARN] initial frame process failed: {exc}")
             self.start()
@@ -246,12 +479,33 @@ class PipelineVisionService:
                 return
             if not self._is_realtime_mode():
                 self._cap = self._open_capture()
-            self._frame_queue = queue.Queue(maxsize=3)
+                fps = float(self._cap.get(cv2.CAP_PROP_FPS) or 0.0)
+                if 0.5 <= fps <= 240.0:
+                    self._local_frame_interval_s = 1.0 / fps
+                else:
+                    self._local_frame_interval_s = 1.0 / 30.0
+                self._next_local_frame_time = time.monotonic()
+            self._frame_queue = queue.Queue(maxsize=PROCESSING_BATCH_QUEUE_SIZE)
+            self._preview_queue = queue.Queue(maxsize=PREVIEW_QUEUE_SIZE)
+            self._sampling_queue = queue.Queue(maxsize=SAMPLING_QUEUE_SIZE)
+            self._capture_batch = []
+            self._analysis_batch_started_at = 0.0
+            self._next_analysis_batch_time = 0.0
+            self._motion_observations.clear()
+            self._crossing_times.clear()
+            self._average_droplet_speed_um_s = None
+            self._speed_sample_count = 0
+            self._droplet_generation_rate_hz = 0.0
+            self._last_motion_frame_id = 0
             self._stop_event.clear()
             self._worker = threading.Thread(target=self._capture_loop, name="vision-capture-loop", daemon=True)
             self._process_worker = threading.Thread(target=self._process_loop, name="vision-processing-loop", daemon=True)
+            self._preview_worker = threading.Thread(target=self._preview_loop, name="vision-preview-loop", daemon=True)
+            self._sampling_worker = threading.Thread(target=self._sampling_loop, name="vision-sampling-loop", daemon=True)
             self._worker.start()
             self._process_worker.start()
+            self._preview_worker.start()
+            self._sampling_worker.start()
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -261,11 +515,19 @@ class PipelineVisionService:
         process_worker = self._process_worker
         if process_worker is not None and process_worker.is_alive() and process_worker is not threading.current_thread():
             process_worker.join(timeout=1.0)
+        preview_worker = self._preview_worker
+        if preview_worker is not None and preview_worker.is_alive() and preview_worker is not threading.current_thread():
+            preview_worker.join(timeout=1.0)
+        sampling_worker = self._sampling_worker
+        if sampling_worker is not None and sampling_worker.is_alive() and sampling_worker is not threading.current_thread():
+            sampling_worker.join(timeout=1.0)
         with self._lock:
             cap = self._cap
             self._cap = None
             self._worker = None
             self._process_worker = None
+            self._preview_worker = None
+            self._sampling_worker = None
         if cap is not None:
             cap.release()
         try:
@@ -279,10 +541,49 @@ class PipelineVisionService:
             return None, 0, 0
         try:
             preview = self._resize_preview_frame(frame)
-            ok, buf = cv2.imencode(".png", preview, [int(cv2.IMWRITE_PNG_COMPRESSION), 1])
+            # Compression level 0 minimizes CPU latency. The preview is an
+            # in-process UI stream, so a larger payload is preferable to
+            # stalling acquisition/Tk on deflate work.
+            ok, buf = cv2.imencode(".png", preview, [int(cv2.IMWRITE_PNG_COMPRESSION), 0])
             if not ok:
                 return None, int(preview.shape[1]), int(preview.shape[0])
             return base64.b64encode(buf.tobytes()).decode("ascii"), int(preview.shape[1]), int(preview.shape[0])
+        except Exception:
+            return None, 0, 0
+
+    def _encode_jpeg(self, frame) -> tuple[bytes | None, int, int]:
+        """Encode a compact preview frame for cross-process transport."""
+        if cv2 is None:
+            return None, 0, 0
+        try:
+            preview = self._resize_preview_frame(frame)
+            if getattr(preview.dtype, "name", "") != "uint8":
+                preview = cv2.normalize(preview, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+            if preview.ndim == 3 and int(preview.shape[2]) == 4:
+                preview = cv2.cvtColor(preview, cv2.COLOR_BGRA2BGR)
+            height, width = int(preview.shape[0]), int(preview.shape[1])
+            ok, encoded = cv2.imencode(
+                ".jpg",
+                preview,
+                [int(cv2.IMWRITE_JPEG_QUALITY), PREVIEW_JPEG_QUALITY],
+            )
+            if not ok:
+                return None, width, height
+            return encoded.tobytes(), width, height
+        except Exception:
+            return None, 0, 0
+
+    def _encode_pgm(self, frame) -> tuple[bytes | None, int, int]:
+        if cv2 is None:
+            return None, 0, 0
+        try:
+            preview = self._resize_preview_frame(frame)
+            gray = cv2.cvtColor(preview, cv2.COLOR_BGR2GRAY) if preview.ndim == 3 else preview
+            if gray.dtype.name != "uint8":
+                gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+            height, width = int(gray.shape[0]), int(gray.shape[1])
+            payload = f"P5\n{width} {height}\n255\n".encode("ascii") + gray.tobytes()
+            return payload, width, height
         except Exception:
             return None, 0, 0
 
@@ -336,21 +637,60 @@ class PipelineVisionService:
         frame_height: int = 0,
         frame_id: int | None = None,
         timestamp: float | None = None,
+        encode_frame: bool = False,
     ) -> RecognitionSnapshot:
-        result = self._ensure_pipeline().process_frame(frame)
+        result = self._ensure_pipeline().process_frame(frame, timestamp=timestamp)
+        observed_ids = {int(track_id) for track_id, _ in result.tracking.matched_pairs}
+        observed_ids.update(int(track_id) for track_id in result.tracking.new_track_ids)
+        with self._lock:
+            sample_time = time.time()
+            calibration_frame = frame
+            if self._ensure_pipeline().config.roi.enabled:
+                frame_h, frame_w = frame.shape[:2]
+                x0, x1, y0, y1, crop_top = self._ensure_pipeline().config.roi.resolve(frame_w, frame_h)
+                calibration_frame = frame[y0 + crop_top : y1, x0:x1]
+            gray = (
+                cv2.cvtColor(calibration_frame, cv2.COLOR_BGR2GRAY)
+                if cv2 is not None and len(calibration_frame.shape) == 3
+                else calibration_frame
+            )
+            normalized = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX) if cv2 is not None else gray
+            calibration_tracks = [
+                track
+                for track in result.tracking.active_tracks
+                if int(track.id) in observed_ids
+                and int(track.age) >= 2
+                and (
+                    float(track.velocity[0]) * float(track.velocity[0])
+                    + float(track.velocity[1]) * float(track.velocity[1])
+                ) ** 0.5 >= 2.0
+            ]
+            for track in calibration_tracks:
+                _cx = float(track.position[0])
+                _cy = float(track.position[1])
+                radius = float(track.metadata.get("observed_radius", track.radius))
+                self._observed_radii.append((sample_time, float(radius)))
+                center = self._ensure_pipeline().detector._center_contrast(normalized, _cx, _cy, radius)
+                ring = self._ensure_pipeline().detector._ring_contrast(normalized, _cx, _cy, radius)
+                self._calibration_stats.append((sample_time, float(gray.mean()), float(gray.std()), center, ring))
         control = result.metrics.control
         avg_px = control.frame_avg_diameter
         active_count = int(result.metrics.control.frame_droplet_count)
         total_count = int(result.metrics.control.total_droplet_count)
         new_cross = int(result.metrics.control.new_crossing_count)
+        self._update_motion_measurements(
+            result.tracking,
+            observed_ids,
+            float(timestamp or result.timestamp),
+            new_cross,
+            int(frame_id if frame_id is not None else result.frame_index),
+        )
         has_droplet = active_count > 0
         control_reason = str(result.metrics.control.reason or "")
         frame_b64 = frame_png_base64
         width = int(frame_width or 0)
         height = int(frame_height or 0)
-        if frame_b64 is None:
-            frame_b64, width, height = self._encode_png_base64(result.annotated_frame)
-        if frame_b64 is None:
+        if encode_frame and frame_b64 is None:
             frame_b64, width, height = self._encode_png_base64(frame)
         scale = float(self._pixel_to_micron)
         frame_diameters = [float(value) * scale for value in control.frame_diameters]
@@ -361,6 +701,7 @@ class PipelineVisionService:
             if control.frame_diameter_std is not None
             else None
         )
+        diagnostics = self._diagnostics()
         return RecognitionSnapshot(
             frame_droplet_count=active_count,
             total_droplet_count=total_count,
@@ -380,6 +721,8 @@ class PipelineVisionService:
             video_source_type=self._video_source_type,
             video_source=self._video_source,
             frame_id=int(frame_id if frame_id is not None else result.frame_index),
+            preview_frame_id=int(frame_id if frame_id is not None else result.frame_index),
+            preview_timestamp=float(timestamp or result.timestamp),
             frame_single_cell_count=int(control.frame_single_cell_count),
             frame_diameters=frame_diameters,
             frame_diameter_sum=frame_diameter_sum,
@@ -390,10 +733,63 @@ class PipelineVisionService:
             uniformity_valid=bool(control.uniformity_valid),
             uniformity_status=str(control.uniformity_status or ""),
             uniformity_reason=str(control.uniformity_reason or ""),
+            control_period_id=int(control.period_id),
+            motion_window_frames=len(self._motion_observations),
+            average_droplet_speed_um_s=self._average_droplet_speed_um_s,
+            speed_sample_count=self._speed_sample_count,
+            droplet_generation_rate_hz=self._droplet_generation_rate_hz,
+            **diagnostics,
         )
+
+    def _update_motion_measurements(
+        self,
+        tracking,
+        observed_ids: set[int],
+        timestamp: float,
+        new_crossings: int,
+        frame_id: int = 0,
+    ) -> None:
+        if frame_id > 0 and self._last_motion_frame_id > 0 and frame_id != self._last_motion_frame_id + 1:
+            self._motion_observations.clear()
+        if frame_id > 0:
+            self._last_motion_frame_id = frame_id
+        positions = {
+            int(track.id): (float(track.position[0]), float(track.position[1]))
+            for track in tracking.active_tracks
+            if int(track.id) in observed_ids
+        }
+        self._motion_observations.append((timestamp, positions))
+
+        speeds: list[float] = []
+        if len(self._motion_observations) == MOTION_WINDOW_FRAMES:
+            axis = str(self._ensure_pipeline().config.metrics.flow_axis).strip().lower()
+            axis_index = 1 if axis == "y" else 0
+            track_ids = set.intersection(
+                *(set(frame_positions) for _, frame_positions in self._motion_observations)
+            )
+            first_time, first_positions = self._motion_observations[0]
+            last_time, last_positions = self._motion_observations[-1]
+            elapsed = last_time - first_time
+            if elapsed > 0.0:
+                for track_id in track_ids:
+                    displacement_px = abs(
+                        last_positions[track_id][axis_index] - first_positions[track_id][axis_index]
+                    )
+                    speeds.append(displacement_px * float(self._pixel_to_micron) / elapsed)
+        self._speed_sample_count = len(speeds)
+        self._average_droplet_speed_um_s = sorted(speeds)[len(speeds) // 2] if speeds else None
+
+        for _ in range(max(0, int(new_crossings))):
+            self._crossing_times.append(timestamp)
+        cutoff = timestamp - GENERATION_RATE_WINDOW_S
+        while self._crossing_times and self._crossing_times[0] < cutoff:
+            self._crossing_times.popleft()
+        self._droplet_generation_rate_hz = len(self._crossing_times) / GENERATION_RATE_WINDOW_S
 
     def _capture_loop(self) -> None:
         while not self._stop_event.is_set():
+            if not self._is_realtime_mode():
+                self._pace_local_video()
             ok, frame, error = self._read_next_frame()
             if not ok:
                 if error and self._is_realtime_mode():
@@ -401,17 +797,21 @@ class PipelineVisionService:
                         self._latest = self._snapshot_with_error(error)
                 elif error:
                     break
-                time.sleep(0.03)
+                # A repeated latest-frame snapshot is normal while polling a
+                # 100 FPS camera. Sleeping 30 ms here skipped roughly three
+                # camera frames and capped the effective acquisition rate.
+                time.sleep(0.001 if not error else 0.03)
                 continue
             try:
                 with self._lock:
                     self._capture_frame_id += 1
                     frame_id = self._capture_frame_id
                 timestamp = time.time()
+                with self._lock:
+                    self._capture_times.append(timestamp)
                 if self._should_publish_preview(timestamp):
-                    self._publish_video_frame(frame, frame_id, timestamp)
-                if self._should_submit_processing(timestamp):
-                    self._submit_processing_frame(frame_id, timestamp, frame)
+                    self._submit_preview_frame(frame_id, timestamp, frame)
+                self._submit_sampling_frame(frame_id, timestamp, frame)
             except Exception as exc:
                 self._log(f"[VISION][WARN] capture frame failed: {exc}")
                 time.sleep(0.02)
@@ -422,64 +822,171 @@ class PipelineVisionService:
         if cap is not None:
             cap.release()
 
+    def _preview_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                frame_id, timestamp, frame = self._preview_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            try:
+                self._publish_video_frame(frame, frame_id, timestamp)
+            except Exception as exc:
+                self._log(f"[VISION][WARN] preview frame failed: {exc}")
+
+    def _sampling_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                frame_id, timestamp, frame = self._sampling_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            self._submit_processing_frame(frame_id, timestamp, frame)
+
     def _process_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
-                frame_id, timestamp, frame = self._frame_queue.get(timeout=0.05)
+                batch = self._frame_queue.get(timeout=0.05)
             except queue.Empty:
                 continue
             try:
                 with self._lock:
-                    current = self._latest
-                    frame_b64 = current.frame_png_base64
-                    width = int(current.frame_width)
-                    height = int(current.frame_height)
-                snapshot = self._snapshot_from_frame(
-                    frame,
-                    frame_png_base64=frame_b64,
-                    frame_width=width,
-                    frame_height=height,
-                    frame_id=frame_id,
-                    timestamp=timestamp,
-                )
-                with self._lock:
-                    current = self._latest
-                    self._latest = replace(
-                        snapshot,
-                        frame_png_base64=current.frame_png_base64,
-                        frame_width=current.frame_width,
-                        frame_height=current.frame_height,
-                        frame_id=max(int(current.frame_id), int(snapshot.frame_id)),
-                        timestamp=max(float(current.timestamp), float(snapshot.timestamp)),
+                    self._processing_busy = True
+                batch_snapshot = None
+                for frame_id, timestamp, frame in batch:
+                    processing_started = time.perf_counter()
+                    batch_snapshot = self._snapshot_from_frame(
+                        frame,
+                        frame_id=frame_id,
+                        timestamp=timestamp,
                     )
+                    with self._lock:
+                        completed_at = time.time()
+                        self._algorithm_processing_ms = max(0.0, (time.perf_counter() - processing_started) * 1000.0)
+                        self._processing_times.append(completed_at)
+                        self._processed_frame_count += 1
+                        self._recognition_latency_ms = max(0.0, (completed_at - timestamp) * 1000.0)
+                    # Candidate scoring contains Python loops. Yield briefly so
+                    # the preview producer and Tk main loop are not starved by
+                    # a five-frame analysis burst.
+                    time.sleep(0.002)
+                # A five-frame window is one analysis transaction. Publish only
+                # after all frames have updated the pipeline's accumulated data.
+                if batch_snapshot is not None:
+                    with self._lock:
+                        preview = self._latest_preview
+                        self._latest = replace(
+                            batch_snapshot,
+                            frame_png_base64=(preview.frame_png_base64 if preview else None),
+                            frame_width=(preview.width if preview else 0),
+                            frame_height=(preview.height if preview else 0),
+                            preview_frame_id=(preview.frame_id if preview else 0),
+                            preview_timestamp=(preview.timestamp if preview else 0.0),
+                            **self._diagnostics(),
+                        )
             except Exception as exc:
                 self._log(f"[VISION][WARN] processing frame failed: {exc}")
+            finally:
+                with self._lock:
+                    self._processing_busy = False
 
     def _publish_video_frame(self, frame, frame_id: int, timestamp: float) -> None:
-        frame_b64, width, height = self._encode_png_base64(frame)
-        if frame_b64 is None:
+        frame_jpeg, width, height = self._encode_jpeg(frame)
+        if frame_jpeg is None:
             return
         with self._lock:
-            self._latest = replace(
-                self._latest,
-                frame_png_base64=frame_b64,
-                frame_width=width,
-                frame_height=height,
+            self._latest_preview = FrameSnapshot(
                 frame_id=int(frame_id),
                 timestamp=float(timestamp),
-                video_source_type=self._video_source_type,
-                video_source=self._video_source,
+                width=width,
+                height=height,
+                valid=True,
+                frame_png_base64=None,
+                frame_pgm=None,
+                frame_jpeg=frame_jpeg,
+                reason="",
             )
 
-    def _submit_processing_frame(self, frame_id: int, timestamp: float, frame) -> None:
+    def _submit_preview_frame(self, frame_id: int, timestamp: float, frame) -> None:
         item = (int(frame_id), float(timestamp), frame)
+        try:
+            self._preview_queue.put_nowait(item)
+            return
+        except queue.Full:
+            pass
+        # Preview is best-effort. Replacing an old frame keeps acquisition
+        # latency bounded even when PNG encoding or the UI is temporarily slow.
+        try:
+            self._preview_queue.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self._preview_queue.put_nowait(item)
+        except queue.Full:
+            pass
+
+    def _submit_sampling_frame(self, frame_id: int, timestamp: float, frame) -> None:
+        item = (int(frame_id), float(timestamp), frame)
+        try:
+            self._sampling_queue.put_nowait(item)
+            return
+        except queue.Full:
+            pass
+        # Sampling must not block camera acquisition. If the lightweight
+        # sampler ever falls behind, discard the oldest frame and let its
+        # continuity check restart the current five-frame burst.
+        try:
+            self._sampling_queue.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self._sampling_queue.put_nowait(item)
+        except queue.Full:
+            pass
+    def _pace_local_video(self) -> None:
+        interval = float(self._local_frame_interval_s)
+        if interval <= 0.0:
+            return
+        now = time.monotonic()
+        due = float(self._next_local_frame_time or now)
+        if due > now:
+            self._stop_event.wait(min(due - now, interval))
+            now = time.monotonic()
+        self._next_local_frame_time = max(due + interval, now)
+
+    def _submit_processing_frame(self, frame_id: int, timestamp: float, frame) -> None:
+        now = time.monotonic()
+        if self._capture_batch and int(frame_id) != int(self._capture_batch[-1][0]) + 1:
+            self._capture_batch = []
+        if not self._capture_batch:
+            if now < self._next_analysis_batch_time:
+                return
+            with self._lock:
+                processing_unavailable = self._processing_busy or not self._frame_queue.empty()
+            if processing_unavailable:
+                # Do not build a backlog. Skip this control period and leave
+                # CPU time for acquisition and the realtime preview.
+                self._next_analysis_batch_time = now + max(0.05, self._control_interval_ms / 1000.0)
+                return
+            self._analysis_batch_started_at = now
+        self._capture_batch.append((int(frame_id), float(timestamp), frame))
+        if len(self._capture_batch) < MOTION_WINDOW_FRAMES:
+            return
+        item = self._capture_batch
+        self._capture_batch = []
+        self._next_analysis_batch_time = self._analysis_batch_started_at + max(
+            0.05, self._control_interval_ms / 1000.0
+        )
         try:
             self._frame_queue.put_nowait(item)
             return
         except queue.Full:
             pass
+        # Recognition must never block camera acquisition or the monitor. Keep
+        # the newest pending frames when processing temporarily falls behind.
         try:
-            self._frame_queue.get_nowait()
+            replaced = self._frame_queue.get_nowait()
+            with self._lock:
+                self._replaced_processing_frames += len(replaced)
+                self._replacement_times.extend([time.time()] * len(replaced))
         except queue.Empty:
             pass
         try:
@@ -490,17 +997,18 @@ class PipelineVisionService:
     def _should_publish_preview(self, timestamp: float) -> bool:
         with self._lock:
             last = float(self._last_preview_publish_time or 0.0)
-            if float(timestamp) - last < PREVIEW_TARGET_INTERVAL_S:
+            current = float(timestamp)
+            if last <= 0.0 or current < last:
+                self._last_preview_publish_time = current
+                return True
+            elapsed = current - last
+            if elapsed < PREVIEW_TARGET_INTERVAL_S:
                 return False
-            self._last_preview_publish_time = float(timestamp)
-            return True
-
-    def _should_submit_processing(self, timestamp: float) -> bool:
-        with self._lock:
-            last = float(self._last_processing_submit_time or 0.0)
-            if float(timestamp) - last < PROCESS_TARGET_INTERVAL_S:
-                return False
-            self._last_processing_submit_time = float(timestamp)
+            # Advance the target clock instead of restarting it from the
+            # selected capture frame. At 100 FPS this alternates 30/40 ms
+            # selections and averages 30 FPS instead of collapsing to 25 FPS.
+            intervals = max(1, int(elapsed / PREVIEW_TARGET_INTERVAL_S))
+            self._last_preview_publish_time = last + intervals * PREVIEW_TARGET_INTERVAL_S
             return True
 
     def _loop(self) -> None:
@@ -530,36 +1038,17 @@ class PipelineVisionService:
 
     def get_snapshot(self) -> RecognitionSnapshot:
         with self._lock:
-            return RecognitionSnapshot(
-                frame_droplet_count=self._latest.frame_droplet_count,
-                total_droplet_count=self._latest.total_droplet_count,
-                new_crossing_count=self._latest.new_crossing_count,
-                avg_diameter=self._latest.avg_diameter,
-                single_cell_rate=self._latest.single_cell_rate,
-                valid_for_control=self._latest.valid_for_control,
-                timestamp=self._latest.timestamp,
-                reason=self._latest.reason,
-                droplet_count=self._latest.droplet_count,
-                active_droplet_count=self._latest.active_droplet_count,
-                has_droplet=self._latest.has_droplet,
-                control_reason=self._latest.control_reason,
-                frame_png_base64=self._latest.frame_png_base64,
-                frame_width=self._latest.frame_width,
-                frame_height=self._latest.frame_height,
-                video_source_type=self._latest.video_source_type,
-                video_source=self._latest.video_source,
-                frame_id=self._latest.frame_id,
-                frame_single_cell_count=self._latest.frame_single_cell_count,
+            return replace(
+                self._latest,
                 frame_diameters=list(self._latest.frame_diameters),
-                frame_diameter_sum=self._latest.frame_diameter_sum,
-                frame_avg_diameter=self._latest.frame_avg_diameter,
-                frame_single_cell_rate=self._latest.frame_single_cell_rate,
-                frame_diameter_std=self._latest.frame_diameter_std,
-                frame_diameter_cv=self._latest.frame_diameter_cv,
-                uniformity_valid=self._latest.uniformity_valid,
-                uniformity_status=self._latest.uniformity_status,
-                uniformity_reason=self._latest.uniformity_reason,
+                **self._diagnostics(),
             )
+
+    def get_frame_snapshot(self) -> FrameSnapshot | None:
+        with self._lock:
+            if self._latest_preview is None:
+                return None
+            return replace(self._latest_preview)
 
     def run_once(self) -> RecognitionSnapshot:
         return self.get_snapshot()

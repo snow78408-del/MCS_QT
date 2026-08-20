@@ -298,6 +298,24 @@ class PumpHardwareService:
             self.log(f"[RSS][FAIL] {e}")
             return self._fail(e)
 
+    def read_rss_with_retry(self, attempts: int | None = None) -> PumpOperationResult:
+        """Read pump setup with bounded retries for the slow serial link."""
+        total = max(1, int(attempts if attempts is not None else self.runtime_config.retry_count + 1))
+        last = self._fail("RSS 未执行")
+        for attempt in range(1, total + 1):
+            last = self.read_rss()
+            if last.ok:
+                if attempt > 1:
+                    self.log(f"[RSS][RECOVERED] attempt={attempt}/{total}")
+                return last
+            if attempt < total:
+                self.log(
+                    f"[RSS][RETRY] attempt={attempt}/{total} "
+                    f"reason={last.error or last.reason or 'unknown'}"
+                )
+                time.sleep(max(0.12, float(self.runtime_config.retry_interval)))
+        return last
+
     def read_rse(self) -> PumpOperationResult:
         try:
             rep = self._send(protocol.pdu_rse(), expect_cmd="RSE")
@@ -596,7 +614,7 @@ class PumpHardwareService:
         def _effective(enable_mask: int, copy_mask: int) -> int:
             return (int(enable_mask) | int(copy_mask)) & 0x0F
 
-        rss = self.read_rss()
+        rss = self.read_rss_with_retry()
         if not rss.ok:
             return self._fail(f"enable_channels_and_verify 前读取 RSS 失败: {rss.error}")
         setup: SystemSetup = rss.parsed_reply
@@ -716,6 +734,28 @@ class PumpHardwareService:
             delay_units=list(setup.delay_units),
         )
         res = self.write_wss_and_verify(req)
+        if res.ok:
+            # write_wss_and_verify() has already completed an RSS readback and
+            # validated the requested masks.  A second immediate RSS query is
+            # redundant and, on the slow 1200-bps pump link, can intermittently
+            # time out after an otherwise successful write.  Trust the verified
+            # result so initialization is not rejected because of that extra
+            # diagnostic read.
+            got = res.parsed_reply if isinstance(res.parsed_reply, SystemSetup) else req
+            self.log(
+                f"[PUMP][PARAM_WRITE][READY] mask=0x{target:02X} "
+                f"enable=0x{int(got.enable_mask) & 0x0F:02X} copy=0x{int(got.copy_mask) & 0x0F:02X}"
+            )
+            return self._ok(
+                parsed=got,
+                raw=res.raw_reply,
+                verified=True,
+                reason="参数写入前通道已进入可写状态",
+            )
+
+        # If the combined write/readback verification failed, one recovery
+        # read may still show that the pump accepted the command.  This keeps
+        # the existing tolerance for devices whose first response is corrupt.
         rd = self.read_rss()
         if rd.ok and rd.parsed_reply is not None:
             got: SystemSetup = rd.parsed_reply
@@ -732,12 +772,12 @@ class PumpHardwareService:
                     reason="参数写入前通道已进入可写状态",
                 )
 
-        reason = res.reason or res.error or (rd.reason if rd else None) or "unknown"
+        reason = res.error or res.reason or (rd.error if rd else None) or (rd.reason if rd else None) or "unknown"
         self.log(f"[PUMP][PARAM_WRITE][FAIL] enable/copy prepare failed: {reason}")
         return self._fail("参数写入前通道准备失败", parsed=setup, raw=rss.raw_reply, reason=reason)
 
     def start_system(self) -> PumpOperationResult:
-        rs = self.read_rss()
+        rs = self.read_rss_with_retry()
         if not rs.ok:
             return self._fail(f"系统启动前 RSS 读取失败: {rs.error}")
         setup: SystemSetup = rs.parsed_reply
@@ -747,7 +787,7 @@ class PumpHardwareService:
         return self.write_wse(sys_runstate=target_sys, q_runstate=0x00)
 
     def start_system_and_verify(self) -> PumpOperationResult:
-        rs = self.read_rss()
+        rs = self.read_rss_with_retry()
         if not rs.ok:
             return self._fail(f"系统启动前 RSS 读取失败: {rs.error}")
         setup: SystemSetup = rs.parsed_reply

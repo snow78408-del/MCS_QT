@@ -1,7 +1,6 @@
 ﻿from __future__ import annotations
 
-import base64
-import time
+import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
 
@@ -15,20 +14,25 @@ from ..components.pump_panel import PumpPanel
 from ..components.recognition_panel import RecognitionPanel
 from ..components.status_panel import StatusPanel
 from ..components.ui_update import set_var_if_changed
+from ..video_process import VideoProcessController
 
 
 class MonitorPage(ttk.Frame):
     def __init__(self, parent, app):
         super().__init__(parent)
         self.app = app
-        self._poll_job = None
-        self._video_photo = None
-        self._last_video_frame_id: int | None = None
-        self._last_video_payload: str | None = None
-        self._last_text_refresh_ts = 0.0
+        self._video_process: VideoProcessController | None = None
+        self._status_poll_job = None
+        self._status_worker: threading.Thread | None = None
+        self._status_stop_event = threading.Event()
+        self._status_snapshot_lock = threading.Lock()
+        self._pending_status_snapshot = None
         self._last_button_state: str | None = None
+        self._start_pending = False
         self._scrollregion_pending = False
-        self._video_refresh_interval_ms = 33
+        self._status_refresh_interval_ms = 100
+        self._sidebar_visible = True
+        self.calibration_var = tk.StringVar(value="未标定")
 
         self.err_var = tk.StringVar(value="--")
         self.adjust_var = tk.StringVar(value="--")
@@ -80,6 +84,12 @@ class MonitorPage(ttk.Frame):
         top.pack(fill="x", padx=10, pady=(6, 4))
         ttk.Button(top, text="参数页", command=lambda: self.app.show_page("parameter")).pack(side="left")
         ttk.Button(top, text="状态页", command=lambda: self.app.show_page("status")).pack(side="left", padx=4)
+        ttk.Button(top, text="打开独立视频窗口", command=self._open_video_window).pack(side="left", padx=4)
+        self.sidebar_btn = ttk.Button(top, text="隐藏状态侧栏", command=self._toggle_sidebar)
+        self.sidebar_btn.pack(side="right", padx=4)
+        self.calibration_btn = ttk.Button(top, text="自动标定识别(3秒)", command=self._auto_calibrate)
+        self.calibration_btn.pack(side="right", padx=4)
+        ttk.Label(top, textvariable=self.calibration_var).pack(side="right", padx=4)
 
         self.buttons = ControlButtons(self._content)
         self.buttons.pack(fill="x", padx=10, pady=(2, 6))
@@ -91,17 +101,18 @@ class MonitorPage(ttk.Frame):
             on_stop=self._on_stop,
         )
 
-        main = ttk.Frame(self._content)
+        main = ttk.Panedwindow(self._content, orient="horizontal")
         main.pack(fill="both", expand=True, padx=10, pady=6)
-        main.columnconfigure(0, weight=3)
-        main.columnconfigure(1, weight=2)
 
         video_frame = ttk.LabelFrame(main, text="工业相机实时视频画面")
-        video_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=0)
-        video_frame.configure(width=760, height=590)
-        video_frame.grid_propagate(False)
-        self.video_label = ttk.Label(video_frame, text="等待开始", anchor="center")
-        self.video_label.pack(fill="both", expand=True, padx=6, pady=6)
+        main.add(video_frame, weight=5)
+        video_frame.configure(width=980, height=700)
+        ttk.Label(
+            video_frame,
+            text="实时画面已移至独立窗口，避免监控页状态布局刷新影响画面。",
+            anchor="center",
+        ).pack(fill="both", expand=True, padx=6, pady=6)
+        ttk.Button(video_frame, text="打开/置顶独立视频窗口", command=self._open_video_window).pack(pady=(0, 12))
 
         meta = ttk.Frame(video_frame)
         meta.pack(fill="x", padx=6, pady=(0, 6))
@@ -113,20 +124,19 @@ class MonitorPage(ttk.Frame):
         ttk.Label(meta, textvariable=self.video_res_var).grid(row=0, column=5, sticky="w", padx=3, pady=1)
         meta.columnconfigure(3, weight=1)
 
-        right = ttk.Frame(main)
-        right.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=0)
-        self.recognition_panel = RecognitionPanel(right)
+        self._main_pane = main
+        self._sidebar = ttk.Frame(main)
+        main.add(self._sidebar, weight=1)
+        self.recognition_panel = RecognitionPanel(self._sidebar)
         self.recognition_panel.pack(fill="x", expand=False, pady=(0, 6))
-        self.pump_panel = PumpPanel(right)
+        self.pump_panel = PumpPanel(self._sidebar)
         self.pump_panel.pack(fill="x", expand=False, pady=(6, 0))
 
-        lower = ttk.Frame(self._content)
-        lower.pack(fill="x", padx=10, pady=6)
-        self.status_panel = StatusPanel(lower)
-        self.status_panel.pack(side="left", fill="both", expand=True, padx=(0, 4))
+        self.status_panel = StatusPanel(self._sidebar)
+        self.status_panel.pack(fill="x", expand=False, pady=(6, 0))
 
-        ctrl_frame = ttk.LabelFrame(lower, text="PID 控制结果")
-        ctrl_frame.pack(side="left", fill="both", expand=True, padx=(4, 0))
+        ctrl_frame = ttk.LabelFrame(self._sidebar, text="PID 控制结果")
+        ctrl_frame.pack(fill="x", expand=False, pady=(6, 0))
         rows = [
             ("PID mode", self.pid_mode_var),
             ("kp / ki / kd", self.pid_gains_var),
@@ -155,6 +165,39 @@ class MonitorPage(ttk.Frame):
             ttk.Label(ctrl_frame, text=f"{name}:").grid(row=i, column=0, padx=4, pady=2, sticky="w")
             ttk.Label(ctrl_frame, textvariable=var, wraplength=360).grid(row=i, column=1, padx=4, pady=2, sticky="w")
         ctrl_frame.columnconfigure(1, weight=1)
+
+    def _toggle_sidebar(self) -> None:
+        if self._sidebar_visible:
+            self._main_pane.forget(self._sidebar)
+            self._sidebar_visible = False
+            self.sidebar_btn.configure(text="显示状态侧栏")
+        else:
+            self._main_pane.add(self._sidebar, weight=1)
+            self._sidebar_visible = True
+            self.sidebar_btn.configure(text="隐藏状态侧栏")
+
+    def _auto_calibrate(self) -> None:
+        result: dict[str, object] = {}
+        self.calibration_btn.configure(state="disabled")
+        self.calibration_var.set("正在采集实时液滴样本…")
+
+        def task() -> None:
+            result.update(self.app.orchestrator.auto_calibrate_detection(3.0))
+
+        def done() -> None:
+            self.calibration_btn.configure(state="normal")
+            self.calibration_var.set(
+                f"标定完成：{int(result.get('sample_count', 0))} 样本，"
+                f"直径 {float(result.get('preferred_diameter_px', 0.0)):.1f}px，"
+                f"{result.get('polarity', '--')}，噪声 {float(result.get('noise_sigma', 0.0)):.1f}"
+            )
+
+        def failed(exc: Exception) -> None:
+            self.calibration_btn.configure(state="normal")
+            self.calibration_var.set("标定失败")
+            messagebox.showwarning("自动标定失败", str(exc))
+
+        self.app.run_backend_task(task, on_success=done, on_error=failed)
 
     def _on_content_configure(self, _event=None) -> None:
         if self._canvas is None or self._scrollregion_pending:
@@ -196,37 +239,62 @@ class MonitorPage(ttk.Frame):
     def on_hide(self) -> None:
         self._stop_poll()
 
+    def _open_video_window(self) -> None:
+        if self._video_process is not None and self._video_process.is_alive():
+            return
+        if self._video_process is not None:
+            self._video_process.stop()
+        self._video_process = VideoProcessController(self.app.orchestrator.get_video_frame_snapshot)
+        self._video_process.start()
+
+    def _close_video_window(self) -> None:
+        controller = self._video_process
+        self._video_process = None
+        if controller is not None:
+            controller.stop()
+
     def _start_poll(self) -> None:
         self._stop_poll()
-        self._poll_once()
+        self._status_stop_event = threading.Event()
+        self._status_worker = threading.Thread(
+            target=self._status_snapshot_loop,
+            args=(self._status_stop_event,),
+            name="monitor-status-loop",
+            daemon=True,
+        )
+        self._status_worker.start()
+        self._open_video_window()
+        self._poll_status_once()
 
     def _stop_poll(self) -> None:
-        if self._poll_job is not None:
-            self.after_cancel(self._poll_job)
-            self._poll_job = None
+        self._close_video_window()
+        if self._status_poll_job is not None:
+            self.after_cancel(self._status_poll_job)
+            self._status_poll_job = None
+        self._status_stop_event.set()
+        self._status_worker = None
 
-    def _set_video_image(self, frame_png_base64: str | None, frame_id: int | None = None) -> None:
-        if not frame_png_base64:
-            return
-        if frame_id is not None and frame_id == self._last_video_frame_id:
-            return
-        if frame_id is None and frame_png_base64 == self._last_video_payload:
-            return
-        try:
-            self._video_photo = tk.PhotoImage(data=frame_png_base64)
-            self.video_label.configure(image=self._video_photo, text="")
-            self._last_video_frame_id = frame_id
-            self._last_video_payload = frame_png_base64
-        except Exception:
+    def _status_snapshot_loop(self, stop_event: threading.Event) -> None:
+        last_signature = None
+        while not stop_event.is_set():
             try:
-                raw = base64.b64decode(frame_png_base64)
-                b64 = base64.b64encode(raw).decode("ascii")
-                self._video_photo = tk.PhotoImage(data=b64)
-                self.video_label.configure(image=self._video_photo, text="")
-                self._last_video_frame_id = frame_id
-                self._last_video_payload = frame_png_base64
+                snapshot = self.app.orchestrator.get_snapshot()
+                control = getattr(snapshot, "control", None)
+                signature = (
+                    float(getattr(control, "timestamp", 0.0) or 0.0),
+                    str(getattr(snapshot, "system_state", "")),
+                    str(getattr(snapshot, "message", "") or ""),
+                    str(getattr(snapshot, "error", "") or ""),
+                )
+                if signature != last_signature:
+                    with self._status_snapshot_lock:
+                        self._pending_status_snapshot = snapshot
+                    last_signature = signature
             except Exception:
-                self.video_label.configure(text="视频帧解码失败")
+                pass
+            # Lightweight background observation; publish only when a new PID
+            # control-period result or system-state change appears.
+            stop_event.wait(0.05)
 
     @staticmethod
     def _parse_channel_status(reason: str, channel: int) -> str:
@@ -251,25 +319,13 @@ class MonitorPage(ttk.Frame):
             return "--"
         return f"{float(channel.actual_flow_rate):.6f}"
 
-    def _poll_once(self) -> None:
-        video_frame = None
-        try:
-            video_frame = self.app.orchestrator.get_video_frame_snapshot()
-        except Exception:
-            video_frame = None
-        if video_frame is not None and video_frame.valid:
-            self._set_video_image(video_frame.frame_png_base64, int(video_frame.frame_id))
-
-        now = time.monotonic()
-        text_due = (now - self._last_text_refresh_ts) >= 1.0
-        if not text_due:
-            self._poll_job = self.after(self._video_refresh_interval_ms, self._poll_once)
+    def _poll_status_once(self) -> None:
+        with self._status_snapshot_lock:
+            snap = self._pending_status_snapshot
+            self._pending_status_snapshot = None
+        if snap is None:
+            self._status_poll_job = self.after(self._status_refresh_interval_ms, self._poll_status_once)
             return
-
-        # Full system snapshot is intentionally low-rate so text, pump state and
-        # PID status do not throttle the realtime video path.
-        snap = self.app.orchestrator.get_snapshot()
-        self._last_text_refresh_ts = now
         self.recognition_panel.update_snapshot(snap)
         self.pump_panel.update_snapshot(snap)
         self.status_panel.update_snapshot(snap)
@@ -329,15 +385,32 @@ class MonitorPage(ttk.Frame):
                 self.buttons.update_by_state(SystemState(state_val))
             except Exception:
                 pass
-        self._poll_job = self.after(self._video_refresh_interval_ms, self._poll_once)
+        if self._start_pending:
+            self.buttons.start_btn.configure(state="disabled")
+        self._status_poll_job = self.after(self._status_refresh_interval_ms, self._poll_status_once)
 
     def _on_init(self) -> None:
         self.app.show_page("init")
 
     def _on_start(self) -> None:
+        if self._start_pending:
+            return
+        self._start_pending = True
+        self.buttons.start_btn.configure(state="disabled", text="启动中…")
+
+        def finished() -> None:
+            self._start_pending = False
+            self.buttons.start_btn.configure(text="开始")
+            self._last_button_state = None
+
+        def failed(exc: Exception) -> None:
+            finished()
+            messagebox.showerror("启动失败", str(exc))
+
         self.app.run_backend_task(
             self.app.orchestrator.start,
-            on_error=lambda e: messagebox.showerror("启动失败", str(e)),
+            on_success=finished,
+            on_error=failed,
         )
 
     def _on_pause(self) -> None:

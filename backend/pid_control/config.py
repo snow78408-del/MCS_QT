@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import StrEnum
+try:
+    from enum import StrEnum
+except ImportError:  # Python 3.10 compatibility
+    from enum import Enum
+
+    class StrEnum(str, Enum):
+        pass
 
 
 class PIDControlMode(StrEnum):
@@ -44,12 +50,16 @@ class PIDConfig:
     output_rate_limit: float = 200.0
     integral_limit: float = 10000.0
     diameter_deadband: float = 1.0
+    integral_decay_in_deadband: float = 0.8
     min_droplet_count_for_feedback: int = 1
 
     q1_min: float = 0.0
     q1_max: float = 5000.0
     q2_min: float = 0.0
     q2_max: float = 5000.0
+    max_flow_change_per_cycle: float = 200.0
+    total_flow_max: float = 8000.0
+    use_initial_flow_as_output_bias: bool = True
 
     # Backward-compatible aliases used by older call sites.
     kp: float | None = None

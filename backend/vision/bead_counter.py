@@ -48,17 +48,14 @@ class BeadCounter:
         else:
             droplets = self._count_intensity_mode(active_droplets, gray)
 
-        debug_image = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
         total_beads = 0
         for droplet in droplets:
             total_beads += droplet.bead_count
-            for bead in droplet.bead_positions:
-                cv2.circle(debug_image, (int(bead[0]), int(bead[1])), 2, (0, 255, 0), -1)
 
         return BeadResult(
             droplets=droplets,
             total_beads=total_beads,
-            debug_image=debug_image,
+            debug_image=np.empty((0, 0, 3), dtype=np.uint8),
             candidate_mask=candidate_mask,
         )
 
@@ -69,7 +66,11 @@ class BeadCounter:
     ) -> List[DropletBead]:
         droplets: List[DropletBead] = []
         for track in active_droplets:
-            radius = max(float(track.radius), self._config.default_droplet_radius)
+            radius = (
+                float(track.radius)
+                if float(track.radius) > 0.0
+                else float(self._config.default_droplet_radius)
+            )
             mask = self._circle_mask(gray.shape[:2], track.position, radius * self._config.inner_radius_ratio)
 
             roi_values = gray[mask > 0]
@@ -126,7 +127,11 @@ class BeadCounter:
             matched_id: Optional[int] = None
 
             for track in active_droplets:
-                radius = max(float(track.radius), self._config.default_droplet_radius)
+                radius = (
+                    float(track.radius)
+                    if float(track.radius) > 0.0
+                    else float(self._config.default_droplet_radius)
+                )
                 inner_radius = max(1.0, radius * self._config.inner_radius_ratio)
                 dx = points[:, 0] - float(track.position[0])
                 dy = points[:, 1] - float(track.position[1])

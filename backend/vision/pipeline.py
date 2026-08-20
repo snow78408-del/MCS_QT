@@ -46,34 +46,49 @@ class VisionPipeline:
         self.tracker: BaseTracker = self._build_tracker(config)
         self._frame_index = 0
 
+    def configure_expected_diameter(self, diameter_um: float, pixel_to_micron: float) -> None:
+        self.detector.configure_expected_diameter(diameter_um, pixel_to_micron)
+
     def _build_tracker(self, config: PipelineConfig) -> BaseTracker:
         if config.tracker.tracker_type == "kalman":
             return KalmanTracker(config.tracker)
         return NearestTracker(config.tracker)
 
     def reset(self) -> None:
+        self.detector.reset_adaptive_size()
         self.tracker.reset()
         self.metrics.reset()
         self._frame_index = 0
 
-    def process_frame(self, frame: np.ndarray) -> VisionResult:
+    def process_frame(self, frame: np.ndarray, *, timestamp: float | None = None) -> VisionResult:
         self._frame_index += 1
-        roi_frame, _ = self._apply_roi(frame)
+        roi_frame, roi_offset = self._apply_roi(frame)
 
         gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY) if roi_frame.ndim == 3 else roi_frame
         detections = self.detector.detect(gray)
         tracking = self.tracker.update(detections.centers, detections.radii)
-        beads = self.bead_counter.count(tracking.active_tracks, gray, detections.helper_mask)
-        metrics = self.metrics.update(tracking, beads, frame_height=int(roi_frame.shape[0]))
-        if bool(getattr(self.config.debug, "draw_overlay", False)):
-            annotated = self._draw_overlay(roi_frame, tracking, beads, metrics)
-        else:
-            # 隐藏辅助动画，仅保留原始画面显示，不影响识别链路。
-            annotated = roi_frame.copy()
+        self._align_tracks_to_current_detections(tracking, detections)
+        confirmed_observed_tracks = [
+            track
+            for track in tracking.active_tracks
+            if "detection_index" in track.metadata
+            and int(track.age) >= int(self.config.metrics.min_track_age_for_count)
+        ]
+        beads = self.bead_counter.count(confirmed_observed_tracks, gray, detections.helper_mask)
+        metrics = self.metrics.update(
+            tracking,
+            beads,
+            frame_height=int(roi_frame.shape[0]),
+            frame_width=int(roi_frame.shape[1]),
+            timestamp=timestamp,
+        )
+        # The realtime system no longer renders recognition guides. Keep the
+        # source reference so analysis does not allocate another full frame.
+        annotated = frame
 
         return VisionResult(
             frame_index=self._frame_index,
-            timestamp=time(),
+            timestamp=float(timestamp if timestamp is not None else time()),
             detections=detections,
             tracking=tracking,
             beads=beads,
@@ -161,66 +176,23 @@ class VisionPipeline:
             cropped = cropped[crop_top:, :]
         return cropped, (x0, y0 + crop_top)
 
-    def _draw_overlay(
-        self,
-        frame: np.ndarray,
+    @staticmethod
+    def _align_tracks_to_current_detections(
         tracking: TrackingResult,
-        beads: BeadResult,
-        metrics: MetricsResult,
-    ) -> np.ndarray:
-        canvas = frame.copy()
-        if canvas.ndim == 2:
-            canvas = cv2.cvtColor(canvas, cv2.COLOR_GRAY2BGR)
-
-        bead_map = {item.droplet_id: item for item in beads.droplets}
-
+        detections: DetectionResult,
+    ) -> None:
+        detection_by_track = {
+            int(track_id): int(detection_index)
+            for track_id, detection_index in tracking.matched_pairs
+        }
         for track in tracking.active_tracks:
-            center = (int(track.position[0]), int(track.position[1]))
-            radius = int(max(2.0, float(track.radius)))
-            cv2.circle(canvas, center, radius, (255, 0, 0), 2)
-            cv2.putText(
-                canvas,
-                f"ID{track.id}",
-                (center[0] + 8, center[1] - 10),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
-                (0, 255, 0),
-                1,
-            )
-
-            bead_count = bead_map.get(track.id).bead_count if track.id in bead_map else 0
-            cv2.putText(
-                canvas,
-                f"beads:{bead_count}",
-                (center[0] + 8, center[1] + 10),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.4,
-                (0, 255, 255),
-                1,
-            )
-
-        for droplet in beads.droplets:
-            for bead in droplet.bead_positions:
-                cv2.circle(canvas, (int(bead[0]), int(bead[1])), 2, (0, 255, 255), -1)
-
-        avg_d = metrics.control.average_diameter
-        avg_text = f"{avg_d:.2f}" if avg_d is not None else "None"
-        stats_lines = [
-            f"frame={metrics.control.frame_droplet_count}",
-            f"new_cross={metrics.control.new_crossing_count}",
-            f"total={metrics.control.total_droplet_count}",
-            f"avg_diameter={avg_text}",
-            f"valid_for_control={metrics.control.valid_for_control}",
-        ]
-        for idx, line in enumerate(stats_lines):
-            cv2.putText(
-                canvas,
-                line,
-                (10, 24 + 22 * idx),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (0, 255, 0),
-                2,
-            )
-
-        return canvas
+            detection_index = detection_by_track.get(int(track.id))
+            if detection_index is None:
+                track.metadata.pop("detection_index", None)
+                track.metadata.pop("observed_radius", None)
+                continue
+            if detection_index < 0 or detection_index >= len(detections.centers):
+                continue
+            track.position = np.asarray(detections.centers[detection_index], dtype=np.float32)
+            track.metadata["detection_index"] = float(detection_index)
+            track.metadata["observed_radius"] = float(detections.radii[detection_index])

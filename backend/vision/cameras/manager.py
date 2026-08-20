@@ -115,7 +115,7 @@ class CameraManager:
         adapter_cls = self.registry.get_adapter_for_device(device, device.selected_backend)
         return adapter_cls(config=self.config, logger=self._log)
 
-    def test_device(self) -> CameraTestResult:
+    def test_device(self, camera_config: dict[str, Any] | None = None) -> CameraTestResult:
         device = self._require_selected()
         adapter = self._build_adapter(device)
         frames: list[FrameData] = []
@@ -123,6 +123,7 @@ class CameraManager:
             self._log("[CAMERA][TEST] 请关闭厂商官方相机软件及其预览窗口，避免设备被独占。")
             adapter.open(device)
             caps = adapter.get_capabilities()
+            parameter_result = self._configure_adapter(adapter, camera_config or {})
             _apply_continuous_mode(adapter, caps)
             adapter.start_stream()
             deadline = time.time() + 6.0
@@ -154,6 +155,8 @@ class CameraManager:
                 preview_png_base64=preview,
                 device_info=device.to_dict(),
                 capabilities=caps.to_dict(),
+                applied_parameters=parameter_result["applied"],
+                parameter_readback=parameter_result["readback"],
             )
         except Exception as exc:
             logging.exception("camera test failed")
@@ -164,8 +167,14 @@ class CameraManager:
             )
             return CameraTestResult(False, error=str(exc), unique_id=device.unique_id, backend_name=device.selected_backend)
         finally:
-            adapter.stop_stream()
-            adapter.close()
+            try:
+                adapter.stop_stream()
+            except Exception:
+                pass
+            try:
+                adapter.close()
+            except Exception:
+                pass
 
     def open_selected(self) -> None:
         device = self._require_selected()
@@ -193,14 +202,26 @@ class CameraManager:
             self._log(f"[CAMERA][OPEN][FAIL] backend={device.selected_backend} error={exc}")
             raise
 
-    def configure_selected(self, camera_config: dict[str, Any] | None = None) -> None:
+    def configure_selected(self, camera_config: dict[str, Any] | None = None) -> dict[str, Any]:
         adapter = self._require_adapter()
+        return self._configure_adapter(adapter, camera_config or {})
+
+    def _configure_adapter(
+        self,
+        adapter: BaseCameraAdapter,
+        camera_config: dict[str, Any],
+    ) -> dict[str, Any]:
         caps = adapter.get_capabilities()
-        for name, value in (camera_config or {}).items():
+        applied: dict[str, Any] = {}
+        readback: dict[str, Any] = {}
+        skipped: dict[str, str] = {}
+        for name, value in camera_config.items():
             cap = getattr(caps, name, None)
             if cap is None or not cap.supported:
+                skipped[name] = "设备不支持"
                 continue
             if cap.writable is False:
+                skipped[name] = "参数只读"
                 continue
             if value in (None, ""):
                 continue
@@ -209,6 +230,15 @@ class CameraManager:
             if cap.max_value is not None and float(value) > float(cap.max_value):
                 raise CameraBackendError(f"{name} 超出允许范围: {cap.min_value} - {cap.max_value}")
             adapter.set_feature(name, value)
+            applied[name] = value
+            if cap.readable:
+                actual = adapter.get_feature(name)
+                readback[name] = actual
+            self._log(
+                f"[CAMERA][PARAMETER][SET] backend={adapter.backend_name} "
+                f"name={name} requested={value} readback={readback.get(name, 'unavailable')}"
+            )
+        return {"applied": applied, "readback": readback, "skipped": skipped}
 
     def start_stream(self) -> None:
         adapter = self._require_adapter()

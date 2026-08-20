@@ -22,6 +22,8 @@ class SystemConfig:
     pump_parity: str = "N"
     mvs_sdk_path: str = ""
     camera_backend: str = ""
+    camera_parameters: dict[str, float | int | str] = field(default_factory=dict)
+    recognition_roi: dict[str, float | bool] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -44,7 +46,12 @@ class RecognitionSnapshot:
     frame_height: int = 0
     video_source_type: str = ""
     video_source: str = ""
+    # frame_id/timestamp identify the frame used to produce recognition data.
+    # Preview frames are published independently and must never make stale
+    # recognition data look newer to the PID loop.
     frame_id: int = 0
+    preview_frame_id: int = 0
+    preview_timestamp: float = 0.0
     frame_single_cell_count: int = 0
     frame_diameters: list[float] = field(default_factory=list)
     frame_diameter_sum: float = 0.0
@@ -55,6 +62,21 @@ class RecognitionSnapshot:
     uniformity_valid: bool = False
     uniformity_status: str = "样本不足"
     uniformity_reason: str = ""
+    capture_fps: float = 0.0
+    processing_fps: float = 0.0
+    recognition_latency_ms: float = 0.0
+    algorithm_processing_ms: float = 0.0
+    replaced_processing_frames: int = 0
+    pending_processing_frames: int = 0
+    period_replaced_processing_frames: int = 0
+    processed_frame_count: int = 0
+    period_processed_frames: int = 0
+    vision_performance_status: str = "等待视觉数据"
+    control_period_id: int = 0
+    motion_window_frames: int = 0
+    average_droplet_speed_um_s: float | None = None
+    speed_sample_count: int = 0
+    droplet_generation_rate_hz: float = 0.0
 
 
 @dataclass(slots=True)
@@ -65,6 +87,10 @@ class FrameSnapshot:
     height: int
     valid: bool
     frame_png_base64: Optional[str] = None
+    frame_pgm: Optional[bytes] = None
+    # Lightweight preview transport used by the independent video process.
+    # Keeping this as bytes avoids the extra 33% Base64 expansion.
+    frame_jpeg: Optional[bytes] = None
     reason: str = ""
 
 

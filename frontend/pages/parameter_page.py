@@ -12,10 +12,13 @@ class ParameterPage(ttk.Frame):
     def __init__(self, parent, app):
         super().__init__(parent)
         self.app = app
-        self.target_var = tk.StringVar(value="60")
-        self.magnification_var = tk.StringVar(value=f"{DEFAULT_MAGNIFICATION:g}")
-        self.camera_pixel_size_var = tk.StringVar(value=f"{DEFAULT_CAMERA_PIXEL_SIZE_UM:g}")
-        self.interval_var = tk.StringVar(value="300")
+        saved = app.frontend_config
+        self.target_var = tk.StringVar(value=str(saved.get("target_diameter", 60)))
+        self.magnification_var = tk.StringVar(value=str(saved.get("magnification", f"{DEFAULT_MAGNIFICATION:g}")))
+        self.camera_pixel_size_var = tk.StringVar(
+            value=str(saved.get("camera_pixel_size_um", f"{DEFAULT_CAMERA_PIXEL_SIZE_UM:g}"))
+        )
+        self.interval_var = tk.StringVar(value=str(saved.get("control_interval_ms", 300)))
         self._build()
 
     def _build(self) -> None:
@@ -38,6 +41,14 @@ class ParameterPage(ttk.Frame):
         ttk.Label(card, text="控制周期(ms)").grid(row=3, column=0, padx=8, pady=8, sticky="w")
         ttk.Entry(card, textvariable=self.interval_var, width=24).grid(row=3, column=1, padx=8, pady=8, sticky="w")
 
+        test_buttons = ttk.Frame(card)
+        test_buttons.grid(row=4, column=0, padx=8, pady=16, sticky="w")
+        ttk.Button(test_buttons, text="相机纯净测试", command=lambda: self.app.show_page("camera_test")).pack(
+            side="left", padx=(0, 6)
+        )
+        ttk.Button(test_buttons, text="泵机交互测试", command=lambda: self.app.show_page("pump_test")).pack(
+            side="left"
+        )
         ttk.Button(card, text="下一步", command=self._next_step).grid(row=4, column=1, padx=8, pady=16, sticky="e")
 
     def _next_step(self) -> None:
@@ -59,9 +70,11 @@ class ParameterPage(ttk.Frame):
             return
 
         pixel = camera_pixel_size_um / magnification
-        self.app.frontend_config["target_diameter"] = target
-        self.app.frontend_config["magnification"] = magnification
-        self.app.frontend_config["camera_pixel_size_um"] = camera_pixel_size_um
-        self.app.frontend_config["pixel_to_micron"] = pixel
-        self.app.frontend_config["control_interval_ms"] = interval
+        self.app.update_frontend_config(
+            target_diameter=target,
+            magnification=magnification,
+            camera_pixel_size_um=camera_pixel_size_um,
+            pixel_to_micron=pixel,
+            control_interval_ms=interval,
+        )
         self.app.show_page("video_source")

@@ -51,18 +51,31 @@ class DisturbanceModelTrainer:
 
         x_arr = np.asarray(x, dtype=float)
         y_arr = np.asarray(y, dtype=float)
-        x_aug = np.column_stack([np.ones(len(x_arr)), x_arr])
+        holdout_ratio = min(
+            0.4,
+            max(0.1, float(self.config.validation_ratio) + float(self.config.test_ratio)),
+        )
+        train_count = max(2, min(len(x_arr) - 1, int(round(len(x_arr) * (1.0 - holdout_ratio)))))
+        x_train = x_arr[:train_count]
+        y_train = y_arr[:train_count]
+        x_eval = x_arr[train_count:]
+        y_eval = y_arr[train_count:]
+        if len(x_eval) < 1:
+            return None, ModelMetrics(), "insufficient holdout samples"
+
+        x_aug = np.column_stack([np.ones(len(x_train)), x_train])
         penalty = np.eye(x_aug.shape[1], dtype=float)
         penalty[0, 0] = 0.0
         reg = max(0.0, float(self.config.nonlinear_l2_regularization))
         try:
-            coeff_matrix = np.linalg.solve(x_aug.T @ x_aug + reg * penalty, x_aug.T @ y_arr)
+            coeff_matrix = np.linalg.solve(x_aug.T @ x_aug + reg * penalty, x_aug.T @ y_train)
         except Exception:
-            coeff_matrix, *_ = np.linalg.lstsq(x_aug, y_arr, rcond=None)
+            coeff_matrix, *_ = np.linalg.lstsq(x_aug, y_train, rcond=None)
         intercepts = coeff_matrix[0, :].tolist()
         coefficients = coeff_matrix[1:, :].T.tolist()
-        pred = x_aug @ coeff_matrix
-        metrics = evaluate_predictions(y_arr[:, 0].tolist(), pred[:, 0].tolist())
+        x_eval_aug = np.column_stack([np.ones(len(x_eval)), x_eval])
+        pred = x_eval_aug @ coeff_matrix
+        metrics = evaluate_predictions(y_eval[:, 0].tolist(), pred[:, 0].tolist())
         confidence = max(0.0, min(1.0, (metrics.r2 + 1.0) / 2.0))
         version = f"disturbance-{int(time.time())}"
         model = LinearDisturbanceModel(
@@ -74,7 +87,7 @@ class DisturbanceModelTrainer:
             confidence=confidence,
             model_type="quadratic_ridge",
         )
-        return model, metrics, "trained"
+        return model, metrics, f"trained with chronological holdout ({len(x_eval)} samples)"
 
     def _find_future_sample(
         self,

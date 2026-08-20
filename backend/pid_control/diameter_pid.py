@@ -23,6 +23,8 @@ class DiameterPIDController(BaseDiameterController):
         self._has_previous = False
         self._last_frame_id: int | None = None
         self._last_output = 0.0
+        self._q1_bias: float | None = None
+        self._q2_bias: float | None = None
 
     def reset(self) -> None:
         self.integral = 0.0
@@ -30,6 +32,8 @@ class DiameterPIDController(BaseDiameterController):
         self._has_previous = False
         self._last_frame_id = None
         self._last_output = 0.0
+        self._q1_bias = None
+        self._q2_bias = None
         self.adaptive.reset()
         self.feedforward.reset()
         self.kp = float(self.config.base_kp)
@@ -61,6 +65,10 @@ class DiameterPIDController(BaseDiameterController):
     def update_input(self, pid_input: PIDInput) -> PIDCommand:
         q1_current = float(pid_input.current_q1)
         q2_current = float(pid_input.current_q2)
+        if self._q1_bias is None:
+            self._q1_bias = q1_current
+        if self._q2_bias is None:
+            self._q2_bias = q2_current
         mode = str(self.config.control_mode or PIDControlMode.CLASSIC_PID.value)
 
         freeze = self._validate_input(pid_input)
@@ -74,6 +82,8 @@ class DiameterPIDController(BaseDiameterController):
         current = float(pid_input.current_diameter_um)
         error = target - current
         if abs(error) <= float(self.config.diameter_deadband):
+            decay = min(1.0, max(0.0, float(self.config.integral_decay_in_deadband)))
+            self.integral *= decay
             self.previous_error = error
             self._has_previous = True
             if pid_input.frame_id > 0:
@@ -101,12 +111,22 @@ class DiameterPIDController(BaseDiameterController):
         else:
             self.kp, self.ki, self.kd = self.parameter_manager.base_gains()
 
-        self.integral += error * float(pid_input.dt)
-        self.integral = clamp(self.integral, -abs(self.config.integral_limit), abs(self.config.integral_limit))
+        previous_integral = self.integral
+        candidate_integral = self.integral + error * float(pid_input.dt)
+        candidate_integral = clamp(
+            candidate_integral,
+            -abs(self.config.integral_limit),
+            abs(self.config.integral_limit),
+        )
         derivative = 0.0 if not self._has_previous else (error - self.previous_error) / float(pid_input.dt)
         p_term = self.kp * error
-        i_term = self.ki * self.integral
+        candidate_i_term = self.ki * candidate_integral
         d_term = self.kd * derivative
+        unsaturated_pid = p_term + candidate_i_term + d_term
+        saturating_high = unsaturated_pid > float(self.config.output_max) and error > 0.0
+        saturating_low = unsaturated_pid < float(self.config.output_min) and error < 0.0
+        self.integral = previous_integral if (saturating_high or saturating_low) else candidate_integral
+        i_term = self.ki * self.integral
         u_pid = clamp(p_term + i_term + d_term, self.config.output_min, self.config.output_max)
 
         ff = self.feedforward.compute(pid_input) if mode == PIDControlMode.ADAPTIVE_PID_WITH_FEEDFORWARD.value else None
@@ -116,8 +136,23 @@ class DiameterPIDController(BaseDiameterController):
         u_final = clamp(u_pid + u_ff, self.config.output_min, self.config.output_max)
         u_final = rate_limit(u_final, self._last_output, self.config.output_rate_limit)
 
-        q1_raw = q1_current + u_final
-        q2_raw = q2_current + u_final
+        q1_base = float(self._q1_bias) if self.config.use_initial_flow_as_output_bias else q1_current
+        q2_base = float(self._q2_bias) if self.config.use_initial_flow_as_output_bias else q2_current
+        # Differential control keeps the two phases from being accelerated or
+        # decelerated together. error = target - measured:
+        #   droplet too large (error < 0): Q1 up, Q2 down
+        #   droplet too small (error > 0): Q1 down, Q2 up
+        q1_raw = q1_base - u_final
+        q2_raw = q2_base + u_final
+        max_step = max(0.0, float(self.config.max_flow_change_per_cycle))
+        if max_step > 0.0:
+            q1_raw = clamp(q1_raw, q1_current - max_step, q1_current + max_step)
+            q2_raw = clamp(q2_raw, q2_current - max_step, q2_current + max_step)
+        total_max = max(0.0, float(self.config.total_flow_max))
+        if total_max > 0.0 and q1_raw + q2_raw > total_max:
+            scale = total_max / (q1_raw + q2_raw)
+            q1_raw *= scale
+            q2_raw *= scale
         self.previous_error = error
         self._has_previous = True
         self._last_output = u_final

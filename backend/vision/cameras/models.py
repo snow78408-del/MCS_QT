@@ -157,6 +157,8 @@ class CameraTestResult:
     preview_png_base64: str | None = None
     device_info: dict[str, Any] = field(default_factory=dict)
     capabilities: dict[str, Any] = field(default_factory=dict)
+    applied_parameters: dict[str, Any] = field(default_factory=dict)
+    parameter_readback: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

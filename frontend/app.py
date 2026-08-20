@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import threading
+import multiprocessing as mp
 import tkinter as tk
 from tkinter import messagebox, ttk
 from typing import Callable
@@ -14,15 +15,22 @@ except Exception:  # pragma: no cover
 
 from .config import APP_TITLE, APP_WINDOW_SIZE, DEFAULT_REFRESH_INTERVAL_MS
 from .pages.init_page import InitPage
+from .pages.camera_test_page import CameraTestPage
 from .pages.monitor_page import MonitorPage
 from .pages.parameter_page import ParameterPage
+from .pages.pump_test_page import PumpTestPage
 from .pages.status_page import StatusPage
 from .pages.video_source_page import VideoSourcePage
 from .runtime_logging import create_runtime_logger
+from .settings_store import FrontendSettingsStore
 
 
 class FrontendApp(tk.Tk):
-    def __init__(self, orchestrator: OrchestratorService | None = None):
+    def __init__(
+        self,
+        orchestrator: OrchestratorService | None = None,
+        settings_store: FrontendSettingsStore | None = None,
+    ):
         super().__init__()
         self.title(APP_TITLE)
         self.geometry(APP_WINDOW_SIZE)
@@ -30,13 +38,26 @@ class FrontendApp(tk.Tk):
 
         self.runtime_logger = create_runtime_logger()
         self.orchestrator = orchestrator or OrchestratorService(logger=self.runtime_logger)
-        self.frontend_config: dict[str, object] = {}
+        self.settings_store = settings_store or FrontendSettingsStore()
+        self.frontend_config: dict[str, object] = self.settings_store.load()
+        if self.frontend_config:
+            self.runtime_logger(f"[APP][SETTINGS] loaded={self.settings_store.path}")
         self.refresh_interval_ms = DEFAULT_REFRESH_INTERVAL_MS
         self._current_page = None
 
         self._build_layout()
         self._build_pages()
         self.show_page("parameter")
+
+    def update_frontend_config(self, **values: object) -> None:
+        """Update validated user input and persist it for the next launch."""
+        self.frontend_config.update(values)
+        try:
+            self.settings_store.save(self.frontend_config)
+            self.runtime_logger(f"[APP][SETTINGS] saved={self.settings_store.path}")
+        except (OSError, TypeError, ValueError) as exc:
+            # A settings write must never prevent the current session from running.
+            self.runtime_logger(f"[APP][SETTINGS][ERROR] {exc}")
 
     def _build_layout(self) -> None:
         self.container = ttk.Frame(self)
@@ -45,6 +66,8 @@ class FrontendApp(tk.Tk):
     def _build_pages(self) -> None:
         self.pages = {
             "parameter": ParameterPage(self.container, self),
+            "camera_test": CameraTestPage(self.container, self),
+            "pump_test": PumpTestPage(self.container, self),
             "video_source": VideoSourcePage(self.container, self),
             "init": InitPage(self.container, self),
             "monitor": MonitorPage(self.container, self),
@@ -93,6 +116,8 @@ class FrontendApp(tk.Tk):
             pump_parity=str(self.frontend_config.get("pump_parity", "N")).strip().upper() or "N",
             mvs_sdk_path=str(self.frontend_config.get("mvs_sdk_path", "")).strip(),
             camera_backend=str(self.frontend_config.get("camera_backend", "")).strip(),
+            camera_parameters=dict(self.frontend_config.get("camera_parameters", {}) or {}),
+            recognition_roi=dict(self.frontend_config.get("recognition_roi", {}) or {}),
         )
 
     def configure_prepare_initialize(self) -> None:
@@ -135,6 +160,7 @@ class FrontendApp(tk.Tk):
 
 
 def main() -> None:
+    mp.freeze_support()
     app = FrontendApp()
     app.mainloop()
 

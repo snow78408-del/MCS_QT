@@ -97,6 +97,10 @@ def main() -> int:
         cfg.roi.y_start_ratio = float(y0)
         cfg.roi.y_end_ratio = float(y1)
     pipeline = VisionPipeline(cfg)
+    pipeline.configure_expected_diameter(
+        float(args.target_um),
+        float(args.pixel_to_micron),
+    )
     reset_controller()
     PIDConfig()
 
@@ -126,7 +130,12 @@ def main() -> int:
             break
         processed += 1
 
-        result = pipeline.process_frame(frame)
+        source_timestamp = (
+            float(frame_no - 1) / fps
+            if fps > 0.0
+            else float(processed - 1) * max(1e-3, float(args.control_interval_ms) / 1000.0)
+        )
+        result = pipeline.process_frame(frame, timestamp=source_timestamp)
         control = result.metrics.control
         frame_avg_px = control.frame_avg_diameter
         frame_avg_um = None if frame_avg_px is None else float(frame_avg_px) * float(args.pixel_to_micron)
@@ -169,6 +178,7 @@ def main() -> int:
             {
                 "source_frame": frame_no,
                 "pipeline_frame": result.frame_index,
+                "raw_detections": len(result.detections.centers),
                 "droplets": droplet_count,
                 "valid_for_control": valid,
                 "avg_diameter_px": frame_avg_px,

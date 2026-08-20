@@ -8,6 +8,7 @@ from ctypes import (
     WinDLL,
     byref,
     c_char_p,
+    c_bool,
     c_float,
     c_int,
     c_ubyte,
@@ -326,7 +327,14 @@ class DirectHikrobotDllCamera:
                 self._set_enum_value(key, enum_value, raise_on_fail=False)
             elif key in {"Width", "Height", "OffsetX", "OffsetY", "GevSCPSPacketSize"}:
                 self._set_int_value(key, int(value), raise_on_fail=True)
-            elif key in {"ExposureTime", "Gain", "AcquisitionFrameRate"}:
+            elif key == "ExposureTime":
+                self._set_enum_value("ExposureAuto", 0, raise_on_fail=False)
+                self._set_float_value(key, float(value), raise_on_fail=True)
+            elif key == "Gain":
+                self._set_enum_value("GainAuto", 0, raise_on_fail=False)
+                self._set_float_value(key, float(value), raise_on_fail=True)
+            elif key == "AcquisitionFrameRate":
+                self._set_bool_value("AcquisitionFrameRateEnable", True, raise_on_fail=False)
                 self._set_float_value(key, float(value), raise_on_fail=True)
         except Exception as exc:
             self._last_error = str(exc)
@@ -372,6 +380,9 @@ class DirectHikrobotDllCamera:
         dll.MV_CC_SetIntValue.restype = c_int
         dll.MV_CC_SetFloatValue.argtypes = [c_void_p, c_char_p, c_float]
         dll.MV_CC_SetFloatValue.restype = c_int
+        if hasattr(dll, "MV_CC_SetBoolValue"):
+            dll.MV_CC_SetBoolValue.argtypes = [c_void_p, c_char_p, c_bool]
+            dll.MV_CC_SetBoolValue.restype = c_int
         dll.MV_CC_GetOptimalPacketSize.argtypes = [c_void_p]
         dll.MV_CC_GetOptimalPacketSize.restype = c_int
         if hasattr(dll, "MV_CC_ConvertPixelType"):
@@ -402,6 +413,14 @@ class DirectHikrobotDllCamera:
         ret = self._dll.MV_CC_SetFloatValue(self._handle, name.encode("ascii"), c_float(float(value)))
         if ret != 0 and raise_on_fail:
             raise CameraBackendError(f"MV_CC_SetFloatValue {name} failed: {_ret_hex(ret)}", int(ret))
+
+    def _set_bool_value(self, name: str, value: bool, raise_on_fail: bool) -> None:
+        setter = getattr(self._dll, "MV_CC_SetBoolValue", None)
+        if setter is None:
+            return
+        ret = setter(self._handle, name.encode("ascii"), c_bool(bool(value)))
+        if ret != 0 and raise_on_fail:
+            raise CameraBackendError(f"MV_CC_SetBoolValue {name} failed: {_ret_hex(ret)}", int(ret))
 
     def _safe_call(self, name: str) -> None:
         try:

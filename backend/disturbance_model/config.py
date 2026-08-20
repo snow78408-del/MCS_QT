@@ -3,13 +3,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
 from .models import DisturbanceControlStage
 
 
 @dataclass(slots=True)
 class DisturbanceModelConfig:
-    database_path: str = str(Path("data") / "disturbance_model.sqlite3")
-    model_path: str = str(Path("data") / "disturbance_model.json")
+    database_path: str = str(PROJECT_ROOT / "data" / "disturbance_model.sqlite3")
+    model_path: str = str(PROJECT_ROOT / "data" / "disturbance_model.json")
     sample_interval_ms: int = 200
     prediction_horizon_ms: int = 200
     prediction_horizon_tolerance_ms: int = 100
