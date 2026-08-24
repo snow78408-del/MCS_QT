@@ -88,6 +88,8 @@ class InitPage(ttk.Frame):
                 raise ValueError("初始 Q1 流速必须大于 0，单位为 uL/min")
             if q2 <= 0:
                 raise ValueError("初始 Q2 流速必须大于 0，单位为 uL/min")
+            if q1 < q2 + 0.2:
+                raise ValueError("油相 Q1 必须至少比水相 Q2 大 0.2 uL/min")
 
             port = self.port_var.get().strip().upper()
             if not local_video_mode and not port:

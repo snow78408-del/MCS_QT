@@ -30,6 +30,19 @@ class _PumpStub:
 
 
 class PumpInteractionFlowTests(unittest.TestCase):
+    def test_interaction_test_rejects_q1_not_above_q2_before_connect(self) -> None:
+        service = OrchestratorService.__new__(OrchestratorService)
+        service.pump_service = _PumpStub()
+        service._state = SystemState.IDLE
+        service._log = lambda _message: None
+
+        with self.assertRaises(ValueError):
+            service.run_pump_interaction_test(
+                port="COM3", address=1, baudrate=1200, parity="N", q1=20.0, q2=20.0
+            )
+
+        self.assertEqual(service.pump_service.calls, [])
+
     def test_complete_test_writes_starts_and_stops_in_order(self) -> None:
         service = OrchestratorService.__new__(OrchestratorService)
         service.pump_service = _PumpStub()

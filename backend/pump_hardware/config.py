@@ -30,4 +30,12 @@ class PumpHardwareConfig:
     probe_step_delay: float = 0.06
     wsp_verify_read_retry: int = 3
     wsp_verify_retry_interval: float = 0.12
+    # The controller communicates at only 1200 baud. Give CH1 enough time to
+    # finish its commit before issuing CH2, then recover CH2 independently if
+    # its write/readback is lost. A successful CH1 is never written again.
+    inter_channel_update_delay: float = 0.18
+    q2_update_max_attempts: int = 2
+    q2_update_retry_interval: float = 0.25
     wss_swap_fallback: bool = True
+    # CH1 is oil and CH2 is water in this system.
+    min_q1_q2_gap: float = 0.2

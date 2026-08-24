@@ -954,6 +954,20 @@ class PumpHardwareService:
 
     def update_flow_while_running(self, q1: float, q2: float) -> FlowUpdateResult:
         self.log(f"[PUMP][UPDATE] 运行中参数更新: q1={q1:.6f}, q2={q2:.6f}")
+        min_gap = max(1e-9, float(self.runtime_config.min_q1_q2_gap))
+        if float(q1) < float(q2) + min_gap:
+            reason = (
+                f"拒绝泵流量更新：油相 Q1 必须至少比水相 Q2 大 {min_gap:.6f} uL/min；"
+                f"当前 q1={float(q1):.6f}, q2={float(q2):.6f}"
+            )
+            self.log(f"[PUMP][UPDATE][REJECT] {reason}")
+            return FlowUpdateResult(
+                ok=False,
+                q1_ok=False,
+                q2_ok=False,
+                still_running=False,
+                reason=reason,
+            )
         rs_before = self.read_run_state()
         if not rs_before.ok or rs_before.parsed_reply is None:
             reason = rs_before.error or rs_before.reason or "读取运行状态失败"
@@ -981,6 +995,25 @@ class PumpHardwareService:
 
         p1 = self._channel_params_with_flow(1, q1)
         p2 = self._channel_params_with_flow(2, q2)
+        encoded_q1 = self.flow_from_channel_params(p1)
+        encoded_q2 = self.flow_from_channel_params(p2)
+        if (
+            encoded_q1 is None
+            or encoded_q2 is None
+            or encoded_q1 < encoded_q2 + min_gap
+        ):
+            reason = (
+                "拒绝泵流量更新：编码后的泵参数不能保持油相 Q1 严格大于水相 Q2；"
+                f"encoded_q1={encoded_q1}, encoded_q2={encoded_q2}, min_gap={min_gap:.6f}"
+            )
+            self.log(f"[PUMP][UPDATE][REJECT] {reason}")
+            return FlowUpdateResult(
+                ok=False,
+                q1_ok=False,
+                q2_ok=False,
+                still_running=True,
+                reason=reason,
+            )
         self.log(
             "[PUMP][UPDATE][PARAMS] "
             f"CH1 target={q1:.6f}uL/min dispense={p1.dispense_value}/unit{p1.dispense_unit} "
@@ -999,7 +1032,36 @@ class PumpHardwareService:
         else:
             self.log(f"[PUMP][VERIFY][FAIL] CH1 参数回读校验失败: {q1_error}")
 
-        wr2 = self.write_wsp_and_verify(2, p2)
+        inter_channel_delay = max(
+            0.0,
+            float(getattr(self.runtime_config, "inter_channel_update_delay", 0.0)),
+        )
+        if inter_channel_delay > 0.0:
+            time.sleep(inter_channel_delay)
+
+        q2_attempts = max(
+            1,
+            int(getattr(self.runtime_config, "q2_update_max_attempts", 1)),
+        )
+        wr2 = PumpOperationResult(ok=False, error="Q2 尚未写入")
+        for attempt in range(1, q2_attempts + 1):
+            wr2 = self.write_wsp_and_verify(2, p2)
+            if wr2.ok:
+                if attempt > 1:
+                    self.log(f"[PUMP][Q2][RECOVERED] 第 {attempt} 次独立写入/回读成功")
+                break
+            q2_attempt_error = wr2.reason or wr2.error or "Q2下发失败"
+            self.log(
+                f"[PUMP][Q2][RETRY] 第 {attempt}/{q2_attempts} 次写入/回读失败: "
+                f"{q2_attempt_error}"
+            )
+            if attempt < q2_attempts:
+                time.sleep(
+                    max(
+                        0.0,
+                        float(getattr(self.runtime_config, "q2_update_retry_interval", 0.0)),
+                    )
+                )
         q2_ok = bool(wr2.ok)
         q2_error = None if wr2.ok else (wr2.reason or wr2.error or "Q2下发失败")
         if q2_ok:

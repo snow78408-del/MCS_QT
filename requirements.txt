@@ -2,3 +2,4 @@ numpy>=1.23
 opencv-python>=4.8
 pyserial>=3.5
 harvesters>=1.4
+PySide6>=6.8

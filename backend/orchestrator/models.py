@@ -23,7 +23,7 @@ class SystemConfig:
     mvs_sdk_path: str = ""
     camera_backend: str = ""
     camera_parameters: dict[str, float | int | str] = field(default_factory=dict)
-    recognition_roi: dict[str, float | bool] = field(default_factory=dict)
+    recognition_roi: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -77,6 +77,13 @@ class RecognitionSnapshot:
     average_droplet_speed_um_s: float | None = None
     speed_sample_count: int = 0
     droplet_generation_rate_hz: float = 0.0
+    pixel_to_micron: float = 0.0
+    scale_source: str = "configured"
+    channel_width_um: float | None = None
+    channel_width_px: float | None = None
+    channel_calibration_status: str = "disabled"
+    channel_calibration_confidence: float = 0.0
+    channel_calibration_reason: str = ""
 
 
 @dataclass(slots=True)
@@ -131,8 +138,13 @@ class ControlSnapshot:
     ki: float = 0.0
     kd: float = 0.0
     adaptive_active: bool = False
+    adaptive_enabled: bool = False
+    adaptive_reason: str = ""
     feedforward_active: bool = False
+    feedforward_reason: str = ""
     control_mode: str = "CLASSIC_PID"
+    q1_output_gain: float = 1.0
+    q2_output_gain: float = 1.0
     frame_id: int = 0
 
 

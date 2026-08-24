@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import threading
 import time
+from dataclasses import asdict
 from typing import Any, Callable
 
 from ..disturbance_model import DisturbanceModelConfig, DisturbanceModelService
@@ -19,6 +20,7 @@ from .models import (
     SystemConfig,
     SystemSnapshot,
 )
+from .pid_database import PIDSessionRecorder
 from .state import SystemState
 from .vision_adapter import GenericVisionAdapter, PipelineVisionService, VisionAdapterProtocol
 
@@ -50,6 +52,9 @@ class OrchestratorService:
         self.pump_service = pump_service or PumpHardwareService(logger=logger)
         self.runtime = orchestrator_config or OrchestratorConfig()
         self.pid_config = pid_config or PIDConfig()
+        pump_runtime = getattr(self.pump_service, "runtime_config", None)
+        if pump_runtime is not None and hasattr(pump_runtime, "min_q1_q2_gap"):
+            pump_runtime.min_q1_q2_gap = float(self.pid_config.min_q1_q2_gap)
         self.disturbance_service = disturbance_service or DisturbanceModelService(
             config=disturbance_config,
             logger=self._log,
@@ -71,16 +76,21 @@ class OrchestratorService:
             last_update_reason="",
         )
         self._control: ControlSnapshot | None = None
+        self._pid_data_recorder = PIDSessionRecorder()
         self._message = ""
         self._error = ""
 
         self._lock = threading.RLock()
+        self._control_condition = threading.Condition(self._lock)
         self._loop_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
         self._last_control_ts: float | None = None
         self._last_control_frame_id: int | None = None
         self._last_control_period_id: int | None = None
+        # Newest vision period observed, including rejected/stale periods.
+        # This is intentionally separate from the last period applied to PID.
+        self._last_seen_vision_period_id: int | None = None
         self._last_disturbance_prediction = None
         self._disturbance_context: dict[str, Any] = {}
         self._refresh_pump_channels(communication_ok=False, error="not connected")
@@ -222,6 +232,7 @@ class OrchestratorService:
             self._log(f"[ORCH][ERROR] {error}")
 
     def configure(self, system_config: SystemConfig) -> None:
+        self._require_valid_phase_flows(system_config.initial_q1, system_config.initial_q2)
         interval = int(system_config.control_interval_ms)
         interval = max(self.runtime.min_control_interval_ms, interval)
         interval = min(self.runtime.max_control_interval_ms, interval)
@@ -305,6 +316,50 @@ class OrchestratorService:
         except TypeError:
             return test()
 
+    def analyze_channel_calibration_preview(
+        self,
+        preview_png_base64: str,
+        roi: dict[str, Any] | None = None,
+        channel_width_um: float = 430.0,
+        configured_pixel_to_micron: float = 1.0,
+        hough_parameters: dict[str, float | int] | None = None,
+    ) -> dict[str, Any]:
+        analyze = getattr(self.vision_service, "analyze_channel_calibration_preview", None)
+        if not callable(analyze):
+            raise RuntimeError("当前视觉服务不支持测试帧管道分析")
+        try:
+            result = analyze(
+                preview_png_base64,
+                roi=roi,
+                channel_width_um=channel_width_um,
+                configured_pixel_to_micron=configured_pixel_to_micron,
+                hough_parameters=hough_parameters,
+            )
+        except TypeError as exc:
+            if "hough_parameters" not in str(exc):
+                raise
+            # Preserve compatibility with an injected legacy vision service.
+            result = analyze(
+                preview_png_base64,
+                roi=roi,
+                channel_width_um=channel_width_um,
+                configured_pixel_to_micron=configured_pixel_to_micron,
+            )
+        return dict(result or {})
+
+    def get_last_control_period_droplets(self) -> dict[str, Any]:
+        getter = getattr(self.vision_service, "get_last_control_period_droplets", None)
+        if not callable(getter):
+            return {
+                "period_id": 0,
+                "droplet_count": 0,
+                "droplets": [],
+                "sample_frame_count": 0,
+                "frames": [],
+                "reason": "当前视觉服务不支持有效液滴回看",
+            }
+        return dict(getter() or {})
+
     def _apply_pump_serial_config(self, cfg: SystemConfig) -> None:
         serial_cfg = self.pump_service.serial_config
         serial_cfg.port = str(cfg.pump_port).strip()
@@ -313,6 +368,15 @@ class OrchestratorService:
         serial_cfg.parity = str(cfg.pump_parity or "N").strip().upper()
         if serial_cfg.parity not in {"E", "N"}:
             serial_cfg.parity = "N"
+
+    def _require_valid_phase_flows(self, q1: float, q2: float) -> None:
+        pid_cfg = getattr(self, "pid_config", None)
+        min_gap = max(1e-9, float(getattr(pid_cfg, "min_q1_q2_gap", 0.2)))
+        if float(q1) < float(q2) + min_gap:
+            raise ValueError(
+                f"油相 Q1 必须至少比水相 Q2 大 {min_gap:.1f} uL/min；"
+                f"当前 Q1={float(q1):.6f}, Q2={float(q2):.6f}"
+            )
 
     def run_pump_interaction_test(
         self,
@@ -325,6 +389,7 @@ class OrchestratorService:
         q2: float,
     ) -> dict[str, Any]:
         """Exercise pump communication without initializing camera/control."""
+        self._require_valid_phase_flows(q1, q2)
         serial_cfg = self.pump_service.serial_config
         serial_cfg.port = str(port or "").strip().upper()
         serial_cfg.address = int(address)
@@ -403,6 +468,7 @@ class OrchestratorService:
         return self.pump_service.channel_params_for_flow(channel, q)
 
     def _apply_init_flow_rates(self, q1: float, q2: float):
+        self._require_valid_phase_flows(q1, q2)
         retries = 3
         last_res = None
         for attempt in range(1, retries + 1):
@@ -414,6 +480,17 @@ class OrchestratorService:
                 continue
 
             p1 = self._to_channel_params_with_flow(1, q1)
+            p2 = self._to_channel_params_with_flow(2, q2)
+            q1_encoded = self._flow_from_channel_params(p1)
+            q2_encoded = self._flow_from_channel_params(p2)
+            try:
+                self._require_valid_phase_flows(q1_encoded, q2_encoded)
+            except (TypeError, ValueError) as exc:
+                last_res = self.pump_service._fail(
+                    f"encoded initial flows violate oil/water ordering: {exc}"
+                )
+                time.sleep(0.12)
+                continue
             self._log(
                 "[PUMP][INIT][PARAMS] "
                 f"CH1 target={q1:.6f}uL/min dispense={p1.dispense_value}/unit{p1.dispense_unit} "
@@ -427,7 +504,6 @@ class OrchestratorService:
                 time.sleep(0.12)
                 continue
 
-            p2 = self._to_channel_params_with_flow(2, q2)
             self._log(
                 "[PUMP][INIT][PARAMS] "
                 f"CH2 target={q2:.6f}uL/min dispense={p2.dispense_value}/unit{p2.dispense_unit} "
@@ -555,9 +631,18 @@ class OrchestratorService:
 
             build_controller(self.pid_config)
             reset_controller()
+            self._log(
+                "[PID][INIT] "
+                f"mode={self.pid_config.control_mode} "
+                f"adaptive_min_samples={self.pid_config.adaptive_min_sample_count} "
+                f"adaptive_interval={self.pid_config.adaptive_update_interval} "
+                f"q1_gain={self.pid_config.q1_output_gain:.3f} "
+                f"q2_gain={self.pid_config.q2_output_gain:.3f}"
+            )
             self._last_control_ts = None
             self._last_control_frame_id = None
             self._last_control_period_id = None
+            self._last_seen_vision_period_id = None
             self._set_state(SystemState.INITIALIZED, message="initialized")
         except Exception as e:
             self._pump_state.last_error = str(e)
@@ -572,6 +657,15 @@ class OrchestratorService:
             if self._loop_thread and self._loop_thread.is_alive():
                 raise RuntimeError(f"state does not allow start: {self._state.value}")
             adapter = self.vision_adapter
+            starting_state = self._state
+
+        if starting_state != SystemState.PAUSED:
+            self._pid_data_recorder.begin_session(
+                {
+                    "system_config": asdict(self._cfg) if self._cfg is not None else {},
+                    "pid_config": asdict(self.pid_config),
+                }
+            )
 
         if adapter is not None:
             adapter.start()
@@ -593,6 +687,15 @@ class OrchestratorService:
 
         self._stop_event.clear()
         self._pause_event.clear()
+        # Do not apply the snapshot that happened to be cached while the pump
+        # was being initialized. Start feedback from the next completed vision
+        # period so the first displayed state is not an avoidable stale freeze.
+        try:
+            baseline_recognition = self._read_recognition()
+            if int(baseline_recognition.control_period_id) > 0:
+                self._last_seen_vision_period_id = int(baseline_recognition.control_period_id)
+        except Exception as exc:
+            self._log(f"[PID][START][WARN] unable to baseline vision period: {exc}")
         self._loop_thread = threading.Thread(target=self._control_loop, name="orchestrator-control-loop", daemon=True)
         self._loop_thread.start()
         self._log("[PID][START] PID feedback started")
@@ -652,7 +755,30 @@ class OrchestratorService:
                 adapter.stop()
         except Exception as e:
             self._log(f"[ORCH][WARN] 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤缂嶅﹪寮婚悢鍏尖拻閻庨潧澹婂Σ顔剧磼閻愵剙鍔ゆ繝鈧柆宥呯劦妞ゆ帒鍊归崵鈧柣搴㈠嚬閸欏啫鐣峰畷鍥ь棜閻庯絻鍔嬪Ч妤呮⒑閸︻厼鍔嬮柛銊ョ秺瀹曟劙鎮欓悜妯轰画濠电姴锕ら崯鎵不閼姐倐鍋撳▓鍨灍濠电偛锕顐﹀礃椤旇偐锛滃┑鐐村灦閼归箖鐛Δ鍛拻濞撴埃鍋撴繛浣冲懏宕查柛顐犲劚閺勩儵鏌涢弴銊ョ仭闁稿﹤娼￠弻娑㈠箻濡も偓閹虫劙鏁嶅鍫熲拺鐟滅増甯掓禍浼存煕濞嗗繘顎楅柍缁樻尭椤劑宕奸悢鍝勫箰闁诲骸鍘滈崑鎾绘煃瑜滈崜鐔风暦娴兼潙鍐€妞ゆ挾濮寸粊锕傛倵楠炲灝鍔氭い锔跨矙瀵偅绻濋崟顓燂紡闂佺懓鍢查惌鍌炲传閻戞ɑ鍙忛柨婵嗘媼濡偓濠殿喖锕︾划顖炲箯閸涱喚鐟规い鏍ㄧ矊婵吋淇婇悙顏勨偓鏍垂閸洖鍨傜憸鐗堝笒缁犳煡鏌曡箛鏇炐涢柡鈧禒瀣€甸柨婵嗙凹濞寸兘鏌熼懞銉︾婵﹥妞藉畷顐﹀礋椤掆偓缁愭盯姊洪崫銉バ㈡繛鏉戝槻閳诲酣濮€閵堝棗鈧兘鏌ｉ幋鐑嗙劷闁告ê宕—鍐Χ閸℃衼缂備浇灏▔鏇犲垝婵犳艾绠婚柟棰佽兌閸炵敻鏌ｉ悢鍝ユ噧閻庢凹鍙冮幃锟犲Ψ閳哄倻鍘撻柣鐔哥懃鐎氼剟鎮橀幘顔界厵妞ゆ梻鏅幊鍥┾偓娈垮枛閻栧ジ鐛€ｎ喗鍋愰弶鍫厛閺佸洭姊婚崒姘偓鐑芥倿閿旈敮鍋撶粭娑樺幘閸濆嫷鍚嬪璺猴功閺屟囨⒑缂佹﹩鐒炬い鏇嗗懐涓嶉柡宥庡幗閻撱儵鏌ｉ弬鎸庢儓鐎涙繈鏌涢悜鍡楃仸婵﹥妞藉畷姗€宕ｆ径瀣壍闂備胶顭堥敃銈夆€﹀畡鎵殾闁靛繈鍊曠涵鈧梺缁樺灥濡瑧鈧潧鐭傚娲濞戞艾顣哄┑鈽嗗亝椤ㄥ棝骞堥妸鈺傛櫇闁稿本绋撻崢閬嶆煟鎼搭垳绉靛ù婊勭矒椤㈡棃顢旈崼鐔哄幐闂佸憡渚楅崢楣冨春閿濆棭娈介柣鎰皺鏁堝銈冨灪閻熲晛鐣峰鍡╂缂備浇椴搁悡鈥愁潖閾忚瀚氶柟缁樺笒濮ｆ劗绱撻崒姘毙㈡俊顐ｇ懅缁顓兼径瀣偓鐑芥煟閵忕姴鎮佺紒妤€顦扮换婵嬫偨闂堟刀锝囩棯閺夎法效闁诡喒鈧枼妲堟慨姗堢到娴滈箖鏌涜箛鎿冩Ц濞存粓绠栧娲焻閻愯尪瀚板褍顕埀顒冾潐濞叉垿宕￠崘宸殨闁稿﹦鍣ュΣ楣冩⒑閸濆嫭锛旈梻鍕缁岃鲸绻濋崶顬囨煕濞戝崬鏋涙繛鍛€濆娲箹閻愭祴鍋撻弴銏犵柈闁圭虎鍠栭拑鐔衡偓骞垮劚椤︻垱瀵奸悩缁樼厱闁哄洢鍔屾禍鎰版煕鐎ｎ偅宕勯柕鍥ㄥ姍楠炴帒鈹戦崶銊︾彟闂傚倷绀侀幉锟犲礉閿曞倸绐楁俊銈呮噹閻撴洟鏌熼悜妯烘鐟滅増甯楅弲鏌ユ煕濞戝崬鏋涢柡鍡楃墦濮婃椽宕妷銉︾亖闂佺顑冮崐婵嗩嚕婵犳碍鏅柛鏇ㄤ簼閸曞啴鏌ｉ悩鍙夊鐟滄澘鍟撮敐鐐哄炊椤掍讲鎷洪柣鐘叉礌閳ь剙纾禒鈺侇渻閵堝繒鐣垫繛浣冲洦鍋╃€瑰嫭瀚堥弮鍫濆窛妞ゆ柨鍚嬮悾浼存⒒娴ｇ鏆遍柟纰卞亰瀹曨垶顢曢敐搴㈩啍闂佸憡娲﹂崹閬嶅煕閹烘嚚褰掓晲閸涱喖鏆堥梺璇″灠閻楀﹦鎹㈠☉姘勃闁稿本鑹鹃‖澶愭⒑闁稓鈹掗柛鏂跨Ч钘濋柣妤€鐗婇崕鐔兼煃閽樺顥炴い銉節濮婄粯鎷呮笟顖滃姼缂備胶绮敋閾荤偤鎮归幁鎺戝鐎规洘鐓￠弻娑㈠焺閸忥附绮嶇粋宥咁煥閸喓鍘搁悗骞垮劚閸燁偅淇婄捄銊х＜闁绘娅曠亸顓㈡婢跺绡€濠电姴鍊搁弳鐔虹磼婢跺銇濋柡灞糕偓宕囨殕閻庯綆鍓涜ⅵ闂備浇妗ㄧ粈渚€宕幘顔兼槬闁逞屽墯閵囧嫰骞掗幋婵愪痪闂佺顑呴鍛村煘閹达附鍋愰柟缁樺俯娴犻箖鎮楃憴鍕鐎殿喖澧庨幑銏犫攽鐎ｎ偒妫冨┑鐐村灥瀹曨剟宕滈柆宥嗏拺缂佸顑欓崕宥夋煕閺冣偓閸ㄧ敻锝炶箛鏃傜瘈婵﹩鍓熼崬鍫曟⒑缂佹ɑ鐓ラ柛銏＄叀閹顢楅崟顑芥嫼闂傚倸鐗婄粙鎾剁不閻愮儤鐓曞┑鐘插暟婢х敻鏌熼鍡欑瘈鐎殿喗鎸抽幃娆撳煛閸屾稒婢戦梻鍌欒兌缁垵鎽悷婊勬緲閸熸潙顕ｉ幎鑺ュ€烽柣鎴烆焽閸樿鲸绻濋悽闈浶㈤柛鐕佸亝閹便劑宕奸妷锔惧帾闂佹悶鍎滈崘鍙ョ磾濠电姵顔栭崰鎺楀磻閹剧粯鈷戦柡鍌樺劜濞呭懘鏌涢悩瀹犲閾荤偤鏌涢幇鈺佸闁哄啫鐗婇崑鎰版⒒閸喓鈼ユ繛宀婁邯濮婃椽骞愭惔銏紭闂佹悶鍔嬬划娆愪繆鐎涙ɑ濯寸紒顖涙礃閻庡姊洪崷顓炰壕婵炲吋鐟︾粋鎺撶附閸涘﹦鍘介棅顐㈡处濞叉牗绂掗埡鍌欑箚妞ゆ劑鍨归顐ょ磼椤旂⒈鐓奸柟顔界懇閹粌螣闁垮顏洪梻鍌欒兌椤牓寮甸鍕仭鐟滄棁妫熼梺鎸庢⒒閺咁偆寮ч埀顒勬⒑闁偛鑻晶鎾煛鐏炶姤顥滄い鎾炽偢瀹曘劑顢涢妶鍥ц€块梻鍌氬€风粈浣革耿闁秴纾婚柟鎹愵嚙缁€鍫熸叏濡灝鐓愰柛濠傛健閺屻倝骞侀幒鎴濆Б缂備胶濞€缁犳牠寮诲☉銏犵労闁稿繆鏅滈崹瑙勭閹间緡鏁囬柣妯兼暩閿涙粓姊洪柅鐐茶嫰婢ь垳鈧灚婢樼€氫即鐛崶顒夋晣闁绘ɑ褰冩俊鍥⒒閸屾瑧顦﹀鐟帮躬瀹曟垿宕ㄩ娑樺簥闂佸憡鍔﹂崯鐔稿緞閹邦剛顔掗柣鈩冨笂閼冲爼骞婇幘鐑┾偓锕傚Ω閳轰胶顦板銈嗘尵婵兘宕㈤幋锔解拻濞撴埃鍋撴繛浣冲厾娲Χ閸ワ絽浜炬慨姗嗗亜瀹撳棝鏌ｅ☉鍗炴灈閾伙綁鏌涜箛鏇炲付缁剧虎鍨堕弻鈩冨緞鐏炴垝鎴锋繝鈷€鍕垫疁鐎规洜鍠栧畷姗€顢欑憴锝嗗濠电偠鎻徊鑲╂媰閿曞倹鍊块柣鎰靛厵娴滄粓鏌熺€涙绠撻柡鍡悼閳ь剝顫夊ú妯好洪悢濂夊殨濠电姵鑹惧敮闂佹寧绻傞崐鍛婄妤ｅ啯鐓曢柟浼存涧閺嬫盯宕鐐粹拺闁告劕寮堕幆鍫ユ煕婵犲啯鍊愰柛鈹惧亾濡炪倖甯掗崐鎼佸储閹绢喗鐓涢悘鐐插⒔閳藉鏌嶇拠鍙夊攭缂佺姵鐩弫鎰板幢韫囨梻浜栨繝鐢靛Х椤ｈ棄危閸涙潙纾婚柟鎯у娑撳秹鏌熸潏鍓ф偧濞存粍鐟╁缁樻媴閾忕懓绗￠梺鎸庢磸閸ㄥ綊鈥﹂崶顏嶆Ъ缂備礁鍊圭敮鎺椻€﹂妸鈺佸窛妞ゆ牗绮ｇ槐鎻掆攽閻橆喖鐏辨繛澶嬬洴閺佸啴鏁傞崜褏鐓嬪┑鐐叉▕娴滄繈鎮¤箛娑欑厱闁斥晛鍟粈鍫熴亜閿旇偐鐣甸柡灞界Ф閹风娀寮婚妷銉ュ強婵°倗濮烽崑鐐烘晪闂佷紮绲块崗妯虹暦閸洘鍤嬮柡浣歌閸婃繂顫忓ú顏呭殥闁靛牆鎳忛悗鍓х磽娓氬洤鏋涢柣顒冨亹閸掓帡寮崼婵嬪敹闂佸搫娲ㄩ崑鐔煎礉閿曗偓椤啴濡堕崱妤冪憪濠电偞娼欏ú锔剧博閻斿娼ㄩ柍褜鍓欓～蹇涙惞鐟欏嫭娈板銈嗘⒐閸庢娊宕虹仦绛嬫富? {e}")
+        self._pid_data_recorder.finish_session()
         self._set_state(SystemState.STOPPED, message="stopped")
+
+    def get_pid_session_data_status(self) -> dict[str, Any]:
+        return self._pid_data_recorder.status()
+
+    def has_unsaved_pid_session_data(self) -> bool:
+        return self._pid_data_recorder.has_unsaved_data()
+
+    def save_pid_session_data(self, database_path: str) -> dict[str, Any]:
+        result = self._pid_data_recorder.save_to_sqlite(database_path)
+        self._log(
+            f"[PID][DATABASE][SAVED] path={result['path']} "
+            f"session={result['session_id']} records={result['record_count']}"
+        )
+        return result
+
+    def discard_pid_session_data(self) -> None:
+        status = self._pid_data_recorder.status()
+        self._pid_data_recorder.discard()
+        self._log(
+            f"[PID][DATABASE][DISCARDED] session={status['session_id']} "
+            f"records={status['record_count']}"
+        )
 
     def get_snapshot(self) -> SystemSnapshot:
         with self._lock:
@@ -689,14 +815,19 @@ class OrchestratorService:
             )
 
     def get_video_frame_snapshot(self) -> FrameSnapshot | None:
-        get_frame = getattr(self.vision_adapter, "get_frame_snapshot", None)
-        if callable(get_frame):
+        frame_providers = (
+            getattr(self.vision_adapter, "get_frame_snapshot", None),
+            getattr(self.vision_service, "get_frame_snapshot", None),
+        )
+        for get_frame in frame_providers:
+            if not callable(get_frame):
+                continue
             try:
                 frame = get_frame()
                 if frame is not None:
                     return frame
             except Exception:
-                pass
+                continue
         try:
             raw = self.vision_adapter.get_snapshot()
             rec = self._build_recognition_snapshot(raw)
@@ -799,6 +930,21 @@ class OrchestratorService:
                 ),
                 speed_sample_count=int(raw.get("speed_sample_count", 0) or 0),
                 droplet_generation_rate_hz=float(raw.get("droplet_generation_rate_hz", 0.0) or 0.0),
+                pixel_to_micron=float(raw.get("pixel_to_micron", 0.0) or 0.0),
+                scale_source=str(raw.get("scale_source", "configured") or "configured"),
+                channel_width_um=(
+                    None
+                    if raw.get("channel_width_um") is None
+                    else float(raw.get("channel_width_um"))
+                ),
+                channel_width_px=(
+                    None
+                    if raw.get("channel_width_px") is None
+                    else float(raw.get("channel_width_px"))
+                ),
+                channel_calibration_status=str(raw.get("channel_calibration_status", "disabled") or "disabled"),
+                channel_calibration_confidence=float(raw.get("channel_calibration_confidence", 0.0) or 0.0),
+                channel_calibration_reason=str(raw.get("channel_calibration_reason", "") or ""),
             )
         raise ValueError(f"闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤缂嶅﹪寮婚悢鍏尖拻閻庨潧澹婂Σ顔剧磼閻愵剙鍔ょ紓宥咃躬瀵鎮㈤崗灏栨嫽闁诲酣娼ф竟濠偽ｉ鍓х＜闁诡垎鍐ｆ寖闂佺娅曢幑鍥灳閺冨牆绀冩い蹇庣娴滈箖鏌ㄥ┑鍡欏嚬缂併劌銈搁弻鐔兼儌閸濄儳袦闂佸搫鐭夌紞渚€銆佸鈧幃娆撳箹椤撶噥妫ч梻鍌欑窔濞佳兾涘▎鎴炴殰闁圭儤顨愮紞鏍ㄧ節闂堟侗鍎愰柡鍛叀閺屾稑鈽夐崡鐐差潻濡炪們鍎查懝楣冨煘閹寸偛绠犻梺绋匡攻椤ㄥ棝骞堥妸鈺傚€婚柦妯侯槺閿涙盯姊虹紒妯哄闁稿簺鍊濆畷鎴犫偓锝庡枟閻撶喐淇婇婵嗗惞婵犫偓娴犲鐓冪憸婊堝礂濞戞碍顐芥慨姗嗗墻閸ゆ洟鏌熺紒銏犳灈妞ゎ偄鎳橀弻宥夊煛娴ｅ憡娈查梺缁樼箖閻楃姴顫忕紒妯肩懝闁逞屽墴閸┾偓妞ゆ帒鍊告禒婊堟煠濞茶鐏￠柡鍛埣楠炴﹢顢欓悾灞藉箥婵＄偑鍊栭弻銊╁触鐎ｎ喖纾婚柕澶涜礋娴滄粓鏌曡箛濞惧亾閸愬弶鎳欓梻浣虹《閺備線宕戦幘鎰佹富闁靛牆妫楃粭鎺楁倵濮樼厧澧撮柟閿嬪灴閹垽宕楅懖鈺佸汲婵犵數濞€濞佳兾涘▎鎾崇柈闁圭儤顨嗛悡娑㈡煕閹扳晛濡垮褎娲熼弻锝夊箳閹寸姳绮甸梺闈涙搐鐎氫即鐛幒妤€绠ｆ繝鍨姃閻ヮ亪姊绘担渚劸妞ゆ垵鎳橀、鏍川閺夋垹鍘撮梺纭呮彧闂勫嫰宕戦幇鐗堢厱婵炲棗娴氬Σ褰掓煙椤旂晫鎳囨慨濠傛惈鐓ら悹鍥ㄥ絻缁犲搫顪冮妶鍐ㄥ闁挎洦浜獮鍐晸閻欌偓閺佸啴鏌ㄩ弴妤€浜鹃梺缁樺姇閿曨亪寮婚弴鐔虹鐟滃宕戦幘鏂ユ斀妞ゆ柨鍚嬮崰妯绘叏婵犲懏顏犵紒杈ㄥ笒铻ｉ悹鍥у级濞堫偊姊绘担鍛婃喐濠殿喚鏁婚幃褔鎮╁顔兼婵犵數濮甸懝楣冨础閹惰姤鐓ユ繛鎴灻顐︽煛婢跺鍊愭慨濠冩そ瀹曨偊宕熼鈧粣娑㈡⒑缁嬫鐓柛瀣攻娣囧﹪鎮滈挊澹┿劑鏌涢幇鈺佸缂佸妞介弻鐔碱敊鐟欏嫭鐝旈梺浼欑悼閸忔ê鐣烽崼鏇炍╅柕澶堝劤娴狀參姊婚崒姘偓椋庣矆娓氣偓楠炴牠顢曢敃鈧€氬銇勯幒鎴濃偓濠氭儗濞嗘挻鐓涚€广儱楠告禍鐐测槈閹惧磭校缂佺粯鐩獮瀣枎韫囨洑鎮ｇ紓鍌欑贰閸嬪嫮绮旇ぐ鎺戣摕婵炴垶鐭▽顏堟煕閹炬鎳愰崢鎺楁⒒娴ｅ憡鍟為拑杈╃磼椤旇姤灏い顐㈢箳缁辨帒螣鐠囧樊鈧捇姊洪崨濠勨槈闁挎洏鍎靛畷鏇㈠箻缂佹ǚ鎷洪梺鍛婄箓鐎氼喗鏅堕柆宥嗙厱闁规崘娉涢弸娑欘殽閻愬弶顥㈢€规洜鍠栭、娑㈡晲閸℃ɑ鐝梻鍌欒兌缁垶宕濆▎蹇ｇ劷鐟滃繒鍒掓繝鍥ㄦ櫇闁逞屽墴閸╃偤骞嬮敂缁樻櫓婵犳鍠楅崝鎺斿垝閸洘鈷戠紒瀣儥閸庢劙鏌熼悷鐗堝枠鐎殿喖顭烽幃銏☆槹鎼淬垺顔曢梻浣规偠閸庢粓鍩€椤掑嫬鍑犻柛娑卞弾濞撳鏌曢崼婵嗘殭闁诲浚浜濋妵鍕Ω閵夘垵鍚悗瑙勬礃濡炰粙宕洪埀顒併亜閹哄秹妾峰ù婊勭矒閺岀喖宕崟顓夛絾銇勯敃鍌ゆ缂佽鲸甯為幏鐘诲矗婢舵ɑ顥ｉ梻鍌氭搐椤︾敻寮婚敐鍛傜喖鎮滃Ο閿嬬亞闂備胶顭堢€涒晠宕濆▎鎾宠摕鐎广儱顦伴悡銉╂倵閿濆簼绨藉ù鐓庣焸濮婃椽宕崟顒佹嫳缂備礁顑嗛崹鍧楀春閻愬搫绠ｉ柨鏇楀亾缂佲偓鐎ｎ偁浜滈柟鎵虫櫅閻忊晜銇勯锝嗗磳闁哄矉绲鹃幆鏃堝閳垛晛顫岀紓鍌欐祰椤曆囧磹閸ф鏄ラ柣鎰惈缁狅綁鏌ㄩ弴妤€浜鹃梺缁樻惈缁绘繈寮诲☉銏犵労闁告劧缂氬▽顏嗙磽娴ｉ潧濮€闁稿鍔楀Σ鎰板箻鐎涙ê顎撶紓浣圭☉椤戝懎鈻撻銏♀拺缂備焦锕╁▓鏃€淇婇锝囩疄闁靛棔绀侀～婵嬫嚋閸偅鐝抽梻浣虹《閸撴繈鎮疯閹線宕煎┑鍐╂杸濡炪倖姊归弸缁樼瑹濞戙垺鐓曢幖杈剧稻閺嗩剟鏌涢埡瀣瘈鐎规洏鍔戦、娆撳箚瑜嶆俊鍥ㄧ節閻㈤潧袨闁搞劎鍘ч埢鏂库槈閵忊€充罕闂佺硶鍓濈粙鎺楀磹閼哥偣浜滈煫鍥ㄦ尵婢ф盯鏌ｉ幘瀵告创闁哄本绋撴禒锔剧磼閵忥紕鏆ュ┑鐐茬摠缁挾绮婚弽褜娼栧┑鐘宠壘绾惧吋鎱ㄥ鍡楀幋闁稿鎹囬幃婊堟嚍閵夈儲鐣遍梻浣告啞閹哥兘鎮為敃鍌氱婵犲﹤鐗婇悡鏇熴亜閹板墎绋荤紒鈧埀顒傜磽娴ｆ彃浜鹃梺鍓插亞閸犳挾寮ч埀顒勬⒒閸屾氨澧涘〒姘殜瀹曟洟骞囬悧鍫㈠幐闂佸憡渚楅崰姘辩不閻愮儤鐓涢悘鐐垫櫕鏍″┑鐐碘拡娴滎亪鐛澶樻晩缁炬澘宕▓鐓庘攽閻樺灚鏆╅柛瀣仱瀹曞綊顢涢悙鎻掔€梺鑽ゅ枔婢ф鐥娑氱瘈闁汇垽娼цⅷ闂佹悶鍔庨崢褔鍩㈤弬搴撴闁靛繆鏅滈弲鐐烘⒑缁嬭法鐏遍柛瀣〒缁顢涘☉姘鳖啎閻庣懓澹婇崰鏇犺姳婵傚憡鐓冮梺鍨儏缁楁帡鏌曢崱妯虹瑨妞ゎ偅绻堥、妤佹媴鐟欏嫬鈧嘲鈹戦悙鑼憼缂侇喖閰ｅ畷鎴﹀Χ婢跺﹨鎽曞┑鐐村灦閸╁啴宕戦幘缁樻櫜閹肩补鈧尙鏁栨繝鐢靛仜瀵爼骞愰幎钘夎摕闁绘棃顥撻弳锕傛煕閵夋垵瀚禍顏呬繆閻愵亜鈧垿宕归搹鍦煓闁硅揪绠戦悡鈥愁熆鐠哄彿鍫ュ几鎼淬劍鐓欓梺顓ㄧ畱閺嬫稑鈹戦悙鍙夊缂佺粯绻堥幃浠嬫濞戞鎹曟俊鐐€栧ú锕傚矗閸愩劎鏆﹂柕蹇ョ秵濡嫰姊虹拠鈥虫灍婵＄偠濮ゆ穱濠囧箹娴ｅ摜鍘搁梺绋挎湰閻喚鑺遍崹顐ょ瘈闁汇垽娼ф禒锕傛煕椤垵鐏︾€规洜鎳撶叅妞ゅ繐鎳庢禍妤呮⒑閸濆嫭宸濋柛鐘虫尵瀵囧焵椤掍胶绡€闁汇垽娼ф禒锕傛煕鎼淬倖鐝紒鍌氱Ч瀹曟粏顦寸痪鎹愭闇夐柨婵嗘缁茶霉濠婂懎浜剧紒缁樼⊕濞煎繘宕滆閸╁苯鈹戦悩顐壕闂備緡鍓欑粔鏌ュ焵椤掆偓閹虫ê顕ｆ繝姘ㄩ柨鏃€鍎抽獮妤佺節瀵伴攱婢橀埀顒佸姍瀹曟垿骞樼紒妯煎幗濠德板€撻懗鍫曟儗婵犲洦鐓冪紓浣股戠亸鎵磼閸屾稑绗ч柍褜鍓ㄧ紞鍡涘磻閸℃稑鍌ㄥù鐘差儐閳锋垹鎲搁悧鍫濈瑨濞存粈鍗抽弻娑㈠Ω閵堝懎绁梺璇″灠閸熸挳骞栬ぐ鎺戞嵍妞ゆ挾濯寸槐鏌ユ⒒娴ｈ櫣甯涢柨姘繆椤栨熬韬柟顔瑰墲缁轰粙宕ㄦ繝鍕箰闁诲骸鍘滈崑鎾绘煃瑜滈崜鐔风暦娴兼潙鍐€妞ゆ挻澹曢崑鎾存媴缁洘鐎婚梺鐟邦嚟閸嬫盯寮搁崒鐐粹拺闁告稑锕ユ径鍕煕閹惧顬奸柕鍥ㄥ姍瀹曞爼顢楁担鍙夊濠电偠鎻徊浠嬪箺濠婂懐鐭撻柣鎴炃滄禍婊堟煏婢舵盯妾悘蹇斿缁辨帞绱掑Ο鍏煎垱闂佺硶鏂侀崑鎾愁渻閵堝棗绗傜紒鍨涒偓鏂ユ灁濞寸姴顑嗛悡鐔兼煙闁箑澧伴柟鐣屽Х閳ь剝顫夊ú鏍嫉椤掑嫨鈧啴濡烽埡鍌氣偓鐑芥煛婢跺鐏﹂悹鍥╁仱閹鈻撻崹顔界亶濠电偛鍚嬮悷銊╂倶閸愵喗鈷戦梺顐ゅ仜閼活垱鏅堕婊呯＜闁稿本姘ㄦ牎闂侀潧鐗炵紞浣哥暦濮椻偓閸╋繝宕橀妸銉х杽婵犵绱曢崑鎴﹀磹閵堝鍌ㄥù鐘差儏閸ㄥ倿鏌ｉ姀銏╃劸闁告垹濞€閺岀喖宕滆鐢盯鏌ｉ幘瀵告创闁哄苯绉烽¨渚€鏌涢幘瀛樼殤缂侇喖顑夐獮鎺楀棘閸濆嫪澹曢梺鎸庣箓缁ㄨ偐鑺遍懞銉ｄ簻闁哄倸灏呴煬顒佹叏婵犲懏顏犻柟鍙夋尦瀹曠喖顢曢姀鐘橈附绻濈喊妯活潑闁稿瀚埀顒佸嚬閸犳绮╅悢鐓庡嵆閹鸿櫕绂嶈ぐ鎺撶厵闁绘垶蓱鐏忕敻鏌涘Ο鍏兼毈婵﹨娅ｇ槐鎺戭潨閸℃鏆ラ梻浣虹帛椤ㄥ懘鏁冮敃鈧埢搴ㄥ閵堝棗娈ゅ銈嗗笒閸婂綊鏁嶈箛娑欌拺閻犲洠鈧磭鈧崵鈧厜鍋撻柍褜鍓熷畷銉р偓锝庡枟閳锋垿鏌涘┑鍡楊伀闁诲繘浜堕弻娑㈡偐瀹曞洤鈪归梺浼欑到閸㈡煡鈥﹂妸鈺佸耿闁冲搫鍊愰鍕拺婵懓娲ら悞娲煕閵娾晙鎲鹃柟顖氬椤㈡盯鎮欓懠鑸垫啺闂備焦瀵х换鍌炈囬婊呬笉濠电姵纰嶉崑锝夋煣韫囨洘鍤€闁告柨顑夐弻锝堢疀閹捐泛鈪靛┑顔硷攻濡炶棄鐣烽锕€绀嬫い鎾跺С缁辨﹢姊绘担鍛婃喐濠殿喚鏁婚幃褔鎮╅懡銈呯ウ闂佸憡鍔﹂悡鍫ユ偂閵夆晜鐓曢煫鍥ㄦ尭閳锋棃鏌涢悩宕囧⒌妤犵偛锕弫鎾绘偐閸欏們鍥х缂侇喛顫夐崵鏇熸叏濮楀棗骞樼紒鈾€鍋撻梻浣圭湽閸ㄨ棄顭囪缁傛帒顭ㄩ崼鐔哄幗闁圭儤濞婂畷婵囨償閵娿儳顦梺鍦劋閺屟冣柦椤忓牊鐓涢柛灞久埀顒佺洴閸┾偓妞ゆ巻鍋撴繛灏栤偓鎰佸殨闁割偅娲栭柋鍥ㄦ叏濮楀棗骞楅柣婵囨礀椤啴濡舵惔鈥茬凹濠电偠灏欓崰鏍ь嚕婵犳碍鍋勯柛蹇曞帶閳ь剛绮穱濠囶敍濠垫劕娈梻鍌氼槸缁夊墎妲愰幘璇茬＜婵ɑ鐦烽姀锛勭鐎瑰壊鍠栧顔锯偓娈垮枛椤嘲顕ｉ幘顔藉亜闁惧繐婀卞Σ鍥⒒婵犲骸浜滄繛璇х畱鐓ゆ繝濠傜墕濮规煡鏌ｅΟ鑲╁笡闁抽攱甯￠弻娑氫沪閹冩瘓濠碘剝褰冮幗婊呮閹烘挸绶為悘鐐村劤濞堝苯顪冮妶搴′簻缂佺粯鍔楅崣鍛渻閵堝懐绠伴柟鍐插缁傛帡顢橀姀鈾€鎷洪梺鍛婄箓鐎氬嘲危瑜版帗鍊电紒妤佺☉閸婂寮伴崒鐐粹拻闁稿本鑹鹃埀顒傚厴閹虫宕奸弴妯峰亾娴ｅ湱绡€闁稿本顨嗛悗娲⒑閸濆嫭鍌ㄩ柛銊ユ贡缁牊寰勭€ｎ剛顔曢梺绯曞墲钃遍悘蹇曟暩閳ь剝顫夐幐椋庣矆娓氣偓閳ワ箓宕稿Δ浣告疂闂傚倸鐗婄粙鎴︼綖瀹€鈧槐鎾存媴閸濆嫅銉х磼椤曞懎鐏﹀┑锛勬暬瀹曠喖顢涘杈╂綁闂備焦鎮堕崕婊堝磼濞戞碍缍庢繝纰夌磿閸嬫垿宕愯濮婁粙宕熼顐ゅ數濠殿喗銇涢崑鎾绘煃閵夛附顥堢€规洘锕㈤、娆撳床婢诡垰娲﹂悡鏇㈡煃閳轰礁鏋ゆ繛鍫熸⒒閹即鎮℃惔妯绘杸闂佺粯蓱椤旀牠寮抽鐐寸厓鐟滄粓宕滃┑鍡忔瀺闁哄洢鍨圭粣妤佹叏濡炶浜鹃梺鍝勬湰閻╊垶宕洪悙鍝勭畾鐟滃本绔熼弴鐐╂斀闁挎稑瀚禍濂告煕婵犲啰澧遍柡渚囧枟缁绘繈宕堕妸銉㈠亾閸ф鐓ラ柡鍥╁仜閳ь剙鎲￠、濠冪節閻㈤潧鈻堟繛浣冲厾娲晝閸屾氨鐓戦棅顐㈡处閹告挳寮ㄦ禒瀣厽婵☆垵顕х徊缁樸亜韫囷絽浜伴柟顔荤矙椤㈡稑鈽夊顓炲灡闂備礁鎼惉濂稿窗鎼淬劍鍋╅柨鐔哄У閸嬪鏌涢锝囩畺妞ゅ繈鍊楃槐鎾诲磼濞嗘垼绐楅梺鍝ュУ瀹€绋款嚕椤愶箑绠瑰ù锝呮憸閸旓箑顪冮妶鍡楃瑨闁挎洩濡囩划鏃堟濞淬垻鎳撻…銊╁礋椤撶姷鏉芥俊鐐€戦崹娲偡閳轰胶鏆﹂柣鏃傗拡閺佸洭鏌ｅΟ纰辨殰缂佽鲸濞婂缁樻媴娓氼垳鍔搁梺鍝勭墱閸撶喖骞冮悜钘壩╅柍杞拌兌椤ρ囨倵閸忓浜鹃梺閫炲苯澧版俊鍙夊姍楠炴帒螖婵犲啯娅旈梻浣告啞娓氭宕㈤悙顒傤浄闁归棿鐒﹂崐鐢告偡濞嗗繐顏紒鈧崘顏嗙＜閻犲洦褰冮埀顒€娼″畷娲閳╁啫鍔呴梺闈涱焾閸庢娊顢欐繝鍥ㄢ拺闁荤喐澹嗘禒銏ゆ煕閻曚礁鐏﹂柡浣哥Ч瀹曞ジ濡烽敂瑙勫闂備胶顭堥張顒勬嚌妤ｅ啫鐒垫い鎺嶇劍閸婃劗鈧娲橀崝鏍囬悧鍫熷劅闁靛繆鏅涙禒娲⒒娴ｈ姤纭堕柛鐘虫尰閹便劎鈧潧鎽滈惌鍡涙煕椤愩倕鏋旂紒鐘荤畺閺屾盯鍩勯崗鐙€浜幃姗€鍩￠崨顔惧幗濡炪倖鎸鹃崰鎰暦瀹€鍕厸鐎光偓鐎ｎ剛袦婵犳鍠掗崑鎾绘⒑闂堟稓绠氶柡鍛箞瀹曟繈宕妷褏锛滈梺缁樺姦閸撴瑩宕濋妶鍡愪簻妞ゆ挾濮撮崢瀵糕偓娈垮枛椤兘宕规ィ鍐ㄧ疀濞达絽鎲￠崐顖炴⒑绾懎浜归悶娑栧劦閸┾偓妞ゆ巻鍋撶痪缁㈠弮椤㈡瑩骞嬮敂瑙ｆ嫽婵炶揪缍€濞咃絿鏁☉銏＄厵婵繂鐭堥崵娆撴偂閵堝鐓熼柡鍐ㄥ€哥敮鍫曟煢閸愵亜鏋涢柡宀嬬秮瀵剟宕归钘夆偓顖炴⒑缁嬪尅韬柡鈧柆宥呂﹂柛鏇ㄥ灠缁犳娊鏌熼幖顓炲箺閺佸牓姊绘担椋庝覆缂佽弓绮欓幃銉︾附缁嬭儻鎽曢梺鎸庣箓濡瑩宕曢悢鍏肩厪闊洦娲栧瓭濠殿噯绲介悧鎾愁潖濞差亜宸濆┑鐘插暙閺嗘姊洪崫銉バｉ柣妤冨█閹即顢氶埀顒€鐣峰鈧、娆撴偂鎼达絺鍋撻鐑嗘富闁靛牆妫楁慨鍌炴煕閳轰礁顏€规洜鏁绘俊鑸靛緞鐎ｎ剙骞楅梺鐟板悑閻ｎ亪宕规繝姘厐闁哄洢鍨洪崵鏇㈡煏閸繍妲归柣鎾寸懇濮婃椽宕归鍛壉闂侀潧娲︾换鍐箞閵婏妇绡€闁告劏鏂傛禒銏ゆ倵鐟欏嫭绀冩い銊ワ躬楠炲﹪寮介鐐靛幋闂佸壊鐓堥崰鏇炩柦椤忓牊鈷掗柛灞剧懅椤︼箓鏌熺喊鍗炰喊鐎规洘鍔栭ˇ鐗堟償閵忊晛浠烘繝娈垮枟閿氬褍楠搁悾鍨瑹閳ь剟鎮￠锕€鐐婇柕濞р偓婵洭姊洪崫鍕櫤闁诡喖鍊垮濠氭晲閸涘倻鍠栭幖褰掓儌閸濄儳顦梻鍌欑閹诧繝鏁冮姀锛勵洸閻犺桨缍嶅☉銏犲窛闁圭⒈鍘介弲婵嬫⒑闂堟稓绠氶柍褜鍓氶崜姘ｆ潏銊х瘈缁剧増蓱椤﹪鏌涚€ｎ亝鍤囩€规洖缍婂畷绋课旈埀顒傜不閻樼粯鐓欓柟瑙勫姇閻撴劗鈧娲栭ˇ鐢稿蓟閺囩喓绠鹃柛顭戝枤娴犲吋绻? {type(raw)!r}")
 
@@ -813,24 +959,74 @@ class OrchestratorService:
         return snap
 
     def _update_control_snapshot(self, ctrl: ControlSnapshot) -> None:
-        with self._lock:
+        with self._control_condition:
             self._control = ctrl
+            rec = self._recognition
+            cfg = self._cfg
+            q1_actual = self._pump_state.q1_actual
+            q2_actual = self._pump_state.q2_actual
+            self._control_condition.notify_all()
+        try:
+            self._pid_data_recorder.record_sample(
+                timestamp=float(ctrl.timestamp),
+                frame_id=int(ctrl.frame_id),
+                control_period_id=int(getattr(rec, "control_period_id", 0) or 0),
+                q1_command_ul_min=float(ctrl.q1_command),
+                q2_command_ul_min=float(ctrl.q2_command),
+                q1_actual_ul_min=None if q1_actual is None else float(q1_actual),
+                q2_actual_ul_min=None if q2_actual is None else float(q2_actual),
+                target_diameter_um=None if cfg is None else float(cfg.target_diameter),
+                measured_diameter_um=(
+                    None if rec is None or rec.avg_diameter is None else float(rec.avg_diameter)
+                ),
+                diameter_error_um=float(ctrl.diameter_error),
+                droplet_speed_um_s=(
+                    None
+                    if rec is None or rec.average_droplet_speed_um_s is None
+                    else float(rec.average_droplet_speed_um_s)
+                ),
+                adjustment=float(ctrl.adjustment),
+                pid_output=float(ctrl.pid_output),
+                kp=float(ctrl.kp),
+                ki=float(ctrl.ki),
+                kd=float(ctrl.kd),
+                adaptive_enabled=bool(ctrl.adaptive_enabled),
+                adaptive_active=bool(ctrl.adaptive_active),
+                feedback_frozen=bool(ctrl.freeze_feedback),
+                reason=str(ctrl.reason or ""),
+            )
+        except Exception as exc:
+            self._log(f"[PID][DATABASE][RECORD][WARN] {exc}")
+
+    def wait_for_control_snapshot(self, after_timestamp: float = 0.0, timeout: float | None = None) -> SystemSnapshot:
+        """Wait for a newer PID result, then return one coherent system view."""
+        with self._control_condition:
+            current = float(getattr(self._control, "timestamp", 0.0) or 0.0)
+            if current <= float(after_timestamp):
+                self._control_condition.wait(timeout=timeout)
+        return self.get_snapshot()
 
     def _control_loop(self) -> None:
-        # Wait for one complete user-configured period before the first PID
-        # decision, so feedback never uses a partial-cycle diameter average.
-        first_period = True
+        # Prefer completed-period events from vision. The timeout remains a
+        # watchdog/fallback for adapters that cannot publish such events.
         while not self._stop_event.is_set():
             interval_s = max(
                 0.01,
                 (self._cfg.control_interval_ms if self._cfg else self.runtime.default_control_interval_ms) / 1000.0,
             )
-            if first_period:
-                if self._stop_event.wait(interval_s):
-                    break
-                first_period = False
+            waiter = getattr(self.vision_adapter, "wait_for_recognition_snapshot", None)
+            if callable(waiter):
+                try:
+                    waiter(
+                        after_period_id=int(self._last_seen_vision_period_id or 0),
+                        timeout=interval_s,
+                    )
+                except (AttributeError, TypeError):
+                    if self._stop_event.wait(interval_s):
+                        break
+            elif self._stop_event.wait(interval_s):
+                break
             if self._pause_event.is_set():
-                time.sleep(0.05)
                 continue
 
             try:
@@ -841,11 +1037,16 @@ class OrchestratorService:
                 self._stop_event.set()
                 break
 
-            if self._stop_event.wait(interval_s):
-                break
-
     def run_control_step(self) -> None:
         rec = self._read_recognition()
+        if int(rec.control_period_id) > 0:
+            # Record the period before any early return. Otherwise a stale or
+            # invalid snapshot makes the event waiter return immediately on
+            # every loop and the same period is retried hundreds of times.
+            self._last_seen_vision_period_id = max(
+                int(self._last_seen_vision_period_id or 0),
+                int(rec.control_period_id),
+            )
         now = time.time()
         if self._last_control_ts is None:
             dt = (self._cfg.control_interval_ms if self._cfg else self.runtime.default_control_interval_ms) / 1000.0
@@ -946,7 +1147,19 @@ class OrchestratorService:
             return
 
         recognition_age_ms = max(0.0, (now - float(rec.timestamp or 0.0)) * 1000.0)
-        if rec.timestamp <= 0.0 or recognition_age_ms > float(self.runtime.max_recognition_age_ms):
+        # A completed vision transaction contains a five-frame batch and can
+        # legitimately be older than the fixed 1.5 s guard when the configured
+        # control period is several seconds. Keep the hard lower bound, but
+        # allow one and a half control periods before declaring vision lost.
+        control_interval_ms = float(
+            self._cfg.control_interval_ms if self._cfg is not None
+            else self.runtime.default_control_interval_ms
+        )
+        recognition_age_limit_ms = max(
+            float(self.runtime.max_recognition_age_ms),
+            control_interval_ms * 1.5,
+        )
+        if rec.timestamp <= 0.0 or recognition_age_ms > recognition_age_limit_ms:
             ctrl = ControlSnapshot(
                 diameter_error=0.0,
                 adjustment=0.0,
@@ -954,7 +1167,10 @@ class OrchestratorService:
                 q2_command=self._pump_state.q2,
                 freeze_feedback=True,
                 suggested_stop=False,
-                reason=f"recognition result stale ({recognition_age_ms:.0f} ms); keep current infusion",
+                reason=(
+                    f"recognition result stale ({recognition_age_ms:.0f} ms > "
+                    f"{recognition_age_limit_ms:.0f} ms); keep current infusion"
+                ),
                 timestamp=now,
             )
             self._log(f"[PID][FREEZE] {ctrl.reason}")
@@ -1056,8 +1272,13 @@ class OrchestratorService:
             ki=float(cmd.ki),
             kd=float(cmd.kd),
             adaptive_active=bool(cmd.adaptive_active),
+            adaptive_enabled=bool(cmd.adaptive_enabled),
+            adaptive_reason=str(cmd.adaptive_reason or ""),
             feedforward_active=bool(cmd.feedforward_active),
+            feedforward_reason=str(cmd.feedforward_reason or ""),
             control_mode=str(cmd.control_mode),
+            q1_output_gain=float(cmd.q1_output_gain),
+            q2_output_gain=float(cmd.q2_output_gain),
             frame_id=int(cmd.frame_id),
         )
 
@@ -1078,10 +1299,34 @@ class OrchestratorService:
             self._set_state(SystemState.ERROR, error=ctrl.reason or "PID suggested stop")
             return
 
-        self._log(f"[PID][UPDATE] q1={cmd.q1:.6f}, q2={cmd.q2:.6f}, adj={cmd.adjustment:.6f}")
+        try:
+            self._require_valid_phase_flows(cmd.q1, cmd.q2)
+        except ValueError as exc:
+            ctrl.freeze_feedback = True
+            ctrl.reason = f"PID command rejected: {exc}; keep current infusion"
+            self._log(f"[PID][SAFETY][REJECT] {ctrl.reason}")
+            self._update_control_snapshot(ctrl)
+            return
+
+        self._log(
+            "[PID][UPDATE] "
+            f"mode={cmd.control_mode} adaptive_enabled={cmd.adaptive_enabled} "
+            f"adaptive_active={cmd.adaptive_active} "
+            f"kp={cmd.kp:.6f} ki={cmd.ki:.6f} kd={cmd.kd:.6f} "
+            f"q1_gain={cmd.q1_output_gain:.3f} q2_gain={cmd.q2_output_gain:.3f} "
+            f"q1={cmd.q1:.6f}, q2={cmd.q2:.6f}, adj={cmd.adjustment:.6f} "
+            f"adaptive_reason={cmd.adaptive_reason}"
+        )
         update_res = self.pump_service.update_flow_while_running(float(cmd.q1), float(cmd.q2))
-        if (not update_res.ok) and bool(update_res.still_running):
-            # Retry once if the pump is still running after a transient flow-update failure.
+        if (
+            (not update_res.ok)
+            and bool(update_res.still_running)
+            and not bool(update_res.q1_ok)
+            and not bool(update_res.q2_ok)
+        ):
+            # A channel that already passed readback must not be rewritten.
+            # CH2-only loss is recovered inside PumpHardwareService; repeat the
+            # whole transaction only when neither channel was accepted.
             update_res = self.pump_service.update_flow_while_running(float(cmd.q1), float(cmd.q2))
 
         if not update_res.ok:

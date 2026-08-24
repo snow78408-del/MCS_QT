@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Literal, Tuple
+from typing import Any, Literal, Tuple
 
 import os
 
@@ -21,6 +21,9 @@ class ROIConfig:
     y_start_ratio: float = 0.48
     y_end_ratio: float = 0.84
     crop_top_ratio: float = 0.0
+    # Two normalized Hough segments selected by the user. When present they
+    # define a tilted quadrilateral that is rectified before all recognition.
+    wall_lines: list[dict[str, Any]] = field(default_factory=list)
 
     def resolve(self, width: int, height: int) -> Tuple[int, int, int, int, int]:
         x0 = max(0, min(width - 1, int(width * self.x_start_ratio)))
@@ -63,7 +66,10 @@ class DetectorConfig:
     split_min_radius_ratio: float = 0.65
     split_large_area_ratio: float = 1.15
     enable_hough_candidates: bool = True
-    hough_fallback_only: bool = False
+    # Full Hough fusion is both expensive and prone to generating duplicate
+    # circles in densely packed real droplets. Contours are the primary path;
+    # Hough remains available when contours find nothing.
+    hough_fallback_only: bool = True
     hough_dp: float = 1.2
     hough_min_distance: float = 0.0
     hough_param1: float = 100.0
@@ -76,7 +82,7 @@ class DetectorConfig:
     hough_work_max_width: int = 760
     hough_work_max_height: int = 560
     hough_max_candidates: int = 120
-    enable_intensity_peak_candidates: bool = True
+    enable_intensity_peak_candidates: bool = False
     enable_intensity_peak_fallback: bool = True
     intensity_peak_kernel_radius_ratio: float = 1.25
     intensity_peak_percentile: float = 55.0
@@ -101,7 +107,10 @@ class DetectorConfig:
     candidate_full_circle_ratio: float = 0.85
     candidate_nms_overlap_ratio: float = 0.42
     cut_line_ratio: float = 1.0
-    detection_mode: DetectionMode = "split_connected"
+    # Actual high-density camera footage contains touching but already
+    # individually bounded droplets. Watershed splitting fragmented each real
+    # circle into multiple 8-14 px candidates; preserve connected contours.
+    detection_mode: DetectionMode = "no_split"
 
 
 @dataclass
@@ -139,8 +148,8 @@ class BeadConfig:
 @dataclass
 class MetricsConfig:
     min_active_for_control: int = 1
-    # Samples are aggregated by track ID inside the realtime window, so this
-    # threshold counts distinct droplets rather than repeated frames.
+    # Samples are locked once per track at the count-line crossing, so this
+    # threshold counts distinct passed droplets rather than repeated frames.
     min_samples_for_control: int = 1
     realtime_window_ms: int = 500
     rolling_window: int = 120
@@ -148,8 +157,14 @@ class MetricsConfig:
     count_line_ratio: float = 0.6
     min_track_age_for_count: int = 1
     min_track_displacement_for_count: float = 8.0
+    # Keep a short per-track radius history and lock its median when the
+    # droplet crosses the counting line. This suppresses single-frame edge
+    # jitter without adding another image-processing pass.
+    diameter_samples_per_track: int = 15
     uniformity_good_threshold: float = 5.0
     uniformity_normal_threshold: float = 10.0
+    # Retained for settings-file compatibility. CV is diagnostic only and no
+    # longer gates PID feedback.
     max_diameter_cv_for_control: float = 25.0
     robust_mad_multiplier: float = 3.5
     no_droplet_log_interval_s: float = 2.0
@@ -204,9 +219,21 @@ class CameraSystemConfig:
     )
     enabled_camera_backends: tuple[str, ...] = (
         "hikrobot",
+        "gentl",
+        "basler",
+        "daheng",
+        "flir",
+        "allied_vision",
+        "opencv",
     )
     preferred_backend_order: tuple[str, ...] = (
         "hikrobot",
+        "gentl",
+        "basler",
+        "daheng",
+        "flir",
+        "allied_vision",
+        "opencv",
     )
     gentl_producer_paths: tuple[str, ...] = tuple(
         p for p in os.environ.get("GENICAM_GENTL64_PATH", "").split(os.pathsep) if p

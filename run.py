@@ -12,6 +12,7 @@ PROJECT_ROOT = pathlib.Path(__file__).resolve().parent
 REQUIRED_MODULES = {
     "cv2": "opencv-python",
     "numpy": "numpy",
+    "PySide6": "PySide6",
     "serial": "pyserial",
 }
 
@@ -83,7 +84,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command")
 
-    subparsers.add_parser("frontend", help="启动 Tkinter 前端界面（默认）")
+    subparsers.add_parser("frontend", help="启动 PySide6 前端界面（默认）")
 
     vision_parser = subparsers.add_parser("vision", help="独立运行后端视觉流水线")
     vision_parser.add_argument(

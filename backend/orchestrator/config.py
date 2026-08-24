@@ -4,7 +4,10 @@ from dataclasses import dataclass
 
 default_control_interval_ms = 500
 min_control_interval_ms = 500
-max_control_interval_ms = 5000
+# Dense-droplet recognition and the physical transport delay can both exceed
+# five seconds. The UI already permits longer periods, so do not silently
+# clamp a requested 10–30 s control interval back to 5 s.
+max_control_interval_ms = 30000
 pump_command_retry = 2
 init_timeout_s = 8.0
 stop_timeout_s = 5.0

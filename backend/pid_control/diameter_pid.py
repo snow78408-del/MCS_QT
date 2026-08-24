@@ -70,6 +70,10 @@ class DiameterPIDController(BaseDiameterController):
         if self._q2_bias is None:
             self._q2_bias = q2_current
         mode = str(self.config.control_mode or PIDControlMode.CLASSIC_PID.value)
+        adaptive_enabled = mode in {
+            PIDControlMode.ADAPTIVE_PID.value,
+            PIDControlMode.ADAPTIVE_PID_WITH_FEEDFORWARD.value,
+        }
 
         freeze = self._validate_input(pid_input)
         if freeze:
@@ -99,15 +103,22 @@ class DiameterPIDController(BaseDiameterController):
                 kp=self.kp,
                 ki=self.ki,
                 kd=self.kd,
+                adaptive_active=bool(self.adaptive.state.active),
+                adaptive_enabled=adaptive_enabled,
+                adaptive_reason="diameter inside deadband; adaptive state retained",
                 control_mode=mode,
+                q1_output_gain=float(self.config.q1_output_gain),
+                q2_output_gain=float(self.config.q2_output_gain),
                 frame_id=int(pid_input.frame_id),
             )
 
         adaptive_active = False
-        if mode in {PIDControlMode.ADAPTIVE_PID.value, PIDControlMode.ADAPTIVE_PID_WITH_FEEDFORWARD.value}:
+        adaptive_reason = "classic PID mode"
+        if adaptive_enabled:
             state = self.adaptive.update(pid_input, error)
             self.kp, self.ki, self.kd = self.parameter_manager.clamp_gains(state.kp, state.ki, state.kd)
             adaptive_active = bool(state.active)
+            adaptive_reason = str(state.reason or "")
         else:
             self.kp, self.ki, self.kd = self.parameter_manager.base_gains()
 
@@ -132,18 +143,76 @@ class DiameterPIDController(BaseDiameterController):
         ff = self.feedforward.compute(pid_input) if mode == PIDControlMode.ADAPTIVE_PID_WITH_FEEDFORWARD.value else None
         u_ff = float(ff.u_ff) if ff is not None else 0.0
         feedforward_active = bool(ff.active) if ff is not None else False
-
-        u_final = clamp(u_pid + u_ff, self.config.output_min, self.config.output_max)
-        u_final = rate_limit(u_final, self._last_output, self.config.output_rate_limit)
+        feedforward_reason = str(ff.reason or "") if ff is not None else "feedforward not selected"
 
         q1_base = float(self._q1_bias) if self.config.use_initial_flow_as_output_bias else q1_current
         q2_base = float(self._q2_bias) if self.config.use_initial_flow_as_output_bias else q2_current
+        q1_coefficient = float(self.config.q1_control_sign) * float(self.config.q1_output_gain)
+        q2_coefficient = float(self.config.q2_control_sign) * float(self.config.q2_output_gain)
+        # Convert actuator limits into the feasible PID-output interval. This
+        # preserves differential control (and its nominal total flow) when one
+        # pump reaches a boundary, instead of calculating a negative flow and
+        # stopping both pumps.
+        actuator_low = float(self.config.output_min)
+        actuator_high = float(self.config.output_max)
+        for base, coefficient, flow_min, flow_max in (
+            (q1_base, q1_coefficient, float(self.config.q1_min), float(self.config.q1_max)),
+            (q2_base, q2_coefficient, float(self.config.q2_min), float(self.config.q2_max)),
+        ):
+            flow_bounds = (
+                (flow_min - base) / coefficient,
+                (flow_max - base) / coefficient,
+            )
+            actuator_low = max(actuator_low, min(flow_bounds))
+            actuator_high = min(actuator_high, max(flow_bounds))
+
+        # Enforce Q1 >= Q2 + gap in the PID-output feasible interval. The
+        # controller saturates at this boundary instead of crossing it.
+        min_phase_gap = float(self.config.min_q1_q2_gap)
+        phase_gap_at_zero = q1_base - q2_base
+        phase_gap_slope = q1_coefficient - q2_coefficient
+        required_gap_delta = min_phase_gap - phase_gap_at_zero
+        if phase_gap_slope > 0.0:
+            actuator_low = max(actuator_low, required_gap_delta / phase_gap_slope)
+        elif phase_gap_slope < 0.0:
+            actuator_high = min(actuator_high, required_gap_delta / phase_gap_slope)
+        elif phase_gap_at_zero < min_phase_gap:
+            return self._frozen(
+                pid_input,
+                "pump control allocation cannot maintain Q1 strictly above Q2",
+                mode,
+            )
+        if actuator_low > actuator_high:
+            return self._frozen(
+                pid_input,
+                "pump flow limits do not provide a feasible PID output with Q1 strictly above Q2",
+                mode,
+            )
+
+        requested_output = clamp(u_pid + u_ff, self.config.output_min, self.config.output_max)
+        requested_output = rate_limit(requested_output, self._last_output, self.config.output_rate_limit)
+        u_final = clamp(requested_output, actuator_low, actuator_high)
+        actuator_saturated = abs(u_final - requested_output) > 1e-12
+        pushes_further_into_limit = (
+            (requested_output < actuator_low and error < 0.0)
+            or (requested_output > actuator_high and error > 0.0)
+        )
+        if actuator_saturated and pushes_further_into_limit:
+            # Actuator-aware anti-windup: a limited pump cannot realize more
+            # output in this direction, so discard this cycle's integration.
+            self.integral = previous_integral
+            i_term = self.ki * self.integral
+            u_pid = clamp(p_term + i_term + d_term, self.config.output_min, self.config.output_max)
+            requested_output = clamp(u_pid + u_ff, self.config.output_min, self.config.output_max)
+            requested_output = rate_limit(requested_output, self._last_output, self.config.output_rate_limit)
+            u_final = clamp(requested_output, actuator_low, actuator_high)
+
         # Differential control keeps the two phases from being accelerated or
         # decelerated together. error = target - measured:
         #   droplet too large (error < 0): Q1 up, Q2 down
         #   droplet too small (error > 0): Q1 down, Q2 up
-        q1_raw = q1_base - u_final
-        q2_raw = q2_base + u_final
+        q1_raw = q1_base + q1_coefficient * u_final
+        q2_raw = q2_base + q2_coefficient * u_final
         max_step = max(0.0, float(self.config.max_flow_change_per_cycle))
         if max_step > 0.0:
             q1_raw = clamp(q1_raw, q1_current - max_step, q1_current + max_step)
@@ -172,26 +241,38 @@ class DiameterPIDController(BaseDiameterController):
             ki=self.ki,
             kd=self.kd,
             adaptive_active=adaptive_active,
+            adaptive_enabled=adaptive_enabled,
+            adaptive_reason=adaptive_reason,
             feedforward_active=feedforward_active,
+            feedforward_reason=feedforward_reason,
             control_mode=mode,
+            q1_output_gain=float(self.config.q1_output_gain),
+            q2_output_gain=float(self.config.q2_output_gain),
             frame_id=int(pid_input.frame_id),
         )
-        if q1_raw <= 0 or q2_raw <= 0:
-            return PIDCommand(
-                q1=q1_current,
-                q2=q2_current,
-                freeze_feedback=False,
-                suggested_stop=True,
-                reason=f"computed non-positive flow; q1_raw={q1_raw:.6f}, q2_raw={q2_raw:.6f}",
-                **common,
+        q1_final = clamp(q1_raw, self.config.q1_min, self.config.q1_max)
+        q2_final = clamp(q2_raw, self.config.q2_min, self.config.q2_max)
+        if q1_final < q2_final + min_phase_gap:
+            # A total-flow scale or floating point rounding may shrink the
+            # gap after the feasible-output calculation.
+            q2_final = max(float(self.config.q2_min), q1_final - min_phase_gap)
+        if q1_final < q2_final + min_phase_gap - 1e-9:
+            return self._frozen(
+                pid_input,
+                "final pump command cannot maintain Q1 strictly above Q2",
+                mode,
             )
 
         return PIDCommand(
-            q1=clamp(q1_raw, self.config.q1_min, self.config.q1_max),
-            q2=clamp(q2_raw, self.config.q2_min, self.config.q2_max),
+            q1=q1_final,
+            q2=q2_final,
             freeze_feedback=False,
             suggested_stop=False,
-            reason="PID update completed",
+            reason=(
+                "PID update completed; pump output saturated at configured limit"
+                if actuator_saturated
+                else "PID update completed"
+            ),
             **common,
         )
 
@@ -211,6 +292,10 @@ class DiameterPIDController(BaseDiameterController):
         return ""
 
     def _frozen(self, pid_input: PIDInput, reason: str, mode: str) -> PIDCommand:
+        adaptive_enabled = mode in {
+            PIDControlMode.ADAPTIVE_PID.value,
+            PIDControlMode.ADAPTIVE_PID_WITH_FEEDFORWARD.value,
+        }
         return PIDCommand(
             q1=float(pid_input.current_q1),
             q2=float(pid_input.current_q2),
@@ -222,6 +307,11 @@ class DiameterPIDController(BaseDiameterController):
             kp=self.kp,
             ki=self.ki,
             kd=self.kd,
+            adaptive_active=bool(self.adaptive.state.active),
+            adaptive_enabled=adaptive_enabled,
+            adaptive_reason=f"feedback unavailable; {self.adaptive.state.reason}",
             control_mode=mode,
+            q1_output_gain=float(self.config.q1_output_gain),
+            q2_output_gain=float(self.config.q2_output_gain),
             frame_id=int(pid_input.frame_id),
         )

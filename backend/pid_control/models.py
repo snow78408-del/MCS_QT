@@ -44,8 +44,13 @@ class PIDCommand:
     ki: float = 0.0
     kd: float = 0.0
     adaptive_active: bool = False
+    adaptive_enabled: bool = False
+    adaptive_reason: str = ""
     feedforward_active: bool = False
+    feedforward_reason: str = ""
     control_mode: str = "CLASSIC_PID"
+    q1_output_gain: float = 1.0
+    q2_output_gain: float = 1.0
     frame_id: int = 0
 
 

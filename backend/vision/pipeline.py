@@ -34,6 +34,7 @@ class VisionResult:
     beads: BeadResult
     metrics: MetricsResult
     annotated_frame: np.ndarray
+    analysis_frame: np.ndarray
 
 
 class VisionPipeline:
@@ -94,6 +95,7 @@ class VisionPipeline:
             beads=beads,
             metrics=metrics,
             annotated_frame=annotated,
+            analysis_frame=roi_frame,
         )
 
     def process_video(
@@ -166,6 +168,9 @@ class VisionPipeline:
         return results
 
     def _apply_roi(self, frame: np.ndarray) -> Tuple[np.ndarray, Tuple[int, int]]:
+        rectified = self.rectify_selected_channel(frame)
+        if rectified is not None:
+            return rectified, (0, 0)
         if not self.config.roi.enabled:
             return frame.copy(), (0, 0)
 
@@ -175,6 +180,16 @@ class VisionPipeline:
         if crop_top > 0:
             cropped = cropped[crop_top:, :]
         return cropped, (x0, y0 + crop_top)
+
+    def rectify_selected_channel(self, frame: np.ndarray) -> np.ndarray | None:
+        wall_lines = list(getattr(self.config.roi, "wall_lines", []) or [])
+        if len(wall_lines) != 2:
+            return None
+        try:
+            from .rectified_roi import rectify_channel_frame
+        except ImportError:
+            from rectified_roi import rectify_channel_frame
+        return rectify_channel_frame(frame, wall_lines)
 
     @staticmethod
     def _align_tracks_to_current_detections(

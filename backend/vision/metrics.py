@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Deque, Dict
 
 import numpy as np
@@ -38,6 +38,12 @@ class ControlMetrics:
     uniformity_valid: bool
     uniformity_status: str
     uniformity_reason: str
+    # IDs that crossed in the current processed frame. These are used only to
+    # capture evidence thumbnails; control aggregation remains period-based.
+    crossed_track_ids: list[int] = field(default_factory=list)
+    # Tracks observed and accepted in this exact sampled frame. The monitor
+    # uses these IDs to annotate full-frame recognition evidence.
+    valid_track_ids: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -63,6 +69,8 @@ class AnalysisMetrics:
     uniformity_valid: bool
     uniformity_status: str
     uniformity_reason: str
+    crossed_track_ids: list[int] = field(default_factory=list)
+    valid_track_ids: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -76,6 +84,7 @@ class _TrackState:
     start_coord: float
     last_coord: float
     counted: bool = False
+    diameters: list[float] = field(default_factory=list)
 
 
 class MetricsCalculator:
@@ -84,7 +93,9 @@ class MetricsCalculator:
         self._log = logger or (lambda _msg: None)
         self._diameter_history: Deque[float] = deque(maxlen=max(1, config.rolling_window))
         self._period_start: float | None = None
-        self._period_diameters: dict[int, list[float]] = {}
+        # One locked median diameter per droplet that actually crossed the
+        # count line in the current control period.
+        self._period_diameters: dict[int, float] = {}
         self._period_bead_max: dict[int, int] = {}
         self._period_crossing_count = 0
         self._completed_period_id = 0
@@ -100,7 +111,12 @@ class MetricsCalculator:
             return False
         return (prev_y <= line_y < cur_y) or (prev_y >= line_y > cur_y)
 
-    def _update_crossing_count(self, track: DropletTrack, line_y: float) -> bool:
+    def _update_crossing_count(
+        self,
+        track: DropletTrack,
+        line_y: float,
+        diameter: float | None,
+    ) -> tuple[bool, float | None]:
         axis = str(self._config.flow_axis).strip().lower()
         axis_index = 1 if axis == "y" else 0
         cur_coord = float(track.position[axis_index])
@@ -110,13 +126,19 @@ class MetricsCalculator:
                 start_coord=cur_coord,
                 last_coord=cur_coord,
                 counted=False,
+                diameters=[float(diameter)] if diameter is not None else [],
             )
-            return False
+            return False, None
 
         prev_coord = state.last_coord
         state.last_coord = cur_coord
+        if diameter is not None and np.isfinite(diameter) and float(diameter) > 0.0:
+            state.diameters.append(float(diameter))
+            keep = max(1, int(self._config.diameter_samples_per_track))
+            if len(state.diameters) > keep:
+                del state.diameters[:-keep]
         if state.counted:
-            return False
+            return False, None
 
         crossed = self._did_cross_line(prev_coord, cur_coord, line_y)
         displacement = abs(cur_coord - state.start_coord)
@@ -129,8 +151,13 @@ class MetricsCalculator:
                 f"[VISION][COUNT] new real droplet count: track_id={track.id}, "
                 f"total={len(self._counted_track_ids)}"
             )
-            return True
-        return False
+            locked_diameter = (
+                float(np.median(np.asarray(state.diameters, dtype=np.float32)))
+                if state.diameters
+                else None
+            )
+            return True, locked_diameter
+        return False, None
 
     def update(
         self,
@@ -158,15 +185,34 @@ class MetricsCalculator:
         frame_droplet_count = len(valid_tracks)
 
         frame_diameters: list[float] = []
-        frame_track_diameters: dict[int, float] = {}
+        crossed_track_diameters: dict[int, float] = {}
+        crossed_track_bead_counts: dict[int, int] = {}
+        crossed_track_ids: list[int] = []
         new_crossing_count = 0
+
+        frame_bead_counts: dict[int, int] = {}
+        for droplet in beads.droplets:
+            droplet_id = int(droplet.droplet_id)
+            bead_count = int(droplet.bead_count)
+            if droplet_id in valid_track_ids:
+                frame_bead_counts[droplet_id] = bead_count
+            prev_max = self._track_bead_max.get(droplet_id, 0)
+            if bead_count > prev_max:
+                self._track_bead_max[droplet_id] = bead_count
+
         for track in valid_tracks:
-            if float(track.radius) > 0.0:
-                diameter = float(track.radius) * 2.0
+            observed_radius = float(track.metadata.get("observed_radius", track.radius))
+            diameter = observed_radius * 2.0 if observed_radius > 0.0 else None
+            if diameter is not None:
                 frame_diameters.append(diameter)
-                frame_track_diameters[int(track.id)] = diameter
-            if self._update_crossing_count(track, line_y):
+            crossed, locked_diameter = self._update_crossing_count(track, line_y, diameter)
+            if crossed:
                 new_crossing_count += 1
+                crossed_track_ids.append(int(track.id))
+                if locked_diameter is not None:
+                    track_id = int(track.id)
+                    crossed_track_diameters[track_id] = locked_diameter
+                    crossed_track_bead_counts[track_id] = self._track_bead_max.get(track_id, 0)
 
         for track_id in tracking.removed_track_ids:
             self._track_state.pop(int(track_id), None)
@@ -181,16 +227,6 @@ class MetricsCalculator:
                 self._last_no_droplet_log_time = log_now
                 self._log("[VISION][NO_DROPLET] current frame has no valid droplets")
 
-        frame_bead_counts: dict[int, int] = {}
-        for droplet in beads.droplets:
-            droplet_id = int(droplet.droplet_id)
-            bead_count = int(droplet.bead_count)
-            if droplet_id in valid_track_ids:
-                frame_bead_counts[droplet_id] = bead_count
-            prev_max = self._track_bead_max.get(droplet_id, 0)
-            if bead_count > prev_max:
-                self._track_bead_max[droplet_id] = bead_count
-
         counted_ids = sorted(self._counted_track_ids)
         bead_counts = [self._track_bead_max.get(track_id, 0) for track_id in counted_ids]
         total_droplets = len(counted_ids)
@@ -201,18 +237,18 @@ class MetricsCalculator:
 
         frame_single_cell_count = sum(1 for value in frame_bead_counts.values() if int(value) == 1)
         window_diameters, window_single_cell_count, window_droplet_count, new_crossing_count, period_id = self._update_realtime_window(
-            frame_track_diameters=frame_track_diameters,
-            frame_track_bead_counts=frame_bead_counts,
+            crossed_track_diameters=crossed_track_diameters,
+            crossed_track_bead_counts=crossed_track_bead_counts,
             frame_crossing_count=new_crossing_count,
             timestamp=timestamp,
         )
-        # Every distinct detected track in the control period contributes one
-        # median diameter. Do not discard period droplets as statistical
-        # outliers before computing the average used by PID.
-        frame_diameters = list(window_diameters)
+        # Use the robust sample set for feedback. Detector false positives and
+        # partial circles otherwise inflate CV and can keep PID frozen forever.
+        # Raw track/count statistics remain available through the period count.
+        frame_diameters = self._robust_diameter_samples(list(window_diameters))
         # Public "frame_*" fields are retained for API compatibility, but the
-        # control/monitoring values represent distinct tracks observed during
-        # the configured control-period window.
+        # control/monitoring values represent droplets that actually crossed
+        # the count line during the configured control-period window.
         frame_droplet_count = window_droplet_count
         frame_single_cell_count = window_single_cell_count
         frame_single_cell_rate = (
@@ -267,17 +303,11 @@ class MetricsCalculator:
             valid_for_control = False
             reason = "控制周期样本数不足"
 
-        if (
-            valid_for_control
-            and frame_diameter_cv is not None
-            and frame_diameter_cv > float(self._config.max_diameter_cv_for_control)
-        ):
-            valid_for_control = False
-            reason = (
-                "diameter measurements are unstable: "
-                f"cv={frame_diameter_cv:.2f}% > "
-                f"{float(self._config.max_diameter_cv_for_control):.2f}%"
-            )
+        # CV describes size uniformity and remains available for monitoring,
+        # but it must not disable diameter feedback. A broad diameter
+        # distribution is precisely one of the conditions that closed-loop
+        # control is expected to improve. Safety gating above is therefore
+        # limited to missing/invalid measurements and insufficient samples.
 
         denom = float(total_droplets) if total_droplets > 0 else 1.0
         analysis = AnalysisMetrics(
@@ -302,6 +332,8 @@ class MetricsCalculator:
             uniformity_valid=uniformity_valid,
             uniformity_status=uniformity_status,
             uniformity_reason=uniformity_reason,
+            crossed_track_ids=list(crossed_track_ids),
+            valid_track_ids=sorted(valid_track_ids),
         )
 
         control = ControlMetrics(
@@ -324,6 +356,8 @@ class MetricsCalculator:
             uniformity_valid=uniformity_valid,
             uniformity_status=uniformity_status,
             uniformity_reason=uniformity_reason,
+            crossed_track_ids=list(crossed_track_ids),
+            valid_track_ids=sorted(valid_track_ids),
         )
 
         return MetricsResult(control=control, analysis=analysis)
@@ -331,8 +365,8 @@ class MetricsCalculator:
     def _update_realtime_window(
         self,
         *,
-        frame_track_diameters: dict[int, float],
-        frame_track_bead_counts: dict[int, int],
+        crossed_track_diameters: dict[int, float],
+        crossed_track_bead_counts: dict[int, int],
         frame_crossing_count: int = 0,
         timestamp: float | None = None,
     ) -> tuple[list[float], int, int, int, int]:
@@ -345,11 +379,7 @@ class MetricsCalculator:
             self._period_crossing_count = 0
 
         if now >= self._period_start + period_s:
-            completed_diameters = [
-                float(np.median(np.asarray(values, dtype=np.float32)))
-                for values in self._period_diameters.values()
-                if values
-            ]
+            completed_diameters = list(self._period_diameters.values())
             completed_single = sum(
                 1 for track_id in self._period_diameters if self._period_bead_max.get(track_id, 0) == 1
             )
@@ -367,9 +397,9 @@ class MetricsCalculator:
             self._period_bead_max.clear()
             self._period_crossing_count = 0
 
-        for track_id, diameter in frame_track_diameters.items():
-            self._period_diameters.setdefault(int(track_id), []).append(float(diameter))
-        for track_id, bead_count in frame_track_bead_counts.items():
+        for track_id, diameter in crossed_track_diameters.items():
+            self._period_diameters[int(track_id)] = float(diameter)
+        for track_id, bead_count in crossed_track_bead_counts.items():
             key = int(track_id)
             self._period_bead_max[key] = max(self._period_bead_max.get(key, 0), int(bead_count))
         self._period_crossing_count += max(0, int(frame_crossing_count))

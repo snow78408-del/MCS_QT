@@ -85,6 +85,8 @@ class PumpTestPage(ttk.Frame):
                 "q1": float(self.q1_var.get().strip()),
                 "q2": float(self.q2_var.get().strip()),
             }
+            if values["q1"] < values["q2"] + 0.2:
+                raise ValueError("油相 Q1 必须至少比水相 Q2 大 0.2 uL/min")
             if not values["port"]:
                 raise ValueError("泵串口号不能为空，例如 COM3")
         except Exception as exc:

@@ -49,6 +49,8 @@ class MonitorPage(ttk.Frame):
         self.pid_mode_var = tk.StringVar(value="--")
         self.pid_gains_var = tk.StringVar(value="--")
         self.adaptive_var = tk.StringVar(value="--")
+        self.adaptive_reason_var = tk.StringVar(value="--")
+        self.output_gain_var = tk.StringVar(value="--")
         self.feedforward_var = tk.StringVar(value="--")
         self.pid_output_var = tk.StringVar(value="--")
         self.feedforward_output_var = tk.StringVar(value="--")
@@ -141,6 +143,8 @@ class MonitorPage(ttk.Frame):
             ("PID mode", self.pid_mode_var),
             ("kp / ki / kd", self.pid_gains_var),
             ("adaptive active", self.adaptive_var),
+            ("adaptive reason", self.adaptive_reason_var),
+            ("Q1 / Q2 output gain", self.output_gain_var),
             ("feedforward active", self.feedforward_var),
             ("PID output", self.pid_output_var),
             ("feedforward output", self.feedforward_output_var),
@@ -351,7 +355,16 @@ class MonitorPage(ttk.Frame):
                 f"{float(getattr(ctrl, 'ki', 0.0)):.6f} / "
                 f"{float(getattr(ctrl, 'kd', 0.0)):.6f}",
             )
-            set_var_if_changed(self.adaptive_var, "yes" if bool(getattr(ctrl, "adaptive_active", False)) else "no")
+            adaptive_enabled = bool(getattr(ctrl, "adaptive_enabled", False))
+            adaptive_active = bool(getattr(ctrl, "adaptive_active", False))
+            adaptive_text = "enabled / tuning" if adaptive_active else "enabled / warming up" if adaptive_enabled else "disabled"
+            set_var_if_changed(self.adaptive_var, adaptive_text)
+            set_var_if_changed(self.adaptive_reason_var, str(getattr(ctrl, "adaptive_reason", "") or "--"))
+            set_var_if_changed(
+                self.output_gain_var,
+                f"{float(getattr(ctrl, 'q1_output_gain', 1.0)):.2f} / "
+                f"{float(getattr(ctrl, 'q2_output_gain', 1.0)):.2f}",
+            )
             set_var_if_changed(self.feedforward_var, "yes" if bool(getattr(ctrl, "feedforward_active", False)) else "no")
             set_var_if_changed(self.err_var, f"{ctrl.diameter_error:.6f}")
             set_var_if_changed(self.adjust_var, f"{ctrl.adjustment:.6f}")

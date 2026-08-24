@@ -52,21 +52,44 @@ class AdaptivePIDManager:
             state.reason = "waiting adaptive update interval"
             return state
 
+        # Feedback adaptation must remain available before the optional
+        # disturbance model has collected and validated enough data. Model
+        # confidence gates only model-derived hints, never the PID tuner itself.
         prediction = pid_input.disturbance_prediction
         confidence = float(getattr(prediction, "confidence", 0.0) or 0.0)
-        if confidence < float(self.config.adaptive_confidence_threshold):
-            state.active = False
-            state.reason = "low model confidence; keep current PID"
-            return state
-
+        model_hint_active = confidence >= float(self.config.adaptive_confidence_threshold)
         mean_abs = sum(abs(v) for v in self._errors) / len(self._errors)
         recent_slope = self._errors[-1] - self._errors[-min(5, len(self._errors))]
-        predicted = abs(float(getattr(prediction, "predicted_diameter_change_um", 0.0) or 0.0))
-        delay_ms = float(pid_input.pump_response_delay_ms or getattr(prediction, "predicted_response_delay_ms", 0.0) or 0.0)
+        predicted = (
+            abs(float(getattr(prediction, "predicted_diameter_change_um", 0.0) or 0.0))
+            if model_hint_active else 0.0
+        )
+        model_delay_ms = (
+            float(getattr(prediction, "predicted_response_delay_ms", 0.0) or 0.0)
+            if model_hint_active else 0.0
+        )
+        delay_ms = float(pid_input.pump_response_delay_ms or model_delay_ms)
 
-        kp_target = state.base_kp * (1.0 + min(0.75, mean_abs / 80.0 + predicted / 120.0))
-        ki_target = state.base_ki * (0.75 if abs(recent_slope) > mean_abs else 1.0)
-        kd_target = state.base_kd + min(0.2, delay_ms / 5000.0 + abs(recent_slope) / 200.0)
+        recent = list(self._errors)[-min(12, len(self._errors)):]
+        sign_changes = sum(
+            1 for left, right in zip(recent, recent[1:])
+            if left * right < 0.0
+        )
+        oscillating = sign_changes >= max(2, len(recent) // 3)
+        signed_mean = sum(recent) / len(recent)
+
+        kp_scale = 1.0 + min(0.75, mean_abs / 80.0 + predicted / 120.0)
+        if oscillating:
+            kp_scale *= 0.85
+        kp_target = state.base_kp * kp_scale
+        # Increase integral action only for a persistent one-sided offset;
+        # suppress it when errors alternate to avoid exciting oscillation.
+        persistent_offset = abs(signed_mean) > max(1.0, mean_abs * 0.55)
+        ki_target = state.base_ki * (1.2 if persistent_offset and not oscillating else 0.7 if oscillating else 1.0)
+        kd_target = state.base_kd + min(
+            0.2,
+            delay_ms / 5000.0 + abs(recent_slope) / 200.0 + (0.01 if oscillating else 0.0),
+        )
 
         state.kp = clamp(
             rate_limit(kp_target, state.kp, self.config.kp_step_limit),
@@ -84,7 +107,10 @@ class AdaptivePIDManager:
             self.config.kd_max,
         )
         state.active = True
-        state.reason = "adaptive PID updated"
+        state.reason = (
+            "adaptive PID updated with model hint"
+            if model_hint_active else "adaptive PID updated from feedback history"
+        )
         return state
 
     @staticmethod

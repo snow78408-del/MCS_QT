@@ -3,10 +3,13 @@ from __future__ import annotations
 import base64
 from collections import deque
 import queue
+from statistics import median
 import threading
 import time
 from dataclasses import replace
 from typing import Any, Callable, Protocol, runtime_checkable
+
+import numpy as np
 
 try:
     import cv2
@@ -25,6 +28,11 @@ PROCESSING_BATCH_QUEUE_SIZE = 2
 PREVIEW_QUEUE_SIZE = 1
 SAMPLING_QUEUE_SIZE = 32
 GENERATION_RATE_WINDOW_S = 1.0
+# Vision sampling must not be tied to the PID decision period. A 10-second PID
+# period still needs continuous observations or most passing droplets vanish
+# between two five-frame batches.
+ANALYSIS_BATCH_INTERVAL_S = 0.05
+ANALYSIS_BUSY_RETRY_S = 0.02
 # The detector intentionally prioritizes well-scored, de-duplicated candidates.
 # Matching its measured throughput keeps the queue near-empty and prevents PID
 # decisions from using stale frames, while the independent preview stays 30 FPS.
@@ -37,6 +45,9 @@ class VisionAdapterProtocol(Protocol):
     def stop(self) -> None: ...
     def get_snapshot(self) -> RecognitionSnapshot | dict[str, Any]: ...
     def get_frame_snapshot(self) -> FrameSnapshot | None: ...
+    def wait_for_recognition_snapshot(
+        self, after_period_id: int = 0, timeout: float | None = None
+    ) -> RecognitionSnapshot: ...
 
 
 class GenericVisionAdapter:
@@ -72,6 +83,19 @@ class GenericVisionAdapter:
     def get_snapshot(self) -> RecognitionSnapshot | dict[str, Any]:
         return self._call(["get_snapshot", "get_latest_snapshot", "read_snapshot", "pull_result", "run_once"])
 
+    def get_frame_snapshot(self) -> FrameSnapshot | None:
+        """Forward the independent live-preview frame without mixing in analysis results."""
+        return self._call(["get_frame_snapshot", "get_video_frame_snapshot", "get_latest_frame_snapshot"])
+
+    def wait_for_recognition_snapshot(
+        self, after_period_id: int = 0, timeout: float | None = None
+    ) -> RecognitionSnapshot:
+        return self._call(
+            ["wait_for_recognition_snapshot"],
+            after_period_id=after_period_id,
+            timeout=timeout,
+        )
+
 
 class PipelineVisionService:
     def __init__(self, logger: Callable[[str], None] | None = None) -> None:
@@ -84,8 +108,18 @@ class PipelineVisionService:
         self._video_source = "0"
         self._selected_backend = ""
         self._pixel_to_micron = 1.0
+        self._configured_pixel_to_micron = 1.0
         self._expected_diameter_um = 0.0
+        self._channel_calibration_enabled = False
+        self._channel_width_um = 430.0
+        self._channel_width_px: float | None = None
+        self._channel_calibration_status = "disabled"
+        self._channel_calibration_confidence = 0.0
+        self._channel_calibration_reason = "未启用管道标定"
+        self._channel_calibration_attempts = 0
+        self._channel_width_samples: deque[tuple[float, float]] = deque(maxlen=5)
         self._lock = threading.RLock()
+        self._recognition_condition = threading.Condition(self._lock)
         self._cap = None
         self._worker: threading.Thread | None = None
         self._process_worker: threading.Thread | None = None
@@ -128,6 +162,16 @@ class PipelineVisionService:
         self._speed_sample_count = 0
         self._droplet_generation_rate_hz = 0.0
         self._last_motion_frame_id = 0
+        self._droplet_gallery_periods: dict[int, list[dict[str, Any]]] = {}
+        self._last_droplet_gallery: dict[str, Any] = {
+            "period_id": 0,
+            "droplet_count": 0,
+            "droplets": [],
+            "sample_frame_count": 0,
+            "frames": [],
+            "reason": "尚无已完成的控制周期",
+        }
+        self._last_gallery_period_id = 0
         self._control_interval_ms = 300
         self._latest = self._empty_snapshot("当前无有效液滴通过")
         self._latest_preview: FrameSnapshot | None = None
@@ -139,6 +183,21 @@ class PipelineVisionService:
 
             self._pipeline = VisionPipeline(default_config(), logger=self._log)
         return self._pipeline
+
+    def wait_for_recognition_snapshot(
+        self, after_period_id: int = 0, timeout: float | None = None
+    ) -> RecognitionSnapshot:
+        """Wait until vision publishes a completed control period."""
+        with self._recognition_condition:
+            if int(self._latest.control_period_id) <= int(after_period_id):
+                self._recognition_condition.wait_for(
+                    lambda: (
+                        self._stop_event.is_set()
+                        or int(self._latest.control_period_id) > int(after_period_id)
+                    ),
+                    timeout=timeout,
+                )
+            return self._latest
 
     def _is_realtime_mode(self) -> bool:
         mode = self._video_source_type.strip().lower()
@@ -187,6 +246,13 @@ class PipelineVisionService:
             uniformity_valid=False,
             uniformity_status="当前无液滴",
             uniformity_reason=reason,
+            pixel_to_micron=float(self._pixel_to_micron),
+            scale_source=("channel_430um" if self._channel_calibration_status == "calibrated" else "configured"),
+            channel_width_um=(self._channel_width_um if self._channel_calibration_enabled else None),
+            channel_width_px=self._channel_width_px,
+            channel_calibration_status=self._channel_calibration_status,
+            channel_calibration_confidence=self._channel_calibration_confidence,
+            channel_calibration_reason=self._channel_calibration_reason,
         )
 
     def _snapshot_with_error(self, reason: str) -> RecognitionSnapshot:
@@ -221,6 +287,7 @@ class PipelineVisionService:
     def configure_detection_scale(self, target_diameter_um: float, pixel_to_micron: float) -> None:
         self._expected_diameter_um = max(0.0, float(target_diameter_um))
         self._pixel_to_micron = float(pixel_to_micron) if float(pixel_to_micron) > 0.0 else 1.0
+        self._configured_pixel_to_micron = self._pixel_to_micron
         pipeline = self._ensure_pipeline()
         # The target is a soft preference only.  The outline radius must come
         # from the observed droplet edge; otherwise changing the PID setpoint
@@ -278,10 +345,131 @@ class PipelineVisionService:
         config.x_end_ratio = max(0.0, min(1.0, float(values.get("x_end_ratio", 1.0))))
         config.y_start_ratio = max(0.0, min(1.0, float(values.get("y_start_ratio", 0.0))))
         config.y_end_ratio = max(0.0, min(1.0, float(values.get("y_end_ratio", 1.0))))
+        wall_lines: list[dict[str, float]] = []
+        for raw_line in list(values.get("wall_lines", []) or [])[:2]:
+            if not isinstance(raw_line, dict):
+                continue
+            try:
+                line = {
+                    key: max(0.0, min(1.0, float(raw_line[key])))
+                    for key in ("x1", "y1", "x2", "y2")
+                }
+            except (KeyError, TypeError, ValueError):
+                continue
+            if abs(line["x2"] - line["x1"]) + abs(line["y2"] - line["y1"]) >= 0.05:
+                wall_lines.append(line)
+        config.wall_lines = wall_lines if len(wall_lines) == 2 else []
         if config.x_end_ratio <= config.x_start_ratio or config.y_end_ratio <= config.y_start_ratio:
             raise ValueError("识别 ROI 的结束坐标必须大于开始坐标")
         config.crop_top_ratio = 0.0
+        self._channel_calibration_enabled = bool(values.get("channel_calibration_enabled", False))
+        self._channel_width_um = float(values.get("channel_width_um", 430.0))
+        if self._channel_width_um <= 0.0:
+            raise ValueError("管道内宽必须大于 0 μm")
+        if self._channel_calibration_enabled and not config.enabled:
+            raise ValueError("启用 430 μm 管道标定前必须先启用并框选 ROI")
         self._log(f"[VISION][ROI] enabled={config.enabled} x={config.x_start_ratio:.3f}-{config.x_end_ratio:.3f} y={config.y_start_ratio:.3f}-{config.y_end_ratio:.3f}")
+
+    def _reset_channel_calibration(self) -> None:
+        self._channel_width_px = None
+        self._channel_calibration_confidence = 0.0
+        self._channel_calibration_attempts = 0
+        self._channel_width_samples.clear()
+        self._pixel_to_micron = self._configured_pixel_to_micron
+        if self._channel_calibration_enabled:
+            self._channel_calibration_status = "collecting"
+            self._channel_calibration_reason = f"正在从 ROI 中拟合 {self._channel_width_um:.1f} μm 管道内壁"
+        else:
+            self._channel_calibration_status = "disabled"
+            self._channel_calibration_reason = "未启用管道标定"
+
+    def _try_channel_calibration(self, frame) -> None:
+        if not self._channel_calibration_enabled or self._channel_calibration_status in {"calibrated", "user_config"}:
+            return
+        from ..vision.channel_calibration import estimate_channel_width_px
+
+        pipeline = self._ensure_pipeline()
+        frame_h, frame_w = frame.shape[:2]
+        wall_lines = list(getattr(pipeline.config.roi, "wall_lines", []) or [])
+        if len(wall_lines) == 2:
+            from ..vision.rectified_roi import wall_separation_px
+
+            selected_width = wall_separation_px(frame_w, frame_h, wall_lines)
+            self._channel_calibration_attempts += 1
+            if selected_width is not None and selected_width > 1.0:
+                scale = self._channel_width_um / selected_width
+                self._pixel_to_micron = float(scale)
+                self._channel_width_px = float(selected_width)
+                self._channel_calibration_confidence = 1.0
+                self._channel_calibration_status = "calibrated"
+                self._channel_calibration_reason = (
+                    f"采用用户选择的两条管壁：{self._channel_width_um:.1f} μm / "
+                    f"{selected_width:.2f} px = {scale:.6f} μm/px"
+                )
+                pipeline.detector.configure_expected_diameter(
+                    self._expected_diameter_um,
+                    self._pixel_to_micron,
+                )
+                self._log(
+                    "[VISION][CHANNEL_CALIBRATION][SELECTED_LINES] "
+                    f"width_px={selected_width:.3f} pixel_to_micron={scale:.8f}"
+                )
+                return
+        x0, x1, y0, y1, crop_top = pipeline.config.roi.resolve(frame_w, frame_h)
+        roi_frame = frame[y0 + crop_top : y1, x0:x1]
+        measurement = estimate_channel_width_px(
+            roi_frame,
+            flow_axis=pipeline.config.metrics.flow_axis,
+        )
+        self._channel_calibration_attempts += 1
+        if measurement.width_px is not None:
+            self._channel_width_samples.append((float(measurement.width_px), float(measurement.confidence)))
+
+        required = self._channel_width_samples.maxlen or 5
+        if len(self._channel_width_samples) >= required:
+            widths = [item[0] for item in self._channel_width_samples]
+            center = float(median(widths))
+            deviations = [abs(value - center) for value in widths]
+            robust_cv = 100.0 * 1.4826 * float(median(deviations)) / max(center, 1.0)
+            if robust_cv <= 3.0:
+                scale = self._channel_width_um / center
+                if 0.05 <= scale <= 100.0:
+                    self._pixel_to_micron = float(scale)
+                    self._channel_width_px = center
+                    self._channel_calibration_confidence = float(median([item[1] for item in self._channel_width_samples]))
+                    self._channel_calibration_status = "calibrated"
+                    self._channel_calibration_reason = (
+                        f"管道内宽 {self._channel_width_um:.1f} μm / {center:.2f} px，"
+                        f"标定比例 {scale:.6f} μm/px"
+                    )
+                    pipeline.detector.configure_expected_diameter(
+                        self._expected_diameter_um,
+                        self._pixel_to_micron,
+                    )
+                    self._log(
+                        "[VISION][CHANNEL_CALIBRATION][OK] "
+                        f"width_um={self._channel_width_um:.3f} width_px={center:.3f} "
+                        f"pixel_to_micron={scale:.8f} robust_cv={robust_cv:.3f}% "
+                        f"confidence={self._channel_calibration_confidence:.3f}"
+                    )
+                    return
+
+        if self._channel_calibration_attempts >= 20:
+            self._channel_calibration_status = "user_config"
+            failure_reason = (
+                measurement.reason
+                if len(self._channel_width_samples) < required
+                else "多帧管壁间距不稳定；请收紧 ROI、固定相机并改善照明"
+            )
+            self._channel_calibration_reason = (
+                f"{failure_reason}；保留用户设置的 ROI 和光学比例 "
+                f"{self._configured_pixel_to_micron:.6f} μm/px"
+            )
+            self._log(
+                "[VISION][CHANNEL_CALIBRATION][USER_CONFIG] "
+                f"attempts={self._channel_calibration_attempts} samples={len(self._channel_width_samples)} "
+                f"reason={self._channel_calibration_reason}"
+            )
 
     def auto_calibrate_detection(self, duration_s: float = 3.0) -> dict[str, Any]:
         started = time.time()
@@ -396,6 +584,159 @@ class PipelineVisionService:
     def test_camera(self, camera_config: dict[str, Any] | None = None) -> dict[str, Any]:
         return self._camera_service.test_camera(camera_config=camera_config or self._camera_parameters)
 
+    def analyze_channel_calibration_preview(
+        self,
+        preview_png_base64: str,
+        roi: dict[str, Any] | None = None,
+        channel_width_um: float = 430.0,
+        configured_pixel_to_micron: float = 1.0,
+        hough_parameters: dict[str, float | int] | None = None,
+    ) -> dict[str, Any]:
+        """Analyze and annotate the synchronized camera-test frame."""
+        if cv2 is None:
+            raise RuntimeError("OpenCV/cv2 未安装，无法分析管道标定")
+        from ..vision.channel_calibration import (
+            ChannelWidthMeasurement,
+            detect_wall_line_candidates,
+            estimate_channel_width_px,
+            normalize_hough_line_parameters,
+            suggest_channel_roi,
+        )
+        from ..vision.rectified_roi import wall_lines_bbox, wall_separation_px
+
+        encoded = str(preview_png_base64 or "").strip()
+        if not encoded:
+            raise ValueError("测试帧为空，无法分析管道")
+        frame = cv2.imdecode(np.frombuffer(base64.b64decode(encoded), dtype=np.uint8), cv2.IMREAD_COLOR)
+        if frame is None:
+            raise ValueError("测试帧解码失败")
+
+        values = dict(roi or {})
+        applied_hough_parameters = normalize_hough_line_parameters(hough_parameters)
+        selected_wall_lines = [dict(line) for line in list(values.get("wall_lines", []) or [])[:2] if isinstance(line, dict)]
+        if len(selected_wall_lines) != 2:
+            selected_wall_lines = []
+        used_user_roi = bool(selected_wall_lines or (values.get("enabled", False) and values.get("user_defined", False)))
+        suggestion = None
+        if selected_wall_lines:
+            bbox = wall_lines_bbox(selected_wall_lines)
+            if bbox:
+                values.update({"enabled": True, **bbox, "user_defined": True})
+        elif not used_user_roi:
+            suggestion = suggest_channel_roi(
+                frame,
+                flow_axis="x",
+                hough_parameters=applied_hough_parameters,
+            )
+            if suggestion is not None:
+                values.update(
+                    {
+                        "enabled": True,
+                        "x_start_ratio": suggestion.x_start_ratio,
+                        "y_start_ratio": suggestion.y_start_ratio,
+                        "x_end_ratio": suggestion.x_end_ratio,
+                        "y_end_ratio": suggestion.y_end_ratio,
+                        "user_defined": False,
+                    }
+                )
+
+        height, width = frame.shape[:2]
+        enabled = bool(values.get("enabled", False))
+        x0 = max(0, min(width - 1, int(width * float(values.get("x_start_ratio", 0.0)))))
+        x1 = max(x0 + 1, min(width, int(width * float(values.get("x_end_ratio", 1.0)))))
+        y0 = max(0, min(height - 1, int(height * float(values.get("y_start_ratio", 0.0)))))
+        y1 = max(y0 + 1, min(height, int(height * float(values.get("y_end_ratio", 1.0)))))
+        selected_width = wall_separation_px(width, height, selected_wall_lines) if selected_wall_lines else None
+        measurement = (
+            ChannelWidthMeasurement(selected_width, 1.0, "ok")
+            if selected_width is not None
+            else (
+                estimate_channel_width_px(
+                    frame[y0:y1, x0:x1],
+                    flow_axis="x",
+                    hough_parameters=applied_hough_parameters,
+                )
+                if enabled
+                else None
+            )
+        )
+        ok = bool(measurement is not None and measurement.width_px is not None)
+        reference_um = max(1e-9, float(channel_width_um))
+        measured_scale = reference_um / float(measurement.width_px) if ok else None
+        fallback_scale = max(1e-9, float(configured_pixel_to_micron))
+
+        overlay = frame.copy()
+        color = (70, 210, 70) if ok else (40, 80, 230)
+        hough_lines = detect_wall_line_candidates(
+            frame,
+            hough_parameters=applied_hough_parameters,
+        )
+        for candidate in hough_lines:
+            p1 = (int(round(float(candidate["x1"]) * width)), int(round(float(candidate["y1"]) * height)))
+            p2 = (int(round(float(candidate["x2"]) * width)), int(round(float(candidate["y2"]) * height)))
+            cv2.line(overlay, p1, p2, (255, 190, 40), 1, cv2.LINE_AA)
+            cv2.putText(overlay, str(candidate["id"]), p1, cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 220, 80), 1, cv2.LINE_AA)
+        if enabled:
+            cv2.rectangle(overlay, (x0, y0), (x1 - 1, y1 - 1), color, 2)
+        if selected_wall_lines:
+            for line in selected_wall_lines:
+                p1 = (int(round(float(line["x1"]) * width)), int(round(float(line["y1"]) * height)))
+                p2 = (int(round(float(line["x2"]) * width)), int(round(float(line["y2"]) * height)))
+                cv2.line(overlay, p1, p2, (0, 165, 255), 4, cv2.LINE_AA)
+        elif ok and measurement is not None:
+            local_center_x = (x1 - x0 - 1) * 0.5
+            for center, slope in (
+                (measurement.upper_center_px, measurement.upper_slope),
+                (measurement.lower_center_px, measurement.lower_slope),
+            ):
+                if center is None:
+                    continue
+                line_slope = float(slope or 0.0)
+                left_y = int(round(y0 + float(center) - line_slope * local_center_x))
+                right_y = int(round(y0 + float(center) + line_slope * local_center_x))
+                cv2.line(overlay, (x0, left_y), (x1 - 1, right_y), (40, 255, 255), 2)
+        label = (
+            f"{'USER' if used_user_roi else 'AUTO'} ROI | {reference_um:.1f}um / "
+            f"{float(measurement.width_px):.2f}px = {float(measured_scale):.6f}um/px"
+            if ok and measurement is not None
+            else f"USER SETTINGS | optical scale {fallback_scale:.6f}um/px"
+        )
+        cv2.rectangle(overlay, (6, 6), (min(width - 6, 6 + max(360, len(label) * 8)), 34), (0, 0, 0), -1)
+        cv2.putText(overlay, label, (12, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv2.LINE_AA)
+        encoded_ok, encoded_overlay = cv2.imencode(".png", overlay)
+        if not encoded_ok:
+            raise RuntimeError("管道标定预览编码失败")
+
+        applied_roi = {
+            "enabled": enabled,
+            "x_start_ratio": x0 / float(width),
+            "y_start_ratio": y0 / float(height),
+            "x_end_ratio": x1 / float(width),
+            "y_end_ratio": y1 / float(height),
+            "user_defined": used_user_roi,
+            "channel_calibration_enabled": bool(values.get("channel_calibration_enabled", True)),
+            "channel_width_um": reference_um,
+            "wall_lines": selected_wall_lines,
+        }
+        reason = "ok" if ok else (
+            measurement.reason if measurement is not None else "自动检测未找到可信管道区域"
+        )
+        return {
+            "ok": ok,
+            "used_user_roi": used_user_roi,
+            "auto_suggested": bool(suggestion is not None and not used_user_roi),
+            "roi": applied_roi,
+            "channel_width_um": reference_um,
+            "channel_width_px": (None if measurement is None else measurement.width_px),
+            "pixel_to_micron": measured_scale if measured_scale is not None else fallback_scale,
+            "confidence": (0.0 if measurement is None else measurement.confidence),
+            "reason": reason,
+            "fallback_to_configured_scale": not ok,
+            "hough_lines": hough_lines,
+            "hough_parameters": applied_hough_parameters,
+            "overlay_png_base64": base64.b64encode(encoded_overlay.tobytes()).decode("ascii"),
+        }
+
     def get_camera_status(self) -> dict[str, Any]:
         return self._camera_service.get_camera_status()
 
@@ -405,6 +746,7 @@ class PipelineVisionService:
             self._video_source_type = str(video_source_type or "camera")
             self._video_source = str(video_source or "0")
             self._pixel_to_micron = float(pixel_to_micron) if float(pixel_to_micron) > 0 else 1.0
+            self._configured_pixel_to_micron = self._pixel_to_micron
             self._last_processed_frame_id = 0
             self._last_processed_frame_timestamp = 0.0
             self._capture_frame_id = 0
@@ -424,6 +766,17 @@ class PipelineVisionService:
             self._local_frame_interval_s = 0.0
             self._next_local_frame_time = 0.0
             self._ensure_pipeline().reset()
+            self._reset_channel_calibration()
+            self._droplet_gallery_periods.clear()
+            self._last_droplet_gallery = {
+                "period_id": 0,
+                "droplet_count": 0,
+                "droplets": [],
+                "sample_frame_count": 0,
+                "frames": [],
+                "reason": "尚无已完成的控制周期",
+            }
+            self._last_gallery_period_id = 0
             self._latest = self._empty_snapshot("视频输入已准备，等待识别")
             self._latest_preview = None
 
@@ -639,13 +992,17 @@ class PipelineVisionService:
         timestamp: float | None = None,
         encode_frame: bool = False,
     ) -> RecognitionSnapshot:
+        with self._lock:
+            self._try_channel_calibration(frame)
         result = self._ensure_pipeline().process_frame(frame, timestamp=timestamp)
         observed_ids = {int(track_id) for track_id, _ in result.tracking.matched_pairs}
         observed_ids.update(int(track_id) for track_id in result.tracking.new_track_ids)
         with self._lock:
             sample_time = time.time()
-            calibration_frame = frame
-            if self._ensure_pipeline().config.roi.enabled:
+            calibration_frame = self._ensure_pipeline().rectify_selected_channel(frame)
+            if calibration_frame is None:
+                calibration_frame = frame
+            if self._ensure_pipeline().config.roi.enabled and not self._ensure_pipeline().config.roi.wall_lines:
                 frame_h, frame_w = frame.shape[:2]
                 x0, x1, y0, y1, crop_top = self._ensure_pipeline().config.roi.resolve(frame_w, frame_h)
                 calibration_frame = frame[y0 + crop_top : y1, x0:x1]
@@ -674,6 +1031,11 @@ class PipelineVisionService:
                 ring = self._ensure_pipeline().detector._ring_contrast(normalized, _cx, _cy, radius)
                 self._calibration_stats.append((sample_time, float(gray.mean()), float(gray.std()), center, ring))
         control = result.metrics.control
+        self._update_droplet_gallery(
+            result,
+            frame_id=int(frame_id if frame_id is not None else result.frame_index),
+            timestamp=float(timestamp or result.timestamp),
+        )
         avg_px = control.frame_avg_diameter
         active_count = int(result.metrics.control.frame_droplet_count)
         total_count = int(result.metrics.control.total_droplet_count)
@@ -738,8 +1100,173 @@ class PipelineVisionService:
             average_droplet_speed_um_s=self._average_droplet_speed_um_s,
             speed_sample_count=self._speed_sample_count,
             droplet_generation_rate_hz=self._droplet_generation_rate_hz,
+            pixel_to_micron=scale,
+            scale_source=("channel_430um" if self._channel_calibration_status == "calibrated" else "configured"),
+            channel_width_um=(self._channel_width_um if self._channel_calibration_enabled else None),
+            channel_width_px=self._channel_width_px,
+            channel_calibration_status=self._channel_calibration_status,
+            channel_calibration_confidence=self._channel_calibration_confidence,
+            channel_calibration_reason=self._channel_calibration_reason,
             **diagnostics,
         )
+
+    def _update_droplet_gallery(
+        self,
+        result,
+        *,
+        frame_id: int | None = None,
+        timestamp: float | None = None,
+    ) -> None:
+        """Store every sampled recognition frame for the previous-period viewer."""
+        control = result.metrics.control
+        completed_period = int(control.period_id)
+        with self._lock:
+            if completed_period > self._last_gallery_period_id:
+                period_frames = self._droplet_gallery_periods.pop(completed_period, [])
+                unique_valid_ids = {
+                    int(track_id)
+                    for item in period_frames
+                    for track_id in list(item.get("valid_track_ids", []) or [])
+                }
+                self._last_droplet_gallery = {
+                    "period_id": completed_period,
+                    "droplet_count": len(unique_valid_ids),
+                    "droplets": [],
+                    "sample_frame_count": len(period_frames),
+                    "frames": period_frames,
+                    "reason": "ok" if period_frames else "该控制周期没有可回看的采样识别帧",
+                }
+                self._last_gallery_period_id = completed_period
+                for old_period in [key for key in self._droplet_gallery_periods if key <= completed_period]:
+                    self._droplet_gallery_periods.pop(old_period, None)
+
+            # The metrics transition publishes period N before processing the
+            # current frame into period N+1, so the current sample belongs to
+            # completed_period + 1.
+            target_period = completed_period + 1
+            period_frames = self._droplet_gallery_periods.setdefault(target_period, [])
+            if len(period_frames) >= 300:
+                return
+
+            valid_ids = {
+                int(track_id)
+                for track_id in list(getattr(control, "valid_track_ids", []) or [])
+            }
+            crossed_ids = {
+                int(track_id)
+                for track_id in list(getattr(control, "crossed_track_ids", []) or [])
+            }
+            analysis_frame = result.analysis_frame
+            frame_h, frame_w = analysis_frame.shape[:2]
+            annotated = (
+                cv2.cvtColor(analysis_frame, cv2.COLOR_GRAY2BGR)
+                if analysis_frame.ndim == 2
+                else analysis_frame.copy()
+            )
+            tracks = {int(track.id): track for track in result.tracking.active_tracks}
+            valid_ids = {
+                track_id
+                for track_id in valid_ids
+                if track_id in tracks
+                and float(
+                    tracks[track_id].metadata.get(
+                        "observed_radius",
+                        tracks[track_id].radius,
+                    )
+                ) > 1.0
+            }
+            crossed_ids.intersection_update(valid_ids)
+            valid_diameters_um: list[float] = []
+            for track_id in sorted(valid_ids):
+                track = tracks.get(track_id)
+                if track is None:
+                    continue
+                radius = float(track.metadata.get("observed_radius", track.radius))
+                if radius <= 1.0:
+                    continue
+                cx, cy = float(track.position[0]), float(track.position[1])
+                diameter_um = radius * 2.0 * float(self._pixel_to_micron)
+                valid_diameters_um.append(diameter_um)
+                color = (0, 165, 255) if track_id in crossed_ids else (40, 220, 70)
+                thickness = 3 if track_id in crossed_ids else 2
+                cv2.circle(
+                    annotated,
+                    (int(round(cx)), int(round(cy))),
+                    max(2, int(round(radius))),
+                    color,
+                    thickness,
+                    cv2.LINE_AA,
+                )
+                cv2.putText(
+                    annotated,
+                    f"ID {track_id}  {diameter_um:.1f}um",
+                    (
+                        max(2, int(round(cx - radius))),
+                        max(16, int(round(cy - radius - 5))),
+                    ),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.42,
+                    color,
+                    1,
+                    cv2.LINE_AA,
+                )
+
+            metrics_config = self._ensure_pipeline().config.metrics
+            axis = str(metrics_config.flow_axis).strip().lower()
+            line_ratio = float(metrics_config.count_line_ratio)
+            if axis == "y":
+                line_position = min(frame_h - 1, max(0, int(round(frame_h * line_ratio))))
+                cv2.line(annotated, (0, line_position), (frame_w - 1, line_position), (255, 210, 40), 1)
+            else:
+                line_position = min(frame_w - 1, max(0, int(round(frame_w * line_ratio))))
+                cv2.line(annotated, (line_position, 0), (line_position, frame_h - 1), (255, 210, 40), 1)
+
+            resolved_frame_id = int(frame_id if frame_id is not None else result.frame_index)
+            header = f"Frame {resolved_frame_id} | valid {len(valid_ids)} | crossed {len(crossed_ids)}"
+            cv2.rectangle(annotated, (0, 0), (min(frame_w - 1, 340), 25), (0, 0, 0), -1)
+            cv2.putText(
+                annotated,
+                header,
+                (7, 18),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.48,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+            encoded_ok, encoded = cv2.imencode(
+                ".jpg",
+                annotated,
+                [int(cv2.IMWRITE_JPEG_QUALITY), 88],
+            )
+            if not encoded_ok:
+                return
+            period_frames.append(
+                {
+                    "frame_id": resolved_frame_id,
+                    "timestamp": float(timestamp if timestamp is not None else result.timestamp),
+                    "valid_droplet_count": len(valid_ids),
+                    "crossed_droplet_count": len(crossed_ids),
+                    "valid_track_ids": sorted(valid_ids),
+                    "average_diameter_um": (
+                        float(np.mean(valid_diameters_um)) if valid_diameters_um else None
+                    ),
+                    "image_jpeg_base64": base64.b64encode(encoded.tobytes()).decode("ascii"),
+                    "width": int(frame_w),
+                    "height": int(frame_h),
+                }
+            )
+
+    def get_last_control_period_droplets(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "period_id": int(self._last_droplet_gallery.get("period_id", 0)),
+                "droplet_count": int(self._last_droplet_gallery.get("droplet_count", 0)),
+                "droplets": [dict(item) for item in self._last_droplet_gallery.get("droplets", [])],
+                "sample_frame_count": int(self._last_droplet_gallery.get("sample_frame_count", 0)),
+                "frames": [dict(item) for item in self._last_droplet_gallery.get("frames", [])],
+                "reason": str(self._last_droplet_gallery.get("reason", "") or ""),
+            }
 
     def _update_motion_measurements(
         self,
@@ -871,7 +1398,7 @@ class PipelineVisionService:
                 # A five-frame window is one analysis transaction. Publish only
                 # after all frames have updated the pipeline's accumulated data.
                 if batch_snapshot is not None:
-                    with self._lock:
+                    with self._recognition_condition:
                         preview = self._latest_preview
                         self._latest = replace(
                             batch_snapshot,
@@ -882,6 +1409,7 @@ class PipelineVisionService:
                             preview_timestamp=(preview.timestamp if preview else 0.0),
                             **self._diagnostics(),
                         )
+                        self._recognition_condition.notify_all()
             except Exception as exc:
                 self._log(f"[VISION][WARN] processing frame failed: {exc}")
             finally:
@@ -889,7 +1417,10 @@ class PipelineVisionService:
                     self._processing_busy = False
 
     def _publish_video_frame(self, frame, frame_id: int, timestamp: float) -> None:
-        frame_jpeg, width, height = self._encode_jpeg(frame)
+        display_frame = self._ensure_pipeline().rectify_selected_channel(frame)
+        if display_frame is None:
+            display_frame = frame
+        frame_jpeg, width, height = self._encode_jpeg(display_frame)
         if frame_jpeg is None:
             return
         with self._lock:
@@ -962,9 +1493,10 @@ class PipelineVisionService:
             with self._lock:
                 processing_unavailable = self._processing_busy or not self._frame_queue.empty()
             if processing_unavailable:
-                # Do not build a backlog. Skip this control period and leave
-                # CPU time for acquisition and the realtime preview.
-                self._next_analysis_batch_time = now + max(0.05, self._control_interval_ms / 1000.0)
+                # Do not build a backlog, but retry soon. The PID period only
+                # controls metrics aggregation and must never create a blind
+                # interval in visual tracking.
+                self._next_analysis_batch_time = now + ANALYSIS_BUSY_RETRY_S
                 return
             self._analysis_batch_started_at = now
         self._capture_batch.append((int(frame_id), float(timestamp), frame))
@@ -972,9 +1504,7 @@ class PipelineVisionService:
             return
         item = self._capture_batch
         self._capture_batch = []
-        self._next_analysis_batch_time = self._analysis_batch_started_at + max(
-            0.05, self._control_interval_ms / 1000.0
-        )
+        self._next_analysis_batch_time = self._analysis_batch_started_at + ANALYSIS_BATCH_INTERVAL_S
         try:
             self._frame_queue.put_nowait(item)
             return

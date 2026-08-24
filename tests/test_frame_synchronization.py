@@ -64,18 +64,23 @@ class FrameSynchronizationTests(unittest.TestCase):
         self.assertEqual(timestamp, 2.0)
         self.assertTrue(np.array_equal(frame, newest))
 
-    def test_analysis_collects_only_one_five_frame_batch_per_control_period(self) -> None:
+    def test_analysis_batches_continue_inside_one_pid_control_period(self) -> None:
         service = PipelineVisionService()
-        service._control_interval_ms = 1000
+        service._control_interval_ms = 10_000
         frame = np.zeros((10, 10), dtype=np.uint8)
 
-        with patch("backend.orchestrator.vision_adapter.time.monotonic", side_effect=[0.0] * 5 + [0.2] * 5):
-            for frame_id in range(1, 11):
+        with patch("backend.orchestrator.vision_adapter.time.monotonic", side_effect=[0.0] * 5):
+            for frame_id in range(1, 6):
                 service._submit_processing_frame(frame_id, float(frame_id), frame)
-
         self.assertEqual(service._frame_queue.qsize(), 1)
-        batch = service._frame_queue.get_nowait()
-        self.assertEqual([item[0] for item in batch], [1, 2, 3, 4, 5])
+        first_batch = service._frame_queue.get_nowait()
+        self.assertEqual([item[0] for item in first_batch], [1, 2, 3, 4, 5])
+
+        with patch("backend.orchestrator.vision_adapter.time.monotonic", side_effect=[0.06] * 5):
+            for frame_id in range(6, 11):
+                service._submit_processing_frame(frame_id, float(frame_id), frame)
+        second_batch = service._frame_queue.get_nowait()
+        self.assertEqual([item[0] for item in second_batch], [6, 7, 8, 9, 10])
         self.assertEqual(service._capture_batch, [])
 
 
