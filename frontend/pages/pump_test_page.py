@@ -21,7 +21,7 @@ class PumpTestPage(ttk.Frame):
         top = ttk.Frame(self)
         top.pack(fill="x", padx=24, pady=(20, 8))
         ttk.Button(top, text="返回参数页", command=lambda: self.app.show_page("parameter")).pack(side="left")
-        ttk.Label(top, text="泵机交互测试", font=("Microsoft YaHei UI", 16, "bold")).pack(side="left", padx=18)
+        ttk.Label(top, text="泵机交互测试", font=("TkDefaultFont", 16, "bold")).pack(side="left", padx=18)
 
         card = ttk.LabelFrame(self, text="通信与灌注参数")
         card.pack(fill="x", padx=24, pady=8)

@@ -40,7 +40,7 @@ class CameraTestPage(ttk.Frame):
         top = ttk.Frame(self)
         top.pack(fill="x", padx=18, pady=(14, 8))
         ttk.Button(top, text="返回参数页", command=lambda: self.app.show_page("parameter")).pack(side="left")
-        ttk.Label(top, text="纯相机画面测试", font=("Microsoft YaHei UI", 15, "bold")).pack(side="left", padx=16)
+        ttk.Label(top, text="纯相机画面测试", font=("TkDefaultFont", 15, "bold")).pack(side="left", padx=16)
 
         controls = ttk.Frame(self)
         controls.pack(fill="x", padx=18, pady=6)

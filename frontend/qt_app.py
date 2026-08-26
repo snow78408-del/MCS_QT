@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Callable
 
 from PySide6.QtCore import QObject, QPoint, QRect, QRunnable, QSize, Qt, QThread, QThreadPool, QTimer, Signal, Slot
-from PySide6.QtGui import QColor, QCloseEvent, QImage, QMouseEvent, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QCloseEvent, QFont, QFontDatabase, QImage, QMouseEvent, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout,
     QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSplitter, QStackedWidget,
@@ -1086,7 +1086,7 @@ class FrontendApp(QMainWindow):
         for key,label in (("parameter","1  基础参数"),("video","2  相机识别与读写"),("pump","3  泵机识别与读写"),("init","4  系统初始化"),("monitor","5  运行监控"),("status","6  系统状态"),("tuning","7  液滴算法调参")):
             item=QListWidgetItem(label); item.setData(Qt.UserRole,key); item.setSizeHint(QSize(190,48)); self.nav.addItem(item); self.stack.addWidget(self.pages[key])
         self.nav.currentItemChanged.connect(lambda current,_: current and self.show_page(str(current.data(Qt.UserRole))))
-        self.setStyleSheet("QMainWindow,QWidget{background:#f4f7fb;color:#172033;font-family:'Microsoft YaHei UI';font-size:14px}#nav{background:#152238;color:#dbe7f7;border:0;padding:18px 8px}#nav::item{border-radius:7px;padding-left:12px;margin:2px}#nav::item:selected{background:#2b6de5;color:white}QGroupBox{background:white;border:1px solid #dce3ed;border-radius:10px;margin-top:14px;padding:20px;font-weight:600}QGroupBox::title{subcontrol-origin:margin;left:16px;padding:0 6px}QLineEdit,QComboBox,QPlainTextEdit{background:white;border:1px solid #cbd5e1;border-radius:6px;padding:7px}QPushButton{background:#2b6de5;color:white;border:0;border-radius:6px;padding:8px 16px}QPushButton:disabled{background:#aab5c4}")
+        self.setStyleSheet("QMainWindow,QWidget{background:#f4f7fb;color:#172033;font-size:14px}#nav{background:#152238;color:#dbe7f7;border:0;padding:18px 8px}#nav::item{border-radius:7px;padding-left:12px;margin:2px}#nav::item:selected{background:#2b6de5;color:white}QGroupBox{background:white;border:1px solid #dce3ed;border-radius:10px;margin-top:14px;padding:20px;font-weight:600}QGroupBox::title{subcontrol-origin:margin;left:16px;padding:0 6px}QLineEdit,QComboBox,QPlainTextEdit{background:white;border:1px solid #cbd5e1;border-radius:6px;padding:7px}QPushButton{background:#2b6de5;color:white;border:0;border-radius:6px;padding:8px 16px}QPushButton:disabled{background:#aab5c4}")
 
     def title(self,heading,subtitle):
         widget=QFrame(); layout=QVBoxLayout(widget); label=QLabel(heading); label.setStyleSheet("font-size:26px;font-weight:700"); detail=QLabel(subtitle); detail.setStyleSheet("color:#64748b"); layout.addWidget(label); layout.addWidget(detail); return widget
@@ -1149,7 +1149,16 @@ class FrontendApp(QMainWindow):
         event.accept()
 
 
+def _configure_application_font(application: QApplication) -> None:
+    """Use an installed UI font instead of Qt's unresolved generic alias."""
+    installed = set(QFontDatabase.families())
+    for family in (".AppleSystemUIFont", "Segoe UI", "Noto Sans CJK SC", "Arial"):
+        if family in installed:
+            application.setFont(QFont(family, 14))
+            return
+
+
 def main():
-    mp.freeze_support(); application=QApplication.instance() or QApplication(sys.argv); application.setApplicationName(APP_TITLE); window=FrontendApp(); window.show(); raise SystemExit(application.exec())
+    mp.freeze_support(); application=QApplication.instance() or QApplication(sys.argv); _configure_application_font(application); application.setApplicationName(APP_TITLE); window=FrontendApp(); window.show(); raise SystemExit(application.exec())
 
 if __name__ == "__main__": main()
