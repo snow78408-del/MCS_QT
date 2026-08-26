@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import ctypes
 import os
 import time
 from ctypes import (
     POINTER,
     Structure,
-    WinDLL,
     byref,
     c_char_p,
     c_bool,
@@ -36,6 +36,12 @@ from ..models import (
     DEVICE_TYPE_INDUSTRIAL,
     FrameData,
 )
+
+
+# ``WinDLL`` is only exposed by ctypes on Windows.  Keep this module
+# importable on other platforms so the optional HIKROBOT backend can report
+# itself as unavailable instead of preventing the camera registry from loading.
+WinDLL = getattr(ctypes, "WinDLL", None)
 
 
 DEFAULT_MVS_DLL_PATHS = (
@@ -156,6 +162,8 @@ class DirectHikrobotDllCamera:
 
     @classmethod
     def is_available(cls, config: Any | None = None) -> tuple[bool, str, Path | None]:
+        if WinDLL is None:
+            return False, "HIKROBOT direct DLL backend requires Windows", None
         if cv2 is None or np is None:
             return False, "OpenCV or NumPy is not installed", None
         dll_path = cls.find_dll(config)
