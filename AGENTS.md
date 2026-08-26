@@ -19,28 +19,29 @@
 
 ## 环境与运行
 
-项目要求 Python `>=3.10`。推荐使用虚拟环境：
+项目要求 Python `>=3.10`，**运行项目、测试和开发脚本时必须使用项目虚拟环境 `.venv` 中的 Python**，不要使用系统 Python 或裸 `python`/`pytest` 命令。
+
+首次创建并安装依赖：
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate       # Windows: .venv\\Scripts\\activate
-python -m pip install -r requirements.txt
+.venv/bin/python -m pip install -r requirements.txt
 ```
 
-常用命令：
+常用命令（均使用 `.venv/bin/python`）：
 
 ```bash
-python run.py                    # 启动前端（默认）
-python run.py frontend           # 显式启动前端
-python run.py vision --video input.mp4
-python run.py vision --camera 0
-pytest                           # 运行全部测试
-python -m pytest tests/test_pid_controller.py
-python -m pip install -e .       # 安装为可编辑命令行工具
-microfluidic-control
+.venv/bin/python run.py                    # 启动前端（默认）
+.venv/bin/python run.py frontend           # 显式启动前端
+.venv/bin/python run.py vision --video input.mp4
+.venv/bin/python run.py vision --camera 0
+.venv/bin/python -m pytest                 # 运行全部测试
+.venv/bin/python -m pytest tests/test_pid_controller.py
+.venv/bin/python -m pip install -e .       # 安装为可编辑命令行工具
+.venv/bin/microfluidic-control
 ```
 
-也可以使用 `uv sync` 和 `uv run ...` 管理环境。不要把 `.venv`、缓存、运行日志或本地硬件配置提交到 Git。
+也可以先执行 `source .venv/bin/activate` 后使用 `python` 和 `python -m pytest`，但执行命令前必须确认虚拟环境已激活。不要把 `.venv`、缓存、运行日志或本地硬件配置提交到 Git。
 
 ## 开发约定
 
