@@ -39,6 +39,36 @@ class MultiscaleDropletDetectorTests(unittest.TestCase):
         self.assertEqual(small_range, (8.0, 10.0, 80.0))
         self.assertEqual(large_range, (8.0, 40.0, 80.0))
 
+    def test_expected_size_filter_rejects_wrong_hough_radius(self) -> None:
+        config = default_config()
+        config.detector.expected_radius = 20.0
+        config.detector.expected_radius_tolerance_ratio = 0.25
+        detector = DropletDetector(config.detector, config.debug)
+
+        filtered = detector._filter_expected_size(
+            [(40.0, 40.0, 19.0), (80.0, 40.0, 28.0), (120.0, 40.0, 12.0)]
+        )
+
+        self.assertEqual(filtered, [(40.0, 40.0, 19.0)])
+
+    def test_edge_ownership_rejects_circle_built_from_neighbor_edges(self) -> None:
+        config = default_config()
+        config.detector.edge_ownership_search_radius = 3
+        config.detector.edge_ownership_min_ratio = 0.55
+        detector = DropletDetector(config.detector, config.debug)
+        edges = np.zeros((140, 160), dtype=np.uint8)
+        cv2.circle(edges, (50, 70), 25, 255, 1)
+        cv2.circle(edges, (100, 70), 25, 255, 1)
+        candidates = [
+            (50.0, 70.0, 25.0),
+            (100.0, 70.0, 25.0),
+            (75.0, 70.0, 35.0),
+        ]
+
+        filtered = detector._filter_edge_ownership(edges, candidates, 1.0)
+
+        self.assertEqual(filtered, candidates[:2])
+
     def test_realtime_pipeline_reuses_source_frame_without_overlay(self) -> None:
         config = default_config()
         pipeline = VisionPipeline(config)
@@ -48,45 +78,28 @@ class MultiscaleDropletDetectorTests(unittest.TestCase):
 
         self.assertIs(result.annotated_frame, frame)
 
-    def test_intensity_detector_runs_only_as_empty_result_fallback(self) -> None:
+    def test_detection_uses_hough_as_the_only_candidate_source(self) -> None:
         config = default_config()
-        config.detector.enable_hough_candidates = False
-        config.detector.enable_intensity_peak_candidates = False
-        config.detector.enable_intensity_peak_fallback = True
         detector = DropletDetector(config.detector, config.debug)
         image = np.full((100, 120), 180, dtype=np.uint8)
-        fallback_center = np.array([60.0, 50.0], dtype=np.float32)
-
-        with patch.object(detector, "_detect_split_connected", return_value=([], [])), patch.object(
-            detector,
-            "_detect_intensity_peak_candidates",
-            return_value=([fallback_center], [15.0]),
-        ) as fallback:
-            detector.detect(image)
-
-        fallback.assert_called_once()
-
-    def test_hough_is_skipped_when_contour_candidate_is_valid(self) -> None:
-        config = default_config()
-        config.detector.hough_fallback_only = True
-        config.detector.enable_intensity_peak_candidates = False
-        detector = DropletDetector(config.detector, config.debug)
-        image = np.full((100, 120), 180, dtype=np.uint8)
-        contour_center = np.array([60.0, 50.0], dtype=np.float32)
+        hough_center = np.array([60.0, 50.0], dtype=np.float32)
 
         with patch.object(
             detector,
-            "_detect_split_connected",
-            return_value=([contour_center], [15.0]),
-        ), patch.object(
+            "_detect_hough_candidates",
+            return_value=([hough_center], [15.0]),
+        ) as hough, patch.object(
             detector,
             "_score_and_suppress_candidates",
             side_effect=lambda _image, centers, radii: (centers, radii),
-        ), patch.object(detector, "_detect_hough_candidates") as hough:
+        ):
             result = detector.detect(image)
 
-        hough.assert_not_called()
+        hough.assert_called_once()
         self.assertEqual(len(result.centers), 1)
+        self.assertFalse(hasattr(detector, "_binarize"))
+        self.assertFalse(hasattr(detector, "_detect_no_split"))
+        self.assertFalse(hasattr(detector, "_detect_intensity_peak_candidates"))
 
 
 if __name__ == "__main__":

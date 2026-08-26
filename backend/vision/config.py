@@ -5,6 +5,7 @@ import os
 
 TrackerType = Literal["nearest", "kalman"]
 DetectionMode = Literal["split_connected", "no_split"]
+ThresholdMode = Literal["adaptive_gaussian", "otsu"]
 BeadMode = Literal["intensity", "connected"]
 
 
@@ -57,19 +58,30 @@ class DetectorConfig:
     deduplicate_distance_ratio: float = 0.60
     deduplicate_min_distance: float = 6.0
     deduplicate_contained_ratio: float = 0.88
+    # Deprecated JSON compatibility fields from the removed contour detector.
     circularity_threshold: float = 0.12
     min_contour_area: float = 40.0
+    enable_intensity_normalization: bool = True
+    enable_gaussian_blur: bool = True
     gaussian_blur_size: int = 5
+    # Deprecated JSON compatibility fields from the removed binary,
+    # morphology, and connected-component pipeline. They are not executed.
+    threshold_mode: ThresholdMode = "adaptive_gaussian"
+    adaptive_threshold_block_size: int = 31
+    adaptive_threshold_c: float = 5.0
+    enable_morphology: bool = True
     morphology_open_kernel: int = 3
     morphology_close_kernel: int = 5
     split_peak_threshold_ratio: float = 0.55
     split_min_radius_ratio: float = 0.65
     split_large_area_ratio: float = 1.15
+    # Retained for saved-profile compatibility. The current detector always
+    # uses Hough as its sole candidate source; it cannot be disabled or changed
+    # into a contour fallback by these legacy flags.
     enable_hough_candidates: bool = True
-    # Full Hough fusion is both expensive and prone to generating duplicate
-    # circles in densely packed real droplets. Contours are the primary path;
-    # Hough remains available when contours find nothing.
-    hough_fallback_only: bool = True
+    hough_fallback_only: bool = False
+    enable_hough_clahe: bool = True
+    enable_hough_median_blur: bool = True
     hough_dp: float = 1.2
     hough_min_distance: float = 0.0
     hough_param1: float = 100.0
@@ -79,9 +91,20 @@ class DetectorConfig:
     hough_preferred_radius: float = 0.0
     hough_edge_support_threshold: float = 0.15
     hough_edge_neighborhood: int = 2
+    # Dense-droplet safeguards. A reliable target radius rejects implausible
+    # Hough sizes; edge ownership rejects circles assembled from neighbouring
+    # droplets' arcs.
+    enable_expected_size_filter: bool = True
+    expected_radius_tolerance_ratio: float = 0.30
+    enable_edge_ownership_filter: bool = True
+    edge_ownership_search_radius: int = 2
+    edge_ownership_margin: float = 0.75
+    edge_ownership_min_ratio: float = 0.55
     hough_work_max_width: int = 760
     hough_work_max_height: int = 560
     hough_max_candidates: int = 120
+    # Deprecated JSON compatibility fields from the removed intensity-peak
+    # candidate path. Hough is the only liquid-droplet candidate source.
     enable_intensity_peak_candidates: bool = False
     enable_intensity_peak_fallback: bool = True
     intensity_peak_kernel_radius_ratio: float = 1.25
@@ -107,9 +130,7 @@ class DetectorConfig:
     candidate_full_circle_ratio: float = 0.85
     candidate_nms_overlap_ratio: float = 0.42
     cut_line_ratio: float = 1.0
-    # Actual high-density camera footage contains touching but already
-    # individually bounded droplets. Watershed splitting fragmented each real
-    # circle into multiple 8-14 px candidates; preserve connected contours.
+    # Deprecated JSON compatibility field from the removed contour detector.
     detection_mode: DetectionMode = "no_split"
 
 

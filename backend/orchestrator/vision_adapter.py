@@ -289,21 +289,13 @@ class PipelineVisionService:
         self._pixel_to_micron = float(pixel_to_micron) if float(pixel_to_micron) > 0.0 else 1.0
         self._configured_pixel_to_micron = self._pixel_to_micron
         pipeline = self._ensure_pipeline()
-        # The target is a soft preference only.  The outline radius must come
-        # from the observed droplet edge; otherwise changing the PID setpoint
-        # would also make the recognition circle appear artificially larger or
-        # smaller than the droplet in the camera image.
+        # Keep the broad absolute safety range; the Hough-specific target-size
+        # filter applies the reliable calibrated diameter without changing the
+        # radius reported from the observed circle edge.
         pipeline.config.detector.expected_size_hard_gate = False
         pipeline.config.detector.hough_work_max_width = 480
         pipeline.config.detector.hough_work_max_height = 360
         pipeline.config.detector.hough_max_candidates = 40
-        pipeline.config.detector.intensity_peak_max_candidates = 40
-        # The intensity-peak path scans many radii around many local extrema and
-        # was the dominant full-frame CPU cost. Contours + Hough + tracking give
-        # better realtime coverage for this bright-field stream.
-        pipeline.config.detector.enable_intensity_peak_candidates = False
-        pipeline.config.detector.enable_intensity_peak_fallback = True
-        pipeline.config.detector.hough_fallback_only = True
         # Recover weaker, partially illuminated droplets, then let geometric
         # scoring and temporal tracking reject isolated false candidates.
         pipeline.config.detector.hough_param2 = 22.0

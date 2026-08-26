@@ -1067,7 +1067,7 @@ class TuningPage(Page):
         super().__init__(app)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 12, 16, 12)
-        layout.addWidget(app.title("液滴识别算法调参", "只处理本地视频，不连接相机、泵机、跟踪或 PID"))
+        layout.addWidget(app.title("液滴识别算法调参", "只处理本地视频或图像，不连接相机、泵机、跟踪或 PID"))
         video = str(app.frontend_config.get("video_source", ""))
         initial_video = video if app.frontend_config.get("video_source_type") == "file" else ""
         self.workbench = TuningWindow(initial_video, self)

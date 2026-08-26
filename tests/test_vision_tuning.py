@@ -36,11 +36,33 @@ class VisionTuningTests(unittest.TestCase):
     def test_pipeline_inspection_exposes_each_processing_stage(self):
         frame = self._frames()[0].image
         result, stages = inspect_frame(frame, DetectorConfig())
-        self.assertEqual(len(stages), 10)
+        self.assertEqual(len(stages), 12)
         self.assertEqual(stages[0].name, "1. 原始图像")
-        self.assertEqual(stages[-1].name, "10. 磁珠辅助掩膜")
+        self.assertEqual(stages[-1].name, "12. 最终评分与抑制")
+        self.assertIn("Hough 局部对比度", stages[4].name)
+        self.assertIn("Hough 原始圆", stages[7].name)
+        self.assertIn("目标尺寸过滤", stages[9].name)
+        self.assertIn("圆周边缘归属", stages[10].name)
         self.assertTrue(all(stage.image.size > 0 for stage in stages))
         self.assertEqual(len(result.centers), len(result.radii))
+
+    def test_optional_preprocessing_steps_can_be_skipped(self):
+        frame = self._frames()[0].image
+        config = DetectorConfig(
+            enable_intensity_normalization=False,
+            enable_gaussian_blur=False,
+            enable_hough_clahe=False,
+            enable_hough_median_blur=False,
+        )
+        _, stages = inspect_frame(frame, config)
+        np.testing.assert_array_equal(stages[2].image, stages[1].image)
+        np.testing.assert_array_equal(stages[3].image, stages[2].image)
+        np.testing.assert_array_equal(stages[4].image, stages[3].image)
+        np.testing.assert_array_equal(stages[5].image, stages[4].image)
+        self.assertEqual(stages[2].parameters, "已跳过")
+        self.assertEqual(stages[3].parameters, "已跳过")
+        self.assertEqual(stages[4].parameters, "已跳过")
+        self.assertEqual(stages[5].parameters, "已跳过")
 
     def test_grid_search_returns_best_first_and_does_not_mutate_base(self):
         frames = self._frames()
@@ -48,12 +70,12 @@ class VisionTuningTests(unittest.TestCase):
         results = grid_search(
             frames,
             base,
-            {"min_radius": [8, 18], "circularity_threshold": [0.1, 0.8]},
+            {"hough_param2": [20, 28], "candidate_min_edge_support": [0.1, 0.2]},
             expected_count=1,
         )
         self.assertEqual(len(results), 4)
         self.assertGreaterEqual(results[0].score, results[-1].score)
-        self.assertEqual(base.min_radius, 8.0)
+        self.assertEqual(base.hough_param2, 28.0)
 
     def test_unknown_search_field_is_rejected(self):
         with self.assertRaises(ValueError):

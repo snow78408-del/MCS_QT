@@ -24,10 +24,8 @@ def build_config_from_args(args: argparse.Namespace) -> PipelineConfig:
     config.tracker.kalman.process_noise = float(args.kalman_process_noise)
     config.tracker.kalman.measurement_noise = float(args.kalman_measurement_noise)
 
-    config.detector.detection_mode = args.detection_mode
     config.detector.min_radius = float(args.min_radius)
     config.detector.max_radius = float(args.max_radius)
-    config.detector.circularity_threshold = float(args.circularity_threshold)
 
     config.beads.mode = args.bead_mode
     config.beads.area_min = int(args.bead_area_min)
@@ -69,12 +67,10 @@ def main() -> None:
     parser.add_argument("--max-frames", type=int, default=None, help="Process only first N frames")
 
     parser.add_argument("--tracker", choices=["nearest", "kalman"], default="nearest")
-    parser.add_argument("--detection-mode", choices=["split_connected", "no_split"], default="split_connected")
     parser.add_argument("--bead-mode", choices=["intensity", "connected"], default="intensity")
 
     parser.add_argument("--min-radius", type=float, default=18.0)
     parser.add_argument("--max-radius", type=float, default=32.0)
-    parser.add_argument("--circularity-threshold", type=float, default=0.15)
     parser.add_argument("--match-distance", type=float, default=90.0)
     parser.add_argument("--max-unmatched-frames", type=int, default=8)
 

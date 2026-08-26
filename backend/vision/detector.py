@@ -38,6 +38,7 @@ class DropletDetector:
         self._runtime_min_radius = max(1.0, float(config.min_radius))
         self._runtime_max_radius = max(self._runtime_min_radius + 1.0, float(config.max_radius))
         configured_preferred = float(config.expected_radius or config.hough_preferred_radius)
+        self._has_expected_size = configured_preferred > 0.0
         self._runtime_preferred_radius = (
             configured_preferred
             if configured_preferred > 0.0
@@ -69,6 +70,7 @@ class DropletDetector:
         self._runtime_max_radius = runtime_max
         self._runtime_preferred_radius = min(runtime_max, max(runtime_min, expected))
         self._configured_preferred_radius = float(self._runtime_preferred_radius)
+        self._has_expected_size = True
 
     def reset_adaptive_size(self) -> None:
         self._runtime_preferred_radius = float(self._configured_preferred_radius)
@@ -88,49 +90,31 @@ class DropletDetector:
         preferred = float(np.median(np.asarray(values, dtype=np.float32)))
         self._runtime_preferred_radius = preferred
         self._configured_preferred_radius = preferred
+        self._has_expected_size = True
         return preferred
 
     def detect(self, gray_frame: np.ndarray, mode: Optional[str] = None) -> DetectionResult:
         gray = self._ensure_gray(gray_frame)
-        normalized = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+        normalized = (
+            cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+            if self._config.enable_intensity_normalization
+            else gray.copy()
+        )
 
         blur_size = self._odd(self._config.gaussian_blur_size)
-        smoothed = cv2.GaussianBlur(normalized, (blur_size, blur_size), 0) if blur_size > 1 else normalized
+        smoothed = (
+            cv2.GaussianBlur(normalized, (blur_size, blur_size), 0)
+            if self._config.enable_gaussian_blur and blur_size > 1
+            else normalized
+        )
 
-        _, binary = cv2.threshold(smoothed, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        binary = self._morphology_clean(binary)
-
-        detect_mode = mode or self._config.detection_mode
-        cut_line = int(binary.shape[0] * self._config.cut_line_ratio)
-
-        if detect_mode == "no_split":
-            centers, radii = self._detect_no_split(binary, cut_line)
-        else:
-            centers, radii = self._detect_split_connected(binary, cut_line)
-
-        if self._config.hough_fallback_only:
-            centers, radii = self._score_and_suppress_candidates(normalized, centers, radii)
-            if not centers and self._config.enable_hough_candidates:
-                centers, radii = self._detect_hough_candidates(normalized, cut_line)
-                centers, radii = self._score_and_suppress_candidates(normalized, centers, radii)
-            if not centers and (
-                self._config.enable_intensity_peak_candidates
-                or self._config.enable_intensity_peak_fallback
-            ):
-                centers, radii = self._detect_intensity_peak_candidates(normalized, cut_line)
-                centers, radii = self._score_and_suppress_candidates(normalized, centers, radii)
-        else:
-            if self._config.enable_hough_candidates:
-                hough_centers, hough_radii = self._detect_hough_candidates(normalized, cut_line)
-                centers.extend(hough_centers)
-                radii.extend(hough_radii)
-            if self._config.enable_intensity_peak_candidates or (
-                self._config.enable_intensity_peak_fallback and not centers
-            ):
-                peak_centers, peak_radii = self._detect_intensity_peak_candidates(normalized, cut_line)
-                centers.extend(peak_centers)
-                radii.extend(peak_radii)
-            centers, radii = self._score_and_suppress_candidates(normalized, centers, radii)
+        # Hough gradient circles are the sole candidate source. Connected
+        # components and intensity peaks are intentionally not fused or used
+        # as fallbacks, so every accepted droplet has explicit circular-edge
+        # evidence from the Hough transform.
+        cut_line = int(smoothed.shape[0] * self._config.cut_line_ratio)
+        centers, radii = self._detect_hough_candidates(smoothed, cut_line)
+        centers, radii = self._score_and_suppress_candidates(normalized, centers, radii)
         helper_mask = self._build_bead_helper_mask(normalized)
         debug_image = np.empty((0, 0, 3), dtype=np.uint8)
 
@@ -141,230 +125,32 @@ class DropletDetector:
             return frame
         return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    def _morphology_clean(self, binary: np.ndarray) -> np.ndarray:
-        open_k = self._odd(self._config.morphology_open_kernel)
-        close_k = self._odd(self._config.morphology_close_kernel)
-        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_k, open_k))
-        kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k, close_k))
-        cleaned = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_open)
-        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel_close)
-        return cleaned
-
-    def _detect_no_split(self, binary: np.ndarray, cut_line: int) -> Tuple[List[np.ndarray], List[float]]:
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        centers: List[np.ndarray] = []
-        radii: List[float] = []
-
-        for contour in contours:
-            area = float(cv2.contourArea(contour))
-            if area < self._config.min_contour_area:
-                continue
-
-            perimeter = float(cv2.arcLength(contour, True))
-            if perimeter <= 1e-6:
-                continue
-
-            circularity = 4.0 * np.pi * area / (perimeter * perimeter)
-            if circularity < self._config.circularity_threshold:
-                continue
-
-            radius = float(np.sqrt(area / np.pi))
-            if radius < self._runtime_min_radius or radius > self._runtime_max_radius:
-                continue
-
-            moments = cv2.moments(contour)
-            if abs(moments["m00"]) <= 1e-6:
-                continue
-
-            cx = float(moments["m10"] / moments["m00"])
-            cy = float(moments["m01"] / moments["m00"])
-            if cy > cut_line:
-                continue
-
-            centers.append(np.array([cx, cy], dtype=np.float32))
-            radii.append(radius)
-
-        return centers, radii
-
-    def _detect_intensity_peak_candidates(
+    def _detect_hough_candidates(
         self,
         normalized_gray: np.ndarray,
         cut_line: int,
+        trace: dict[str, object] | None = None,
     ) -> Tuple[List[np.ndarray], List[float]]:
-        """Seed partially occluded droplets from bright interior maxima."""
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(normalized_gray)
-        blurred = cv2.GaussianBlur(enhanced, (9, 9), 0)
-        peak_kernel_size = self._odd(
-            max(
-                5,
-                int(
-                    round(
-                        self._runtime_preferred_radius
-                        * float(self._config.intensity_peak_kernel_radius_ratio)
-                    )
-                ),
-            )
-        )
-        peak_kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE,
-            (peak_kernel_size, peak_kernel_size),
-        )
-        dilated = cv2.dilate(blurred, peak_kernel)
-        percentile = min(99.0, max(1.0, float(self._config.intensity_peak_percentile)))
-        brightness_floor = float(np.percentile(blurred, percentile))
-        maxima = (
-            (blurred >= (dilated - 1.0))
-            & (blurred >= brightness_floor)
-        ).astype(np.uint8)
-        count, _, _, centroids = cv2.connectedComponentsWithStats(
-            maxima,
-            8,
-            cv2.CV_32S,
-        )
-
-        edges = cv2.Canny(cv2.medianBlur(enhanced, 5), 50, 150)
-        support_edges = self._build_support_edges(edges)
-        min_radius = max(
-            self._runtime_min_radius,
-            self._runtime_preferred_radius
-            * float(self._config.intensity_peak_min_radius_ratio),
-        )
-        max_radius = min(
-            self._runtime_max_radius,
-            self._runtime_preferred_radius
-            * float(self._config.intensity_peak_max_radius_ratio),
-        )
-        if max_radius < min_radius:
-            return [], []
-
-        margin = max(2.0, min_radius)
-        height, width = normalized_gray.shape[:2]
-        seeds: list[tuple[float, np.ndarray, float]] = []
-        for label in range(1, count):
-            cx, cy = (float(value) for value in centroids[label])
-            if cy > float(cut_line):
-                continue
-            if cx < margin or cy < margin or cx >= width - margin or cy >= height - margin:
-                continue
-
-            best: tuple[float, float] | None = None
-            for radius in np.arange(min_radius, max_radius + 0.5, 1.0):
-                edge_support = self._circle_edge_support(
-                    support_edges,
-                    cx,
-                    cy,
-                    float(radius),
-                )
-                if edge_support < float(self._config.intensity_peak_min_edge_support):
-                    continue
-                center_contrast = self._center_contrast(
-                    enhanced,
-                    cx,
-                    cy,
-                    float(radius),
-                )
-                if center_contrast < float(self._config.candidate_min_center_contrast):
-                    continue
-                ring_contrast = self._ring_contrast(
-                    enhanced,
-                    cx,
-                    cy,
-                    float(radius),
-                )
-                radius_score = max(
-                    0.0,
-                    1.0
-                    - abs(float(radius) - self._runtime_preferred_radius)
-                    / max(1.0, max_radius - min_radius),
-                )
-                score = (
-                    0.50 * edge_support
-                    + 0.20 * min(1.0, center_contrast / 0.25)
-                    + 0.15 * min(1.0, max(0.0, ring_contrast) / 0.10)
-                    + 0.15 * radius_score
-                )
-                if best is None or score > best[0]:
-                    best = (float(score), float(radius))
-            if best is not None:
-                seeds.append(
-                    (
-                        best[0],
-                        np.array([cx, cy], dtype=np.float32),
-                        best[1],
-                    )
-                )
-
-        seeds.sort(key=lambda item: item[0], reverse=True)
-        seeds = seeds[: max(1, int(self._config.intensity_peak_max_candidates))]
-        return [item[1] for item in seeds], [item[2] for item in seeds]
-
-    def _detect_split_connected(self, binary: np.ndarray, cut_line: int) -> Tuple[List[np.ndarray], List[float]]:
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats((binary > 0).astype(np.uint8), 8, cv2.CV_32S)
-
-        single_max_area = np.pi * (self._runtime_max_radius ** 2) * self._config.split_large_area_ratio
-        centers: List[np.ndarray] = []
-        radii: List[float] = []
-
-        for label in range(1, num_labels):
-            area = float(stats[label, cv2.CC_STAT_AREA])
-            component_mask = (labels == label).astype(np.uint8) * 255
-
-            if area <= single_max_area:
-                c_centers, c_radii = self._detect_no_split(component_mask, cut_line)
-            else:
-                c_centers, c_radii = self._split_component(component_mask, cut_line)
-
-            centers.extend(c_centers)
-            radii.extend(c_radii)
-
-        return centers, radii
-
-    def _split_component(self, component_mask: np.ndarray, cut_line: int) -> Tuple[List[np.ndarray], List[float]]:
-        dist = cv2.distanceTransform(component_mask, cv2.DIST_L2, 5)
-        kernel_size = self._odd(max(3, int(self._runtime_preferred_radius * 0.9)))
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-        dilated = cv2.dilate(dist, kernel)
-
-        peak_threshold = max(
-            1.0,
-            self._runtime_min_radius * self._config.split_peak_threshold_ratio,
-        )
-        local_peaks = ((dist >= (dilated - 1e-6)) & (dist > peak_threshold)).astype(np.uint8)
-
-        num_labels, _, _, centroids = cv2.connectedComponentsWithStats(local_peaks, 8, cv2.CV_32S)
-        centers: List[np.ndarray] = []
-        radii: List[float] = []
-
-        for label in range(1, num_labels):
-            cx, cy = centroids[label]
-            x = int(round(cx))
-            y = int(round(cy))
-            if y < 0 or y >= dist.shape[0] or x < 0 or x >= dist.shape[1]:
-                continue
-
-            radius = float(dist[y, x])
-            split_min = self._runtime_min_radius * float(self._config.split_min_radius_ratio)
-            if radius < split_min or radius > self._runtime_max_radius:
-                continue
-            if y > cut_line:
-                continue
-
-            centers.append(np.array([cx, cy], dtype=np.float32))
-            radii.append(radius)
-
-        if centers:
-            return centers, radii
-        return self._detect_no_split(component_mask, cut_line)
-
-    def _detect_hough_candidates(self, normalized_gray: np.ndarray, cut_line: int) -> Tuple[List[np.ndarray], List[float]]:
         hough_gray, scale = self._prepare_hough_frame(normalized_gray)
         scaled_cut_line = int(float(cut_line) * scale)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(hough_gray)
-        blurred = cv2.medianBlur(enhanced, 5)
+        enhanced = clahe.apply(hough_gray) if self._config.enable_hough_clahe else hough_gray
+        blurred = cv2.medianBlur(enhanced, 5) if self._config.enable_hough_median_blur else enhanced
         edges = cv2.Canny(blurred, 50, 150)
         support_edges = self._build_support_edges(edges)
+        if trace is not None:
+            trace.update(
+                {
+                    "work_gray": hough_gray,
+                    "scale": scale,
+                    "enhanced": enhanced,
+                    "median_blurred": blurred,
+                    "edges": edges,
+                    "support_edges": support_edges,
+                    "raw_centers": [],
+                    "raw_radii": [],
+                }
+            )
         circles = cv2.HoughCircles(
             blurred,
             cv2.HOUGH_GRADIENT,
@@ -378,8 +164,16 @@ class DropletDetector:
         if circles is None:
             return [], []
 
+        raw_circles = np.round(circles[0]).astype(np.float32)
+        if trace is not None:
+            trace["raw_centers"] = [
+                np.array([float(cx) / scale, float(cy) / scale], dtype=np.float32)
+                for cx, cy, _radius in raw_circles
+            ]
+            trace["raw_radii"] = [float(radius) / scale for _cx, _cy, radius in raw_circles]
+
         candidates: List[Tuple[float, float, float]] = []
-        for cx, cy, radius in np.round(circles[0]).astype(np.float32):
+        for cx, cy, radius in raw_circles:
             if float(cy) > float(scaled_cut_line):
                 continue
             original_radius = float(radius) / scale
@@ -396,6 +190,19 @@ class DropletDetector:
         candidates = sorted(candidates, key=lambda item: self._candidate_priority(float(item[2])))
         max_candidates = max(1, int(self._config.hough_max_candidates))
         candidates = candidates[:max_candidates]
+        if trace is not None:
+            trace["geometric_centers"] = [np.array([cx, cy], dtype=np.float32) for cx, cy, _radius in candidates]
+            trace["geometric_radii"] = [float(radius) for _cx, _cy, radius in candidates]
+
+        candidates = self._filter_expected_size(candidates)
+        if trace is not None:
+            trace["size_centers"] = [np.array([cx, cy], dtype=np.float32) for cx, cy, _radius in candidates]
+            trace["size_radii"] = [float(radius) for _cx, _cy, radius in candidates]
+        if self._config.enable_edge_ownership_filter and len(candidates) > 1:
+            candidates = self._filter_edge_ownership(edges, candidates, scale)
+        if trace is not None:
+            trace["owned_centers"] = [np.array([cx, cy], dtype=np.float32) for cx, cy, _radius in candidates]
+            trace["owned_radii"] = [float(radius) for _cx, _cy, radius in candidates]
 
         centers: List[np.ndarray] = []
         radii: List[float] = []
@@ -459,6 +266,87 @@ class DropletDetector:
             if child_count >= min_children:
                 continue
             kept.append((cx, cy, radius))
+        return kept
+
+    def _filter_expected_size(
+        self,
+        candidates: List[Tuple[float, float, float]],
+    ) -> List[Tuple[float, float, float]]:
+        if not self._config.enable_expected_size_filter or not self._has_expected_size:
+            return candidates
+        tolerance = max(0.0, float(self._config.expected_radius_tolerance_ratio))
+        preferred = float(self._runtime_preferred_radius)
+        minimum = preferred * max(0.0, 1.0 - tolerance)
+        maximum = preferred * (1.0 + tolerance)
+        return [item for item in candidates if minimum <= float(item[2]) <= maximum]
+
+    def _filter_edge_ownership(
+        self,
+        edges: np.ndarray,
+        candidates: List[Tuple[float, float, float]],
+        scale: float,
+    ) -> List[Tuple[float, float, float]]:
+        """Reject circles whose supporting pixels belong to neighbouring circles.
+
+        Each candidate perimeter is sampled angularly. The nearest real edge
+        pixel is assigned to the candidate circle with the smallest radial
+        residual. A false circle assembled from several neighbouring arcs has
+        little uniquely owned support even when its total edge support is high.
+        """
+        scaled = [
+            (float(cx) * scale, float(cy) * scale, float(radius) * scale)
+            for cx, cy, radius in candidates
+        ]
+        search = max(1, int(round(float(self._config.edge_ownership_search_radius) * scale)))
+        margin = max(0.0, float(self._config.edge_ownership_margin) * scale)
+        minimum_ratio = min(1.0, max(0.0, float(self._config.edge_ownership_min_ratio)))
+        height, width = edges.shape[:2]
+        kept: List[Tuple[float, float, float]] = []
+
+        for index, ((cx, cy, radius), original) in enumerate(zip(scaled, candidates)):
+            neighbor_indices = [
+                other_index
+                for other_index, (ox, oy, other_radius) in enumerate(scaled)
+                if other_index != index
+                and float(np.hypot(cx - ox, cy - oy))
+                <= radius + other_radius + float(search * 2)
+            ]
+            if not neighbor_indices:
+                kept.append(original)
+                continue
+            xs, ys = self._circle_offsets(radius)
+            supported = 0
+            owned = 0
+            for offset_x, offset_y in zip(xs, ys):
+                expected_x = int(round(cx + float(offset_x)))
+                expected_y = int(round(cy + float(offset_y)))
+                x0 = max(0, expected_x - search)
+                x1 = min(width, expected_x + search + 1)
+                y0 = max(0, expected_y - search)
+                y1 = min(height, expected_y + search + 1)
+                if x0 >= x1 or y0 >= y1:
+                    continue
+                edge_y, edge_x = np.nonzero(edges[y0:y1, x0:x1])
+                if edge_x.size == 0:
+                    continue
+                absolute_x = edge_x.astype(np.float32) + float(x0)
+                absolute_y = edge_y.astype(np.float32) + float(y0)
+                nearest = int(
+                    np.argmin((absolute_x - expected_x) ** 2 + (absolute_y - expected_y) ** 2)
+                )
+                px = float(absolute_x[nearest])
+                py = float(absolute_y[nearest])
+                supported += 1
+                own_residual = abs(float(np.hypot(px - cx, py - cy)) - radius)
+                other_residual = min(
+                    abs(float(np.hypot(px - scaled[other_index][0], py - scaled[other_index][1])) - scaled[other_index][2])
+                    for other_index in neighbor_indices
+                )
+                if own_residual + margin < other_residual:
+                    owned += 1
+            ownership_ratio = float(owned) / float(supported) if supported else 0.0
+            if ownership_ratio >= minimum_ratio:
+                kept.append(original)
         return kept
 
     def _circle_edge_support(self, edges: np.ndarray, cx: float, cy: float, radius: float) -> float:

@@ -4,37 +4,63 @@ import json
 import sys
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any, Callable
 
 import cv2
-from PySide6.QtCore import QObject, QThread, Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QDialog, QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
-    QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton,
-    QScrollArea, QSlider, QSpinBox, QVBoxLayout, QWidget,
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QFileDialog,
+    QFormLayout,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QScrollArea,
+    QSlider,
+    QVBoxLayout,
+    QWidget,
 )
 
 from backend.vision.config import DetectorConfig
-from backend.vision.tuning import (
-    SEARCHABLE_FIELDS, PipelineStage, grid_search, inspect_frame, read_video_frames,
-)
+from backend.vision.tuning import PipelineStage, TuningFrame, inspect_frame, read_video_frames
 
 
-class SearchWorker(QObject):
-    done = Signal(object)
-    failed = Signal(str)
+_INTEGER_PARAMETERS = {
+    "gaussian_blur_size",
+    "hough_edge_neighborhood",
+    "edge_ownership_search_radius",
+}
 
-    def __init__(self, path: str, max_frames: int, expected: float, base: DetectorConfig, grid: dict):
-        super().__init__()
-        self.path, self.max_frames, self.expected, self.base, self.grid = path, max_frames, expected, base, grid
-
-    def run(self) -> None:
-        try:
-            frames = read_video_frames(self.path, self.max_frames)
-            results = grid_search(frames, self.base, self.grid, self.expected)
-            self.done.emit(results)
-        except Exception as exc:
-            self.failed.emit(str(exc))
+# Algorithm-safe slider ranges: (minimum, maximum, step). Text entry remains
+# available for exact values, while sliders cover the useful operating range.
+_PARAMETER_RANGES: dict[str, tuple[float, float, float]] = {
+    "gaussian_blur_size": (1.0, 31.0, 2.0),
+    "hough_param1": (10.0, 300.0, 1.0),
+    "hough_dp": (1.0, 3.0, 0.05),
+    "hough_min_distance": (0.0, 200.0, 1.0),
+    "hough_param2": (5.0, 100.0, 1.0),
+    "min_radius": (1.0, 300.0, 1.0),
+    "max_radius": (2.0, 300.0, 1.0),
+    "hough_min_radius": (1.0, 300.0, 1.0),
+    "hough_max_radius": (2.0, 300.0, 1.0),
+    "hough_edge_support_threshold": (0.0, 1.0, 0.01),
+    "hough_edge_neighborhood": (0.0, 8.0, 1.0),
+    "expected_radius": (0.0, 300.0, 1.0),
+    "expected_radius_tolerance_ratio": (0.0, 1.0, 0.01),
+    "edge_ownership_search_radius": (1.0, 10.0, 1.0),
+    "edge_ownership_margin": (0.0, 5.0, 0.05),
+    "edge_ownership_min_ratio": (0.0, 1.0, 0.01),
+    "candidate_min_edge_support": (0.0, 1.0, 0.01),
+    "candidate_full_circle_ratio": (0.0, 1.0, 0.01),
+}
 
 
 def _pixmap(image) -> QPixmap:
@@ -47,24 +73,156 @@ def _pixmap(image) -> QPixmap:
     return QPixmap.fromImage(qimage)
 
 
+class _NoWheelSlider(QSlider):
+    """Prevent accidental parameter changes when scrolling over a slider."""
+
+    def wheelEvent(self, event) -> None:  # noqa: N802 - Qt API
+        event.ignore()
+
+
+class NumberSlider(QWidget):
+    value_changed = Signal(object)
+
+    def __init__(
+        self,
+        value: int | float,
+        minimum: float,
+        maximum: float,
+        step: float,
+        integer: bool,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.minimum = float(minimum)
+        self.maximum = float(maximum)
+        self.step = max(1e-9, float(step))
+        self.integer = bool(integer)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        self.slider = _NoWheelSlider(Qt.Horizontal)
+        self.slider.setRange(0, int(round((self.maximum - self.minimum) / self.step)))
+        self.slider.setMinimumWidth(150)
+        self.slider.setToolTip(
+            f"滑条范围 {self.minimum:g}–{self.maximum:g}，步长 {self.step:g}；松开后刷新"
+        )
+        self.input = QLineEdit()
+        self.input.setMaximumWidth(76)
+        self.input.setAlignment(Qt.AlignRight)
+        self.input.setToolTip("可直接输入精确数值；停止输入 500ms 后刷新")
+        layout.addWidget(self.slider, 1)
+        layout.addWidget(self.input)
+
+        self._set_controls(float(value))
+        self.slider.valueChanged.connect(self._slider_changed)
+        self.slider.sliderReleased.connect(lambda: self.value_changed.emit(self._slider_value()))
+        self.input.textChanged.connect(self.value_changed.emit)
+        self.input.editingFinished.connect(self._input_finished)
+
+    def _slider_value(self) -> int | float:
+        value = self.minimum + self.slider.value() * self.step
+        return int(round(value)) if self.integer else float(value)
+
+    def _format(self, value: float) -> str:
+        if self.integer:
+            return str(int(round(value)))
+        decimals = 0
+        step = self.step
+        while decimals < 4 and abs(step - round(step)) > 1e-9:
+            step *= 10.0
+            decimals += 1
+        return f"{value:.{decimals}f}"
+
+    def _set_controls(self, value: float) -> None:
+        bounded = min(self.maximum, max(self.minimum, float(value)))
+        position = int(round((bounded - self.minimum) / self.step))
+        self.slider.setValue(position)
+        self.input.setText(self._format(float(value)))
+
+    def _slider_changed(self, _position: int) -> None:
+        # Updating the displayed value is safe while dragging, but detection
+        # must only be triggered by sliderReleased below. This prevents a
+        # costly redraw from interrupting an in-progress drag.
+        value = self._slider_value()
+        self.input.blockSignals(True)
+        self.input.setText(self._format(float(value)))
+        self.input.blockSignals(False)
+
+    def _input_finished(self) -> None:
+        try:
+            value = float(self.input.text())
+        except ValueError:
+            return
+        normalized = int(round(value)) if self.integer else float(value)
+        bounded = min(self.maximum, max(self.minimum, float(normalized)))
+        position = int(round((bounded - self.minimum) / self.step))
+        self.slider.blockSignals(True)
+        self.slider.setValue(position)
+        self.slider.blockSignals(False)
+        self.input.blockSignals(True)
+        self.input.setText(self._format(float(normalized)))
+        self.input.blockSignals(False)
+        self.value_changed.emit(normalized)
+
+
+class _StageImage(QLabel):
+    double_clicked = Signal()
+
+    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802 - Qt API
+        self.double_clicked.emit()
+        super().mouseDoubleClickEvent(event)
+
+
 class StageCard(QGroupBox):
-    def __init__(self, stage: PipelineStage, parent=None) -> None:
+    parameter_changed = Signal(str, object)
+    parameter_reset = Signal(str)
+
+    def __init__(self, stage: PipelineStage, controls: list[dict[str, Any]], parent=None) -> None:
         super().__init__(stage.name, parent)
         self.stage = stage
-        self.setMinimumWidth(275)
+        self.setMinimumWidth(390)
         layout = QVBoxLayout(self)
-        image = QLabel()
+
+        image = _StageImage()
         image.setAlignment(Qt.AlignCenter)
-        image.setMinimumHeight(170)
+        image.setToolTip("双击图像放大查看")
+        image.double_clicked.connect(self._zoom)
+        image.setMinimumHeight(220)
         image.setStyleSheet("background:#111827;border-radius:5px")
-        image.setPixmap(_pixmap(stage.image).scaled(300, 185, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        image.setPixmap(_pixmap(stage.image).scaled(440, 270, Qt.KeepAspectRatio, Qt.SmoothTransformation))
         layout.addWidget(image)
+
         description = QLabel(stage.description)
         description.setWordWrap(True)
         description.setStyleSheet("font-weight:400;color:#475569")
         layout.addWidget(description)
+
+        if controls:
+            form = QFormLayout()
+            form.setContentsMargins(0, 4, 0, 0)
+            for spec in controls:
+                widget = self._control_widget(spec)
+                label = QLabel(str(spec["label"]))
+                if spec.get("modified", False):
+                    label.setText(f'<span style="color:#dc2626">{spec["label"]}</span>')
+                    label.setTextFormat(Qt.RichText)
+                    label.setToolTip("此参数已偏离打开页面时的原设定")
+                    reset = QPushButton("恢复")
+                    reset.setFixedWidth(52)
+                    reset.setToolTip("恢复此参数的原设定")
+                    reset.clicked.connect(lambda _checked=False, name=str(spec["key"]): self.parameter_reset.emit(name))
+                    row = QWidget()
+                    row_layout = QHBoxLayout(row)
+                    row_layout.setContentsMargins(0, 0, 0, 0)
+                    row_layout.addWidget(widget, 1)
+                    row_layout.addWidget(reset)
+                    widget = row
+                form.addRow(label, widget)
+            layout.addLayout(form)
+
         if stage.parameters:
-            parameters = QLabel("参数：" + stage.parameters)
+            parameters = QLabel("当前操作：" + stage.parameters)
             parameters.setWordWrap(True)
             parameters.setStyleSheet("font-weight:400;color:#1d4ed8")
             layout.addWidget(parameters)
@@ -73,9 +231,46 @@ class StageCard(QGroupBox):
             statistics.setWordWrap(True)
             statistics.setStyleSheet("font-weight:600;color:#166534")
             layout.addWidget(statistics)
-        zoom = QPushButton("放大查看")
-        zoom.clicked.connect(self._zoom)
-        layout.addWidget(zoom)
+
+    def _control_widget(self, spec: dict[str, Any]) -> QWidget:
+        key = str(spec["key"])
+        kind = str(spec.get("kind", "number"))
+        value = spec.get("value")
+        if kind == "check":
+            widget = QCheckBox(str(spec.get("text", "启用此步骤")))
+            widget.setChecked(bool(value))
+            widget.toggled.connect(lambda checked, name=key: self.parameter_changed.emit(name, checked))
+            return widget
+        if kind == "choice":
+            widget = QComboBox()
+            for label, option_value in spec["options"]:
+                widget.addItem(label, option_value)
+            index = widget.findData(value)
+            widget.setCurrentIndex(max(0, index))
+            widget.currentIndexChanged.connect(
+                lambda _index, combo=widget, name=key: self.parameter_changed.emit(name, combo.currentData())
+            )
+            return widget
+
+        slider_range = _PARAMETER_RANGES.get(key)
+        if slider_range is not None:
+            minimum, maximum, step = slider_range
+            widget = NumberSlider(
+                value,
+                minimum,
+                maximum,
+                step,
+                key in _INTEGER_PARAMETERS,
+            )
+            widget.value_changed.connect(
+                lambda changed, name=key: self.parameter_changed.emit(name, changed)
+            )
+            return widget
+
+        widget = QLineEdit(str(value))
+        widget.setMaximumWidth(180)
+        widget.textChanged.connect(lambda text, name=key: self.parameter_changed.emit(name, text))
+        return widget
 
     def _zoom(self) -> None:
         dialog = QDialog(self)
@@ -86,7 +281,13 @@ class StageCard(QGroupBox):
         image.setAlignment(Qt.AlignCenter)
         image.setPixmap(_pixmap(self.stage.image).scaled(940, 650, Qt.KeepAspectRatio, Qt.SmoothTransformation))
         layout.addWidget(image, 1)
-        details = QLabel("\n".join(value for value in (self.stage.description, self.stage.parameters, self.stage.statistics) if value))
+        details = QLabel(
+            "\n".join(
+                value
+                for value in (self.stage.description, self.stage.parameters, self.stage.statistics)
+                if value
+            )
+        )
         details.setWordWrap(True)
         layout.addWidget(details)
         dialog.exec()
@@ -97,163 +298,264 @@ class TuningWindow(QWidget):
         super().__init__(parent)
         self.setWindowTitle("液滴识别算法调参工作台")
         self.resize(1280, 820)
-        self.frames = []
+        self.frames: list[TuningFrame] = []
         self.frame_pos = 0
+        self.original_config = DetectorConfig()
         self.current_config = DetectorConfig()
-        self.worker_thread: QThread | None = None
-        self.worker: SearchWorker | None = None
-        self._fields: dict[str, QLineEdit] = {}
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.setInterval(500)
+        self._refresh_timer.timeout.connect(self._redraw)
         self._build(initial_video)
 
     def _build(self, initial_video: str) -> None:
-        root = self
-        outer = QHBoxLayout(root)
-        outer.setSpacing(14)
-        control_panel = QWidget()
-        controls = QVBoxLayout(control_panel)
-        controls.setContentsMargins(0, 0, 0, 0)
-        preview = QVBoxLayout()
-        source = QGroupBox("1. 视频样本"); source_form = QFormLayout(source)
-        self.video = QLineEdit(initial_video); browse = QPushButton("浏览…"); browse.clicked.connect(self._browse)
-        row = QHBoxLayout(); row.addWidget(self.video); row.addWidget(browse); source_form.addRow("视频", row)
-        self.max_frames = QSpinBox(); self.max_frames.setRange(1, 2000); self.max_frames.setValue(80); source_form.addRow("搜索帧数", self.max_frames)
-        self.expected = QLineEdit("1"); source_form.addRow("期望液滴数/帧", self.expected)
-        load = QPushButton("加载视频样本"); load.clicked.connect(self._load); source_form.addRow("", load); controls.addWidget(source)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(8)
 
-        params = QGroupBox("2. 检测参数（修改后点击重新识别）"); form = QFormLayout(params)
-        editable = ("min_radius", "max_radius", "circularity_threshold", "gaussian_blur_size", "morphology_open_kernel", "morphology_close_kernel", "candidate_min_edge_support", "candidate_full_circle_ratio", "hough_param2")
-        for key in editable:
-            field = QLineEdit(str(getattr(self.current_config, key))); self._fields[key] = field; form.addRow(key, field)
-        redraw = QPushButton("重新识别当前帧"); redraw.clicked.connect(self._redraw); form.addRow("", redraw); controls.addWidget(params)
+        toolbar = QHBoxLayout()
+        toolbar.addWidget(QLabel("样本"))
+        self.video = QLineEdit(initial_video)
+        self.video.setPlaceholderText("选择本地视频或图像文件")
+        toolbar.addWidget(self.video, 2)
+        browse = QPushButton("选择样本…")
+        browse.clicked.connect(self._browse)
+        toolbar.addWidget(browse)
+        self.video.editingFinished.connect(self._load)
+        previous = QPushButton("上一帧")
+        previous.clicked.connect(lambda: self.slider.setValue(max(0, self.slider.value() - 1)))
+        toolbar.addWidget(previous)
+        self.slider = _NoWheelSlider(Qt.Horizontal)
+        self.slider.setRange(0, 0)
+        self.slider.setMinimumWidth(160)
+        self.slider.valueChanged.connect(self._slider_changed)
+        toolbar.addWidget(self.slider, 1)
+        next_frame = QPushButton("下一帧")
+        next_frame.clicked.connect(lambda: self.slider.setValue(min(self.slider.maximum(), self.slider.value() + 1)))
+        toolbar.addWidget(next_frame)
+        save = QPushButton("保存参数")
+        save.clicked.connect(self._save)
+        toolbar.addWidget(save)
+        self.reset = QPushButton("回退参数修改")
+        self.reset.setEnabled(False)
+        self.reset.clicked.connect(self._reset_parameters)
+        toolbar.addWidget(self.reset)
+        layout.addLayout(toolbar)
 
-        search = QGroupBox("3. 自动参数搜索（无人工标注的启发式评分）"); search_form = QFormLayout(search)
-        search_form.addRow(QLabel("每行格式：参数=值1,值2；只搜索下方支持的参数"))
-        self.grid_text = QPlainTextEdit("min_radius=12,18,24\nmax_radius=32,40,50\ncircularity_threshold=0.12,0.2\nhough_param2=24,28,32")
-        self.grid_text.setMinimumHeight(115); search_form.addRow(self.grid_text)
-        self.search_button = QPushButton("开始自动搜索"); self.search_button.clicked.connect(self._search); search_form.addRow("", self.search_button)
-        controls.addWidget(search); controls.addStretch()
-        control_scroll = QScrollArea()
-        control_scroll.setWidgetResizable(True)
-        control_scroll.setMinimumWidth(440)
-        control_scroll.setWidget(control_panel)
-        outer.addWidget(control_scroll, 0)
+        self.status = QLabel("等待加载样本；参数修改或步骤开关变化后，将在 500ms 内自动刷新。")
+        self.status.setStyleSheet("color:#475569;padding:2px 4px")
+        layout.addWidget(self.status)
 
-        stage_header = QLabel("算法处理步骤总览（点击“重新识别当前帧”后更新）")
-        stage_header.setStyleSheet("font-size:18px;font-weight:700")
-        preview.addWidget(stage_header)
         self.stage_container = QWidget()
         self.stage_grid = QGridLayout(self.stage_container)
         self.stage_grid.setContentsMargins(6, 6, 6, 6)
         self.stage_grid.setSpacing(12)
-        self.stage_placeholder = QLabel("请选择视频并加载样本")
-        self.stage_placeholder.setAlignment(Qt.AlignCenter)
-        self.stage_placeholder.setMinimumHeight(420)
-        self.stage_placeholder.setStyleSheet("background:#111827;color:#cbd5e1;border-radius:6px")
-        self.stage_grid.addWidget(self.stage_placeholder, 0, 0, 1, 2)
-        stage_scroll = QScrollArea()
-        stage_scroll.setWidgetResizable(True)
-        stage_scroll.setWidget(self.stage_container)
-        preview.addWidget(stage_scroll, 1)
-        self.slider = QSlider(Qt.Horizontal); self.slider.setRange(0, 0); self.slider.valueChanged.connect(self._slider_changed); preview.addWidget(self.slider)
-        nav = QHBoxLayout(); prev = QPushButton("上一帧"); prev.clicked.connect(lambda: self.slider.setValue(max(0, self.slider.value()-1))); nxt = QPushButton("下一帧"); nxt.clicked.connect(lambda: self.slider.setValue(min(self.slider.maximum(), self.slider.value()+1))); nav.addWidget(prev); nav.addWidget(nxt)
-        self.status = QLabel("等待加载"); nav.addWidget(self.status, 1)
-        save = QPushButton("保存当前参数 JSON"); save.clicked.connect(self._save); nav.addWidget(save); preview.addLayout(nav)
-        self.results = QPlainTextEdit(); self.results.setReadOnly(True); preview.addWidget(self.results, 0)
-        outer.addLayout(preview, 1)
+        placeholder = QLabel("请选择视频或图像样本")
+        placeholder.setAlignment(Qt.AlignCenter)
+        placeholder.setMinimumHeight(480)
+        placeholder.setStyleSheet("background:#111827;color:#cbd5e1;border-radius:6px")
+        self.stage_grid.addWidget(placeholder, 0, 0, 1, 2)
+        self.stage_scroll = QScrollArea()
+        self.stage_scroll.setWidgetResizable(True)
+        self.stage_scroll.setWidget(self.stage_container)
+        layout.addWidget(self.stage_scroll, 1)
+        if initial_video:
+            QTimer.singleShot(0, self._load)
 
     def _browse(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "选择视频", "", "视频 (*.mp4 *.avi *.mov *.mkv)")
-        if path: self.video.setText(path)
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择样本",
+            "",
+            "样本 (*.mp4 *.avi *.mov *.mkv *.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp)",
+        )
+        if path:
+            self.video.setText(path)
+            self._load()
 
     def _load(self) -> None:
         try:
-            self.frames = read_video_frames(self.video.text().strip(), self.max_frames.value())
-            self.slider.setRange(0, len(self.frames) - 1); self.frame_pos = 0; self._redraw()
-            self.status.setText(f"已加载 {len(self.frames)} 帧")
+            path = self.video.text().strip()
+            suffix = Path(path).suffix.lower()
+            if suffix in {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}:
+                image = cv2.imread(path)
+                if image is None:
+                    raise ValueError(f"无法读取图像：{path}")
+                self.frames = [TuningFrame(0, image)]
+            else:
+                self.frames = read_video_frames(path, max_frames=80)
+            self.slider.blockSignals(True)
+            self.slider.setRange(0, len(self.frames) - 1)
+            self.slider.setEnabled(len(self.frames) > 1)
+            self.slider.setValue(0)
+            self.slider.blockSignals(False)
+            self.frame_pos = 0
+            self._redraw()
         except Exception as exc:
+            self.frames = []
+            self.slider.setEnabled(False)
             QMessageBox.warning(self, "加载失败", str(exc))
 
     def _slider_changed(self, value: int) -> None:
         self.frame_pos = value
-        if self.frames: self._redraw()
+        self._refresh_timer.stop()
+        if self.frames:
+            self._redraw()
 
-    def _config_from_fields(self) -> DetectorConfig:
-        config = DetectorConfig()
-        for key, field in self._fields.items():
-            value = float(field.text())
-            if key in {"gaussian_blur_size", "morphology_open_kernel", "morphology_close_kernel"}:
-                value = int(value)
-            setattr(config, key, value)
-        return config
+    def _parameter_changed(self, key: str, raw_value: object) -> None:
+        try:
+            if isinstance(raw_value, str) and key in _INTEGER_PARAMETERS:
+                setattr(self.current_config, key, int(float(raw_value)))
+            elif isinstance(raw_value, str) and hasattr(self.current_config, key):
+                current = getattr(self.current_config, key)
+                setattr(self.current_config, key, float(raw_value) if isinstance(current, float) else raw_value)
+            elif hasattr(self.current_config, key):
+                setattr(self.current_config, key, raw_value)
+            else:
+                return
+        except (TypeError, ValueError):
+            self.status.setText(f"参数 {key} 尚未输入完成")
+            return
+        self.reset.setEnabled(self._has_modified_parameters())
+        if self.frames:
+            self.status.setText("参数已修改，正在等待自动刷新…")
+            self._refresh_timer.start()
+
+    def _reset_parameter(self, key: str) -> None:
+        if not hasattr(self.original_config, key):
+            return
+        setattr(self.current_config, key, getattr(self.original_config, key))
+        self.reset.setEnabled(self._has_modified_parameters())
+        if self.frames:
+            self.status.setText(f"参数 {key} 已恢复原设定")
+            self._redraw()
+        else:
+            self.status.setText(f"参数 {key} 已恢复原设定")
+
+    def _has_modified_parameters(self) -> bool:
+        return any(
+            getattr(self.current_config, field) != getattr(self.original_config, field)
+            for field in vars(self.original_config)
+        )
+
+    def _reset_parameters(self) -> None:
+        self.current_config = DetectorConfig(**vars(self.original_config))
+        self.reset.setEnabled(False)
+        if self.frames:
+            self._redraw()
+        else:
+            self.status.setText("参数已回退为原设定")
+
+    def _controls_for_stage(self, index: int) -> list[dict[str, Any]]:
+        config = self.current_config
+        controls: dict[int, list[dict[str, Any]]] = {
+            2: [self._check("enable_intensity_normalization", "启用归一化", config.enable_intensity_normalization)],
+            3: [
+                self._check("enable_gaussian_blur", "启用输入平滑", config.enable_gaussian_blur),
+                self._number("gaussian_blur_size", "高斯核大小", config.gaussian_blur_size),
+            ],
+            4: [self._check("enable_hough_clahe", "启用 CLAHE", config.enable_hough_clahe)],
+            5: [self._check("enable_hough_median_blur", "启用中值滤波", config.enable_hough_median_blur)],
+            6: [self._number("hough_param1", "Hough 梯度阈值", config.hough_param1)],
+            7: [
+                self._number("hough_dp", "累加器分辨率 dp", config.hough_dp),
+                self._number("hough_min_distance", "最小圆心距离（0=自动）", config.hough_min_distance),
+                self._number("hough_param2", "圆心累加阈值 param2", config.hough_param2),
+                self._number("min_radius", "绝对最小半径", config.min_radius),
+                self._number("max_radius", "绝对最大半径", config.max_radius),
+                self._number("hough_min_radius", "Hough 最小半径", config.hough_min_radius),
+                self._number("hough_max_radius", "Hough 最大半径", config.hough_max_radius),
+            ],
+            8: [
+                self._number("hough_edge_support_threshold", "Hough 边缘支撑", config.hough_edge_support_threshold),
+                self._number("hough_edge_neighborhood", "边缘邻域", config.hough_edge_neighborhood),
+                self._check("reject_multi_droplet_circles", "拒绝包围多个液滴的圆", config.reject_multi_droplet_circles),
+            ],
+            9: [
+                self._check("enable_expected_size_filter", "启用目标尺寸过滤", config.enable_expected_size_filter),
+                self._number("expected_radius", "期望液滴半径（px）", config.expected_radius),
+                self._number("expected_radius_tolerance_ratio", "半径容差比例", config.expected_radius_tolerance_ratio),
+            ],
+            10: [
+                self._check("enable_edge_ownership_filter", "启用边缘归属过滤", config.enable_edge_ownership_filter),
+                self._number("edge_ownership_search_radius", "边缘搜索半径", config.edge_ownership_search_radius),
+                self._number("edge_ownership_margin", "归属判定间隔", config.edge_ownership_margin),
+                self._number("edge_ownership_min_ratio", "最小独占边缘比例", config.edge_ownership_min_ratio),
+            ],
+            11: [
+                self._number("candidate_min_edge_support", "最终最小边缘支撑", config.candidate_min_edge_support),
+                self._number("candidate_full_circle_ratio", "完整圆比例", config.candidate_full_circle_ratio),
+            ],
+        }
+        return controls.get(index, [])
+
+    def _check(self, key: str, label: str, value: bool) -> dict[str, Any]:
+        return {
+            "key": key,
+            "label": label,
+            "kind": "check",
+            "value": value,
+            "text": "执行此步骤",
+            "modified": value != getattr(self.original_config, key),
+        }
+
+    def _number(self, key: str, label: str, value: int | float) -> dict[str, Any]:
+        return {
+            "key": key,
+            "label": label,
+            "kind": "number",
+            "value": value,
+            "modified": value != getattr(self.original_config, key),
+        }
 
     def _redraw(self) -> None:
-        if not self.frames: return
+        if not self.frames:
+            return
         try:
-            config = self._config_from_fields()
-            result, stages = inspect_frame(self.frames[self.frame_pos].image, config)
+            result, stages = inspect_frame(self.frames[self.frame_pos].image, self.current_config)
             self._show_stages(stages)
-            self.status.setText(f"帧 {self.frames[self.frame_pos].index}：检测到 {len(result.centers)} 个液滴；已生成 {len(stages)} 个处理步骤")
+            frame_index = self.frames[self.frame_pos].index
+            self.status.setText(
+                f"帧 {frame_index}（{self.frame_pos + 1}/{len(self.frames)}）：检测到 {len(result.centers)} 个液滴"
+            )
         except Exception as exc:
             self.status.setText(f"识别失败：{exc}")
 
     def _show_stages(self, stages: list[PipelineStage]) -> None:
+        scroll_position = self.stage_scroll.verticalScrollBar().value()
         while self.stage_grid.count():
             item = self.stage_grid.takeAt(0)
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()
         for index, stage in enumerate(stages):
-            self.stage_grid.addWidget(StageCard(stage, self.stage_container), index // 2, index % 2)
+            card = StageCard(stage, self._controls_for_stage(index), self.stage_container)
+            card.parameter_changed.connect(self._parameter_changed)
+            card.parameter_reset.connect(self._reset_parameter)
+            self.stage_grid.addWidget(card, index // 2, index % 2)
         self.stage_grid.setRowStretch((len(stages) + 1) // 2, 1)
-
-    def _parse_grid(self) -> dict:
-        grid = {}
-        for line in self.grid_text.toPlainText().splitlines():
-            if not line.strip(): continue
-            key, raw = line.split("=", 1); key = key.strip()
-            if key not in SEARCHABLE_FIELDS: raise ValueError(f"不支持搜索参数：{key}")
-            values = [float(item.strip()) for item in raw.split(",") if item.strip()]
-            if not values: raise ValueError(f"参数没有候选值：{key}")
-            if key in {"gaussian_blur_size", "morphology_open_kernel", "morphology_close_kernel"}: values = [int(v) for v in values]
-            grid[key] = values
-        if not grid: raise ValueError("请至少输入一个搜索参数")
-        return grid
-
-    def _search(self) -> None:
-        try:
-            if not self.frames: self._load()
-            if not self.frames: return
-            base = self._config_from_fields(); grid = self._parse_grid(); expected = float(self.expected.text())
-            combinations = 1
-            for values in grid.values(): combinations *= len(values)
-            if combinations > 500: raise ValueError("搜索组合超过 500 组，请减少候选值")
-            if expected < 0: raise ValueError("期望液滴数不能小于 0")
-        except Exception as exc:
-            QMessageBox.warning(self, "搜索参数错误", str(exc)); return
-        self.search_button.setEnabled(False); self.status.setText("自动搜索中，请稍候…")
-        self.worker_thread = QThread(self); self.worker = SearchWorker(self.video.text().strip(), self.max_frames.value(), expected, base, grid)
-        self.worker.moveToThread(self.worker_thread); self.worker_thread.started.connect(self.worker.run); self.worker.done.connect(self._search_done); self.worker.failed.connect(self._search_failed); self.worker.done.connect(self.worker_thread.quit); self.worker.failed.connect(self.worker_thread.quit); self.worker_thread.finished.connect(self.worker.deleteLater); self.worker_thread.finished.connect(self.worker_thread.deleteLater); self.worker_thread.start()
-
-    def _search_done(self, results) -> None:
-        self.search_button.setEnabled(True)
-        if not results: return
-        best = results[0]; self.results.setPlainText("最佳参数：\n" + json.dumps({"score": best.score, "parameters": best.parameters, "evaluation": asdict(best.evaluation)}, ensure_ascii=False, indent=2) + "\n\n前 10 名：\n" + "\n".join(f"{i+1}. score={r.score:.4f} {r.parameters}" for i, r in enumerate(results[:10])))
-        for key, value in best.parameters.items(): self._fields[key].setText(str(value))
-        self._redraw(); self.status.setText(f"搜索完成，共评估 {len(results)} 组")
-
-    def _search_failed(self, message: str) -> None:
-        self.search_button.setEnabled(True); self.status.setText("搜索失败"); QMessageBox.warning(self, "搜索失败", message)
+        QTimer.singleShot(0, lambda: self.stage_scroll.verticalScrollBar().setValue(scroll_position))
 
     def _save(self) -> None:
-        try: values = asdict(self._config_from_fields())
-        except Exception as exc: QMessageBox.warning(self, "保存失败", str(exc)); return
-        path, _ = QFileDialog.getSaveFileName(self, "保存检测参数", "droplet_detector_tuning.json", "JSON (*.json)")
-        if path: Path(path).write_text(json.dumps(values, ensure_ascii=False, indent=2), encoding="utf-8")
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "保存检测参数",
+            "droplet_detector_tuning.json",
+            "JSON (*.json)",
+        )
+        if path:
+            Path(path).write_text(
+                json.dumps(asdict(self.current_config), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
 
 
 def main(video: str = "") -> None:
     app = QApplication.instance() or QApplication(sys.argv)
-    window = TuningWindow(video); window.show(); raise SystemExit(app.exec())
+    window = TuningWindow(video)
+    window.show()
+    raise SystemExit(app.exec())
 
 
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+    main()

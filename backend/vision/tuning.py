@@ -47,13 +47,21 @@ class PipelineStage:
 SEARCHABLE_FIELDS = (
     "min_radius",
     "max_radius",
-    "circularity_threshold",
     "gaussian_blur_size",
-    "morphology_open_kernel",
-    "morphology_close_kernel",
+    "hough_dp",
+    "hough_min_distance",
+    "hough_param1",
+    "hough_param2",
+    "hough_min_radius",
+    "hough_max_radius",
+    "hough_edge_support_threshold",
+    "expected_radius",
+    "expected_radius_tolerance_ratio",
+    "edge_ownership_search_radius",
+    "edge_ownership_margin",
+    "edge_ownership_min_ratio",
     "candidate_min_edge_support",
     "candidate_full_circle_ratio",
-    "hough_param2",
 )
 
 
@@ -91,55 +99,54 @@ def inspect_frame(frame: np.ndarray, config: DetectorConfig) -> tuple[DetectionR
     """Run the detector pipeline while preserving its important intermediate images."""
     detector = DropletDetector(config, DebugConfig(enabled=False))
     gray = detector._ensure_gray(frame)
-    normalized = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+    normalized = (
+        cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+        if config.enable_intensity_normalization
+        else gray.copy()
+    )
     blur_size = detector._odd(config.gaussian_blur_size)
-    smoothed = cv2.GaussianBlur(normalized, (blur_size, blur_size), 0) if blur_size > 1 else normalized
-    otsu_threshold, raw_binary = cv2.threshold(smoothed, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    cleaned = detector._morphology_clean(raw_binary)
-    cut_line = int(cleaned.shape[0] * config.cut_line_ratio)
-    detect_mode = config.detection_mode
-    if detect_mode == "no_split":
-        connected_centers, connected_radii = detector._detect_no_split(cleaned, cut_line)
-    else:
-        connected_centers, connected_radii = detector._detect_split_connected(cleaned, cut_line)
-
-    centers, radii = list(connected_centers), list(connected_radii)
-    source_parts = [f"连通域 {len(centers)}"]
-    candidate_centers, candidate_radii = list(centers), list(radii)
-    if config.hough_fallback_only:
-        centers, radii = detector._score_and_suppress_candidates(normalized, centers, radii)
-        if not centers and config.enable_hough_candidates:
-            candidate_centers, candidate_radii = detector._detect_hough_candidates(normalized, cut_line)
-            source_parts.append(f"Hough {len(candidate_centers)}")
-            centers, radii = detector._score_and_suppress_candidates(normalized, candidate_centers, candidate_radii)
-        if not centers and (config.enable_intensity_peak_candidates or config.enable_intensity_peak_fallback):
-            candidate_centers, candidate_radii = detector._detect_intensity_peak_candidates(normalized, cut_line)
-            source_parts.append(f"亮度峰值 {len(candidate_centers)}")
-            centers, radii = detector._score_and_suppress_candidates(normalized, candidate_centers, candidate_radii)
-    else:
-        if config.enable_hough_candidates:
-            extra_centers, extra_radii = detector._detect_hough_candidates(normalized, cut_line)
-            source_parts.append(f"Hough {len(extra_centers)}")
-            candidate_centers.extend(extra_centers); candidate_radii.extend(extra_radii)
-        if config.enable_intensity_peak_candidates or (config.enable_intensity_peak_fallback and not candidate_centers):
-            extra_centers, extra_radii = detector._detect_intensity_peak_candidates(normalized, cut_line)
-            source_parts.append(f"亮度峰值 {len(extra_centers)}")
-            candidate_centers.extend(extra_centers); candidate_radii.extend(extra_radii)
-        centers, radii = detector._score_and_suppress_candidates(normalized, candidate_centers, candidate_radii)
+    smoothed = (
+        cv2.GaussianBlur(normalized, (blur_size, blur_size), 0)
+        if config.enable_gaussian_blur and blur_size > 1
+        else normalized
+    )
+    cut_line = int(smoothed.shape[0] * config.cut_line_ratio)
+    hough_trace: dict[str, object] = {}
+    candidate_centers, candidate_radii = detector._detect_hough_candidates(
+        smoothed,
+        cut_line,
+        hough_trace,
+    )
+    centers, radii = detector._score_and_suppress_candidates(
+        normalized,
+        candidate_centers,
+        candidate_radii,
+    )
+    raw_centers = hough_trace.get("raw_centers", [])
+    raw_radii = hough_trace.get("raw_radii", [])
+    geometric_centers = hough_trace.get("geometric_centers", [])
+    geometric_radii = hough_trace.get("geometric_radii", [])
+    size_centers = hough_trace.get("size_centers", [])
+    size_radii = hough_trace.get("size_radii", [])
+    enhanced = np.asarray(hough_trace.get("enhanced", smoothed))
+    median_blurred = np.asarray(hough_trace.get("median_blurred", smoothed))
+    edges = np.asarray(hough_trace.get("edges", np.zeros_like(smoothed)))
 
     helper_mask = detector._build_bead_helper_mask(normalized)
     result = DetectionResult(centers, radii, np.empty((0, 0, 3), dtype=np.uint8), helper_mask)
     stages = [
         PipelineStage("1. 原始图像", "检测器收到的当前视频帧。", frame.copy(), statistics=f"尺寸 {frame.shape[1]}×{frame.shape[0]}"),
-        PipelineStage("2. 灰度转换", "去除颜色信息，保留像素亮度。", gray, parameters="BGR → Gray", statistics=f"亮度范围 {int(gray.min())}–{int(gray.max())}"),
-        PipelineStage("3. 对比度归一化", "将亮度拉伸到完整范围，减轻曝光差异。", normalized, parameters="NORM_MINMAX: 0–255", statistics=f"均值 {float(normalized.mean()):.1f}"),
-        PipelineStage("4. 高斯平滑", "抑制高频噪声，避免产生破碎轮廓。", smoothed, parameters=f"核大小 {blur_size}×{blur_size}"),
-        PipelineStage("5. Otsu 二值化", "自动计算阈值，将暗色液滴区域转为白色。", raw_binary, parameters="THRESH_BINARY_INV + OTSU", statistics=f"阈值 {otsu_threshold:.1f}；前景 {100.0 * np.count_nonzero(raw_binary) / raw_binary.size:.1f}%"),
-        PipelineStage("6. 形态学清理", "先开运算去除噪点，再闭运算填补缺口。", cleaned, parameters=f"开核 {detector._odd(config.morphology_open_kernel)}；闭核 {detector._odd(config.morphology_close_kernel)}", statistics=f"前景 {100.0 * np.count_nonzero(cleaned) / cleaned.size:.1f}%"),
-        PipelineStage("7. 连通域/分裂", "提取轮廓，并按面积、圆度、半径和截断线初筛。", _candidate_overlay(frame, connected_centers, connected_radii), parameters=f"模式 {detect_mode}；圆度 ≥ {config.circularity_threshold:g}；半径 {config.min_radius:g}–{config.max_radius:g}", statistics=f"初筛候选 {len(connected_centers)} 个"),
-        PipelineStage("8. 候选生成", "按配置合并或回退到 Hough 圆与亮度峰值候选。", _candidate_overlay(frame, candidate_centers, candidate_radii), parameters="；".join(source_parts), statistics=f"进入评分候选 {len(candidate_centers)} 个"),
-        PipelineStage("9. 评分与抑制", "按边缘支撑、环形对比度等评分，并抑制重复圆。", annotate_frame(frame, result), parameters=f"边缘支撑 ≥ {config.candidate_min_edge_support:g}", statistics=f"最终液滴 {len(centers)} 个"),
-        PipelineStage("10. 磁珠辅助掩膜", "检测器输出的辅助掩膜；不在本工作台执行磁珠识别。", helper_mask, statistics=f"有效像素 {100.0 * np.count_nonzero(helper_mask) / helper_mask.size:.1f}%"),
+        PipelineStage("2. 灰度转换", "去除颜色信息，为梯度圆检测准备单通道图像。", gray, parameters="BGR → Gray", statistics=f"亮度范围 {int(gray.min())}–{int(gray.max())}"),
+        PipelineStage("3. 对比度归一化", "拉伸灰度范围，减轻不同曝光条件对梯度强度的影响。", normalized, parameters="NORM_MINMAX: 0–255" if config.enable_intensity_normalization else "已跳过", statistics=f"均值 {float(normalized.mean()):.1f}"),
+        PipelineStage("4. 输入高斯平滑", "在进入 Hough 分支前抑制原始高频噪声。", smoothed, parameters=f"核大小 {blur_size}×{blur_size}" if config.enable_gaussian_blur else "已跳过"),
+        PipelineStage("5. Hough 局部对比度增强", "使用 CLAHE 强化不同亮度区域中的圆形边缘。", enhanced, parameters="CLAHE clipLimit=2.0；网格 8×8" if config.enable_hough_clahe else "已跳过", statistics=f"工作缩放 {float(hough_trace.get('scale', 1.0)):.3f}"),
+        PipelineStage("6. Hough 中值滤波", "在圆变换前抑制孤立噪声，同时尽量保留边缘。", median_blurred, parameters="medianBlur 5×5" if config.enable_hough_median_blur else "已跳过"),
+        PipelineStage("7. Canny 梯度边缘", "展示 Hough 圆变换用于寻找圆周的梯度边缘。", edges, parameters=f"低阈值 50；高阈值 150；param1={config.hough_param1:g}", statistics=f"边缘像素 {100.0 * np.count_nonzero(edges) / edges.size:.1f}%"),
+        PipelineStage("8. Hough 原始圆", "展示 HoughCircles 尚未经过几何和边缘支撑过滤的全部圆。", _candidate_overlay(frame, raw_centers, raw_radii), parameters=f"dp={config.hough_dp:g}；param2={config.hough_param2:g}；半径 {detector._hough_min_radius():g}–{detector._hough_max_radius():g}", statistics=f"原始圆 {len(raw_centers)} 个"),
+        PipelineStage("9. Hough 几何过滤", "按截断线、绝对半径、圆周边缘支撑和多液滴包围关系过滤。", _candidate_overlay(frame, geometric_centers, geometric_radii), parameters=f"Hough 边缘支撑 ≥ {config.hough_edge_support_threshold:g}", statistics=f"几何过滤后 {len(geometric_centers)} 个"),
+        PipelineStage("10. 目标尺寸过滤", "利用可靠的目标半径拒绝尺寸异常圆；红色为进入本步骤的圆，绿色为保留圆。", _candidate_overlay(_candidate_overlay(frame, geometric_centers, geometric_radii, (0, 0, 255)), size_centers, size_radii, (0, 220, 80)), parameters=(f"期望半径 {detector.runtime_radius_range()[1]:.1f}；容差 ±{config.expected_radius_tolerance_ratio * 100:.0f}%" if detector._has_expected_size and config.enable_expected_size_filter else "未设置目标尺寸，已跳过"), statistics=f"拒绝 {len(geometric_centers) - len(size_centers)} 个；保留 {len(size_centers)} 个"),
+        PipelineStage("11. 圆周边缘归属", "将实际边缘像素归属给径向残差最小的候选，拒绝借用相邻液滴边缘拼成的圆；红色为进入本步骤的圆，绿色为保留圆。", _candidate_overlay(_candidate_overlay(frame, size_centers, size_radii, (0, 0, 255)), candidate_centers, candidate_radii, (0, 220, 80)), parameters=(f"搜索半径 {config.edge_ownership_search_radius}px；最小独占比例 {config.edge_ownership_min_ratio:g}；归属间隔 {config.edge_ownership_margin:g}px" if config.enable_edge_ownership_filter else "已跳过"), statistics=f"拒绝 {len(size_centers) - len(candidate_centers)} 个；保留 {len(candidate_centers)} 个"),
+        PipelineStage("12. 最终评分与抑制", "按边缘支撑、环形对比度等评分，并抑制重复圆。", annotate_frame(frame, result), parameters=f"候选边缘支撑 ≥ {config.candidate_min_edge_support:g}；完整圆比例 ≥ {config.candidate_full_circle_ratio:g}", statistics=f"最终液滴 {len(centers)} 个"),
     ]
     return result, stages
 
