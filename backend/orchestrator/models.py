@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -24,6 +25,39 @@ class SystemConfig:
     camera_backend: str = ""
     camera_parameters: dict[str, float | int | str] = field(default_factory=dict)
     recognition_roi: dict[str, Any] = field(default_factory=dict)
+    calibration: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        finite_positive = {
+            "target_diameter": self.target_diameter,
+            "pixel_to_micron": self.pixel_to_micron,
+            "initial_q1": self.initial_q1,
+            "initial_q2": self.initial_q2,
+        }
+        for name, value in finite_positive.items():
+            if not math.isfinite(float(value)) or float(value) <= 0.0:
+                raise ValueError(f"{name} must be finite and positive")
+        if float(self.initial_q1) > 5000.0 or float(self.initial_q2) > 5000.0:
+            raise ValueError("initial pump flows must not exceed 5000 uL/min")
+        if not isinstance(self.control_interval_ms, int) or isinstance(self.control_interval_ms, bool):
+            raise ValueError("control_interval_ms must be an integer number of milliseconds")
+        if not 1 <= int(self.pump_address) <= 0x1F:
+            raise ValueError("pump_address must be in [1, 31]")
+        if int(self.pump_baudrate) <= 0:
+            raise ValueError("pump_baudrate must be positive")
+        parity = str(self.pump_parity or "").upper()
+        if parity not in {"N", "E"}:
+            raise ValueError("pump_parity must be 'N' or 'E'")
+        self.pump_parity = parity
+        if self.calibration:
+            from ..vision.calibration import CalibrationRecord
+
+            record = CalibrationRecord.from_mapping(dict(self.calibration))
+            tolerance = max(1e-9, record.uncertainty_um_per_px * 3.0)
+            if abs(float(self.pixel_to_micron) - record.pixel_to_micron) > tolerance:
+                raise ValueError(
+                    "pixel_to_micron disagrees with the versioned calibration record"
+                )
 
 
 @dataclass(slots=True)
@@ -84,6 +118,16 @@ class RecognitionSnapshot:
     channel_calibration_status: str = "disabled"
     channel_calibration_confidence: float = 0.0
     channel_calibration_reason: str = ""
+    session_id: str = ""
+    run_generation: int = 0
+    capture_monotonic: float = 0.0
+    hardware_frame_id: int = 0
+    hardware_timestamp: float = 0.0
+    raw_frame_diameters: list[float] = field(default_factory=list)
+    raw_frame_diameter_cv: float | None = None
+    filtering_rule: str = "none"
+    calibration_id: str = ""
+    calibration_uncertainty_um_per_px: float | None = None
 
 
 @dataclass(slots=True)
@@ -99,6 +143,11 @@ class FrameSnapshot:
     # Keeping this as bytes avoids the extra 33% Base64 expansion.
     frame_jpeg: Optional[bytes] = None
     reason: str = ""
+    session_id: str = ""
+    run_generation: int = 0
+    capture_monotonic: float = 0.0
+    hardware_frame_id: int = 0
+    hardware_timestamp: float = 0.0
 
 
 @dataclass(slots=True)
@@ -116,6 +165,10 @@ class PumpRuntimeState:
     last_update_reason: str = ""
     channels: dict[str, PumpChannelState] = field(default_factory=dict)
     last_readback_time: float | None = None
+    readback_kind: str = "device_parameter_estimate"
+    physical_flow_measured: bool = False
+    pump_response_delay_ms: float | None = None
+    pump_response_measurement_status: str = "unmeasured"
 
 
 @dataclass(slots=True)
@@ -146,6 +199,10 @@ class ControlSnapshot:
     q1_output_gain: float = 1.0
     q2_output_gain: float = 1.0
     frame_id: int = 0
+    control_period_id: int = 0
+    session_id: str = ""
+    run_generation: int = 0
+    monotonic_timestamp: float = 0.0
 
 
 @dataclass(slots=True)
@@ -161,3 +218,4 @@ class SystemSnapshot:
     timestamp: float = 0.0
     disturbance_model: Optional[dict[str, Any]] = None
     disturbance_prediction: Optional[dict[str, Any]] = None
+    safety: Optional[dict[str, Any]] = None

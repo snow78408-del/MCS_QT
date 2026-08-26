@@ -81,6 +81,7 @@ def make_frame_data(
     device_unique_id: str,
     timestamp: float | None = None,
 ) -> FrameData:
+    host_monotonic = time.monotonic()
     image = convert_image(raw, int(width), int(height), pixel_format)
     return FrameData(
         image=image,
@@ -92,4 +93,5 @@ def make_frame_data(
         source_backend=source_backend,
         device_unique_id=device_unique_id,
         valid=image is not None and int(image.size) > 0,
+        host_monotonic_timestamp=host_monotonic,
     )

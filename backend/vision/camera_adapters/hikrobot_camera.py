@@ -335,7 +335,7 @@ class HikrobotCameraAdapter(BaseCameraAdapter):
                         device_type=HIKROBOT_DEVICE_TYPE,
                         manufacturer="HIKROBOT",
                         available=False,
-                        error=f"瑙ｆ瀽娴峰悍璁惧淇℃伅澶辫触: {exc}",
+                        error=f"解析海康设备信息失败: {exc}",
                         device_index=idx,
                         sdk_path=str(loader.sdk_root or ""),
                     )
@@ -383,7 +383,7 @@ class HikrobotCameraAdapter(BaseCameraAdapter):
         layer_type = int(getattr(mvs, "MV_GIGE_DEVICE", 0x00000001)) | int(getattr(mvs, "MV_USB_DEVICE", 0x00000004))
         ret = mvs.MvCamera.MV_CC_EnumDevices(layer_type, device_list)
         if ret != 0:
-            raise CameraAdapterError(f"娴峰悍鐩告満鏋氫妇澶辫触锛岄敊璇爜: 0x{int(ret) & 0xFFFFFFFF:08X}", int(ret))
+            raise CameraAdapterError(f"海康相机枚举失败，错误码: 0x{int(ret) & 0xFFFFFFFF:08X}", int(ret))
         info_type = getattr(mvs, "MV_CC_DEVICE_INFO")
         devices: list[tuple[CameraDevice, Any]] = []
         for idx in range(int(device_list.nDeviceNum)):
@@ -405,7 +405,7 @@ class HikrobotCameraAdapter(BaseCameraAdapter):
             }
             if key in values:
                 return device, raw_info
-        raise CameraAdapterError(f"鏈壘鍒版捣搴峰伐涓氱浉鏈? {device_id}")
+        raise CameraAdapterError(f"未找到海康工业相机: {device_id}")
 
     def open(self, device_id: str, *, start_stream: bool = True) -> None:
         self.close()
@@ -416,7 +416,7 @@ class HikrobotCameraAdapter(BaseCameraAdapter):
             cam = mvs.MvCamera()
             ret = cam.MV_CC_CreateHandle(raw_info)
             if ret != 0:
-                raise CameraAdapterError(f"鍒涘缓娴峰悍鐩告満鍙ユ焺澶辫触锛岄敊璇爜: 0x{int(ret) & 0xFFFFFFFF:08X}", int(ret))
+                raise CameraAdapterError(f"创建海康相机句柄失败，错误码: 0x{int(ret) & 0xFFFFFFFF:08X}", int(ret))
             self._cam = cam
             self._device = device
             self._device_info = raw_info
@@ -424,7 +424,7 @@ class HikrobotCameraAdapter(BaseCameraAdapter):
             exclusive = int(getattr(mvs, "MV_ACCESS_Exclusive", 1))
             ret = cam.MV_CC_OpenDevice(exclusive, 0)
             if ret != 0:
-                raise CameraAdapterError(f"鎵撳紑娴峰悍鐩告満澶辫触锛岄敊璇爜: 0x{int(ret) & 0xFFFFFFFF:08X}", int(ret))
+                raise CameraAdapterError(f"打开海康相机失败，错误码: 0x{int(ret) & 0xFFFFFFFF:08X}", int(ret))
 
             with self._lock:
                 self._opened = True
@@ -447,16 +447,16 @@ class HikrobotCameraAdapter(BaseCameraAdapter):
             self.configure(self.config)
             self.start_stream()
 
-            deadline = time.time() + 3.0
+            deadline = time.monotonic() + 3.0
             valid = None
-            while time.time() < deadline:
+            while time.monotonic() < deadline:
                 packet = self.read_frame()
                 if packet.valid and packet.frame is not None:
                     valid = packet
                     break
                 time.sleep(0.03)
             if valid is None:
-                raise CameraAdapterError("娴峰悍宸ヤ笟鐩告満鎵撳紑鍚庢湭鑾峰彇鍒版湁鏁堟祴璇曞抚")
+                raise CameraAdapterError("海康工业相机打开后未获取到有效测试帧")
 
             self._log(
                 "[HIKROBOT][OPEN][OK] "
@@ -485,10 +485,10 @@ class HikrobotCameraAdapter(BaseCameraAdapter):
                     self._log(
                         "[HIKROBOT][FRAME][FAIL] "
                         f"model={device.model} sn={device.serial_number} ip={device.current_ip} "
-                        "璁剧疆鎺ㄨ崘缃戠粶鍖呭ぇ灏忓け璐ワ紝鍙栨祦寮傚父鏃惰妫€鏌ョ浉鏈哄拰缃戝崱鏄惁澶勪簬鍚屼竴缃戞"
+                        "设置推荐网络包大小失败；取流异常时请检查相机与网卡是否位于同一网段"
                     )
         except Exception as exc:
-            self._log(f"[HIKROBOT][FRAME][FAIL] GigE 鎺ㄨ崘鍖呭ぇ灏忚幏鍙栧け璐? {exc}")
+            self._log(f"[HIKROBOT][FRAME][FAIL] 获取 GigE 推荐包大小失败: {exc}")
 
     def close(self) -> None:
         self.stop_stream()
@@ -524,10 +524,10 @@ class HikrobotCameraAdapter(BaseCameraAdapter):
             cam = self._cam
             opened = self._opened
         if cam is None or not opened:
-            raise CameraAdapterError("娴峰悍宸ヤ笟鐩告満鏈墦寮€")
+            raise CameraAdapterError("海康工业相机未打开")
         ret = cam.MV_CC_StartGrabbing()
         if ret != 0:
-            raise CameraAdapterError(f"娴峰悍宸ヤ笟鐩告満鍚姩鍙栨祦澶辫触锛岄敊璇爜: 0x{int(ret) & 0xFFFFFFFF:08X}", int(ret))
+            raise CameraAdapterError(f"海康工业相机启动取流失败，错误码: 0x{int(ret) & 0xFFFFFFFF:08X}", int(ret))
         self._stop_event.clear()
         with self._lock:
             self._streaming = True
@@ -602,12 +602,12 @@ class HikrobotCameraAdapter(BaseCameraAdapter):
                         f"transport={device.transport_type} ip={device.current_ip} error={exc}"
                     )
                     if device.transport_type == "GigE" and failures >= self._failure_threshold:
-                        self._log("[HIKROBOT][FRAME][FAIL] GigE 鍙栨祦杩炵画澶辫触锛岃妫€鏌ョ浉鏈哄拰缃戝崱鏄惁澶勪簬鍚屼竴缃戞")
+                        self._log("[HIKROBOT][FRAME][FAIL] GigE 连续取流失败，请检查相机与网卡是否位于同一网段")
                 time.sleep(0.03)
 
     def read_frame(self) -> FramePacket:
-        deadline = time.time() + 2.0
-        while time.time() < deadline:
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
             with self._lock:
                 if not self._camera_connected:
                     return FramePacket(
@@ -615,7 +615,7 @@ class HikrobotCameraAdapter(BaseCameraAdapter):
                         timestamp=time.time(),
                         frame_id=self._frame_id,
                         valid=False,
-                        error=self._last_camera_error or "娴峰悍宸ヤ笟鐩告満杩炴帴涓柇",
+                        error=self._last_camera_error or "海康工业相机连接中断",
                     )
                 if self._latest_frame is not None:
                     return FramePacket(
@@ -644,8 +644,8 @@ class HikrobotCameraAdapter(BaseCameraAdapter):
             self.start_stream()
             packets: list[FramePacket] = []
             seen_ids: set[int] = set()
-            deadline = time.time() + 5.0
-            while time.time() < deadline and len(packets) < required:
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and len(packets) < required:
                 packet = self.read_frame()
                 if packet.valid and packet.frame is not None and packet.frame_id not in seen_ids:
                     frame = packet.frame
@@ -760,7 +760,7 @@ class HikrobotCameraAdapter(BaseCameraAdapter):
             return raw.reshape((height, width, 3)), "BGR8"
         converted = self._convert_unsupported_pixel_type(raw, width, height, pixel_type, frame_len)
         if converted is None:
-            raise CameraAdapterError(f"涓嶆敮鎸佺殑娴峰悍鍍忕礌鏍煎紡锛屼笖 MVS 鍍忕礌鏍煎紡杞崲澶辫触: 0x{pixel_type:08X}")
+            raise CameraAdapterError(f"不支持的海康像素格式，且 MVS 像素格式转换失败: 0x{pixel_type:08X}")
         return converted, f"MVSConverted:0x{pixel_type:08X}"
 
     def _convert_unsupported_pixel_type(
@@ -813,7 +813,7 @@ class HikrobotCameraAdapter(BaseCameraAdapter):
             enum_value = int(getattr(mvs, "MV_TRIGGER_MODE_ON", 1))
         ret = cam.MV_CC_SetEnumValue(name, enum_value)
         if ret != 0 and raise_on_fail:
-            raise CameraAdapterError(f"璁剧疆娴峰悍鐩告満鍙傛暟 {name}={value} 澶辫触锛岄敊璇爜: 0x{int(ret) & 0xFFFFFFFF:08X}", int(ret))
+            raise CameraAdapterError(f"设置海康相机参数 {name}={value} 失败，错误码: 0x{int(ret) & 0xFFFFFFFF:08X}", int(ret))
         if ret == 0:
             self._log(f"[HIKROBOT][PARAM][SET] {name}={value}")
 
@@ -824,12 +824,12 @@ class HikrobotCameraAdapter(BaseCameraAdapter):
         info = self.get_parameter_info(name)
         if info.exists and info.writable:
             if info.min_value is not None and value < float(info.min_value):
-                raise CameraAdapterError(f"{name} 瓒呭嚭鍏佽鑼冨洿: {info.min_value} - {info.max_value}")
+                raise CameraAdapterError(f"{name} 超出允许范围: {info.min_value} - {info.max_value}")
             if info.max_value is not None and value > float(info.max_value):
-                raise CameraAdapterError(f"{name} 瓒呭嚭鍏佽鑼冨洿: {info.min_value} - {info.max_value}")
+                raise CameraAdapterError(f"{name} 超出允许范围: {info.min_value} - {info.max_value}")
         ret = cam.MV_CC_SetFloatValue(name, float(value))
         if ret != 0:
-            raise CameraAdapterError(f"璁剧疆娴峰悍鐩告満鍙傛暟 {name}={value} 澶辫触锛岄敊璇爜: 0x{int(ret) & 0xFFFFFFFF:08X}", int(ret))
+            raise CameraAdapterError(f"设置海康相机参数 {name}={value} 失败，错误码: 0x{int(ret) & 0xFFFFFFFF:08X}", int(ret))
         self._log(f"[HIKROBOT][PARAM][SET] {name}={value}")
 
     def _set_int_value(self, name: str, value: int) -> None:
@@ -839,19 +839,19 @@ class HikrobotCameraAdapter(BaseCameraAdapter):
         info = self.get_parameter_info(name)
         if info.exists and info.writable:
             if info.min_value is not None and value < int(info.min_value):
-                raise CameraAdapterError(f"{name} 瓒呭嚭鍏佽鑼冨洿: {info.min_value} - {info.max_value}")
+                raise CameraAdapterError(f"{name} 超出允许范围: {info.min_value} - {info.max_value}")
             if info.max_value is not None and value > int(info.max_value):
-                raise CameraAdapterError(f"{name} 瓒呭嚭鍏佽鑼冨洿: {info.min_value} - {info.max_value}")
+                raise CameraAdapterError(f"{name} 超出允许范围: {info.min_value} - {info.max_value}")
         ret = cam.MV_CC_SetIntValue(name, int(value))
         if ret != 0:
-            raise CameraAdapterError(f"璁剧疆娴峰悍鐩告満鍙傛暟 {name}={value} 澶辫触锛岄敊璇爜: 0x{int(ret) & 0xFFFFFFFF:08X}", int(ret))
+            raise CameraAdapterError(f"设置海康相机参数 {name}={value} 失败，错误码: 0x{int(ret) & 0xFFFFFFFF:08X}", int(ret))
         self._log(f"[HIKROBOT][PARAM][SET] {name}={value}")
 
     def get_parameter_info(self, name: str) -> CameraParameterInfo:
         cam = self._cam
         mvs = self._ensure_sdk()
         if cam is None:
-            return CameraParameterInfo(name=name, exists=False, error="鐩告満鏈墦寮€")
+            return CameraParameterInfo(name=name, exists=False, error="相机未打开")
         for type_name, method_name in (
             ("MVCC_FLOATVALUE", "MV_CC_GetFloatValue"),
             ("MVCC_INTVALUE_EX", "MV_CC_GetIntValueEx"),

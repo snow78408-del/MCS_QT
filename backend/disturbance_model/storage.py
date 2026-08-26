@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import queue
+import shutil
 import sqlite3
 import threading
 import time
@@ -12,6 +13,9 @@ from .config import DisturbanceModelConfig
 from .models import DisturbanceSample, ModelMetrics
 
 
+DATABASE_SCHEMA_VERSION = 1
+
+
 class DisturbanceStorage:
     def __init__(self, config: DisturbanceModelConfig, logger=None) -> None:
         self.config = config
@@ -19,6 +23,7 @@ class DisturbanceStorage:
         self._queue: queue.Queue[DisturbanceSample | None] = queue.Queue(maxsize=int(config.storage_queue_size))
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self.dropped_sample_count = 0
         self._init_db()
 
     @property
@@ -35,17 +40,25 @@ class DisturbanceStorage:
     def stop(self) -> None:
         self._stop_event.set()
         try:
-            self._queue.put_nowait(None)
-        except Exception:
-            pass
+            self._queue.put(None, timeout=2.0)
+        except queue.Full:
+            # The writer also exits once the queue is empty and stop is set.
+            self._log("[DISTURBANCE][STORAGE] stop sentinel delayed; draining full queue")
         if self._thread:
-            self._thread.join(timeout=2.0)
+            self._thread.join(timeout=5.0)
+            if self._thread.is_alive():
+                self._log("[DISTURBANCE][STORAGE][ERROR] writer did not finish draining before timeout")
 
     def submit(self, sample: DisturbanceSample) -> bool:
+        if self._stop_event.is_set():
+            self.dropped_sample_count += 1
+            self._log("[DISTURBANCE][STORAGE] writer is stopping; sample rejected")
+            return False
         try:
             self._queue.put_nowait(sample)
             return True
         except queue.Full:
+            self.dropped_sample_count += 1
             self._log("[DISTURBANCE][STORAGE] queue full; sample dropped")
             return False
 
@@ -87,21 +100,21 @@ class DisturbanceStorage:
 
     def _writer_loop(self) -> None:
         batch: list[DisturbanceSample] = []
-        last_flush = time.time()
-        while not self._stop_event.is_set():
+        last_flush = time.monotonic()
+        while True:
             timeout = max(0.05, float(self.config.storage_flush_interval_s))
             try:
                 item = self._queue.get(timeout=timeout)
             except queue.Empty:
                 item = None
+            if item is None and self._stop_event.is_set() and self._queue.empty():
+                break
             if item is not None:
                 batch.append(item)
-            if batch and (len(batch) >= int(self.config.storage_batch_size) or time.time() - last_flush >= timeout or item is None):
+            if batch and (len(batch) >= int(self.config.storage_batch_size) or time.monotonic() - last_flush >= timeout or item is None):
                 self._insert_batch(batch)
                 batch.clear()
-                last_flush = time.time()
-            if item is None and self._stop_event.is_set():
-                break
+                last_flush = time.monotonic()
         if batch:
             self._insert_batch(batch)
 
@@ -114,7 +127,17 @@ class DisturbanceStorage:
             conn.executemany(sql, rows)
 
     def _init_db(self) -> None:
-        Path(self.config.database_path).parent.mkdir(parents=True, exist_ok=True)
+        database_path = Path(self.config.database_path)
+        database_path.parent.mkdir(parents=True, exist_ok=True)
+        if database_path.is_file():
+            try:
+                with sqlite3.connect(str(database_path), timeout=1.0) as existing:
+                    old_version = int(existing.execute("PRAGMA user_version").fetchone()[0])
+                if old_version < DATABASE_SCHEMA_VERSION:
+                    shutil.copy2(database_path, database_path.with_suffix(database_path.suffix + ".pre_migration.bak"))
+            except sqlite3.DatabaseError:
+                # Let the normal connection below report an actionable error.
+                pass
         names = [field.name for field in fields(DisturbanceSample)]
         columns = ", ".join(f"{name} {self._sqlite_type(name)}" for name in names)
         with self._connect() as conn:
@@ -130,6 +153,15 @@ class DisturbanceStorage:
                 "CREATE TABLE IF NOT EXISTS disturbance_events("
                 "id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp REAL, experiment_id TEXT, name TEXT, stage TEXT, amplitude REAL)"
             )
+            existing_columns = {
+                str(row[1]) for row in conn.execute("PRAGMA table_info(disturbance_samples)").fetchall()
+            }
+            for name in names:
+                if name not in existing_columns:
+                    conn.execute(
+                        f'ALTER TABLE disturbance_samples ADD COLUMN "{name}" {self._sqlite_type(name)}'
+                    )
+            conn.execute(f"PRAGMA user_version={DATABASE_SCHEMA_VERSION}")
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.config.database_path, timeout=1.0)

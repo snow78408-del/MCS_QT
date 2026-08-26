@@ -43,6 +43,7 @@ class VisionAdapterProtocol(Protocol):
     def prepare_video(self, video_source_type: str, video_source: str, pixel_to_micron: float) -> None: ...
     def start(self) -> None: ...
     def stop(self) -> None: ...
+    def set_run_context(self, session_id: str, generation: int) -> None: ...
     def get_snapshot(self) -> RecognitionSnapshot | dict[str, Any]: ...
     def get_frame_snapshot(self) -> FrameSnapshot | None: ...
     def wait_for_recognition_snapshot(
@@ -80,6 +81,11 @@ class GenericVisionAdapter:
     def stop(self) -> None:
         self._call(["stop", "stop_loop", "shutdown"])
 
+    def set_run_context(self, session_id: str, generation: int) -> None:
+        fn = getattr(self.vision_service, "set_run_context", None)
+        if callable(fn):
+            fn(session_id, generation)
+
     def get_snapshot(self) -> RecognitionSnapshot | dict[str, Any]:
         return self._call(["get_snapshot", "get_latest_snapshot", "read_snapshot", "pull_result", "run_once"])
 
@@ -110,6 +116,9 @@ class PipelineVisionService:
         self._pixel_to_micron = 1.0
         self._configured_pixel_to_micron = 1.0
         self._expected_diameter_um = 0.0
+        self._session_id = ""
+        self._run_generation = 0
+        self._calibration_metadata: dict[str, Any] = {}
         self._channel_calibration_enabled = False
         self._channel_width_um = 430.0
         self._channel_width_px: float | None = None
@@ -139,6 +148,8 @@ class PipelineVisionService:
         self._last_processed_frame_id = 0
         self._last_processed_frame_timestamp = 0.0
         self._capture_frame_id = 0
+        self._last_camera_packet = None
+        self._frame_metadata: dict[int, dict[str, Any]] = {}
         self._last_preview_publish_time = 0.0
         self._last_processing_submit_time = 0.0
         self._camera_parameters: dict[str, float | int | str] = {}
@@ -284,14 +295,33 @@ class PipelineVisionService:
             normalized[name] = value
         self._camera_parameters = normalized
 
+    def set_run_context(self, session_id: str, generation: int) -> None:
+        """Bind subsequently captured frames to one control run."""
+        with self._lock:
+            self._session_id = str(session_id or "")
+            self._run_generation = int(generation)
+            self._capture_batch.clear()
+            self._last_motion_frame_id = 0
+            self._motion_observations.clear()
+            self._crossing_times.clear()
+            for work_queue in (self._preview_queue, self._sampling_queue, self._frame_queue):
+                while True:
+                    try:
+                        work_queue.get_nowait()
+                    except queue.Empty:
+                        break
+            self._ensure_pipeline().reset()
+
+    def set_calibration_metadata(self, metadata: dict[str, Any] | None) -> None:
+        self._calibration_metadata = dict(metadata or {})
+
     def configure_detection_scale(self, target_diameter_um: float, pixel_to_micron: float) -> None:
         self._expected_diameter_um = max(0.0, float(target_diameter_um))
         self._pixel_to_micron = float(pixel_to_micron) if float(pixel_to_micron) > 0.0 else 1.0
         self._configured_pixel_to_micron = self._pixel_to_micron
         pipeline = self._ensure_pipeline()
-        # Keep the broad absolute safety range; the Hough-specific target-size
-        # filter applies the reliable calibrated diameter without changing the
-        # radius reported from the observed circle edge.
+        # The control target is deliberately stored only for display/control.
+        # It must not influence detector gates, candidate scores, or tracking.
         pipeline.config.detector.expected_size_hard_gate = False
         pipeline.config.detector.hough_work_max_width = 480
         pipeline.config.detector.hough_work_max_height = 360
@@ -306,14 +336,10 @@ class PipelineVisionService:
         # can move farther than the old 120 px gate between processed frames.
         pipeline.config.tracker.match_distance = 180.0
         pipeline.config.tracker.match_distance_radius_ratio = 4.0
-        pipeline.detector.configure_expected_diameter(
-            self._expected_diameter_um,
-            self._pixel_to_micron,
-        )
         min_r, preferred_r, max_r = pipeline.detector.runtime_radius_range()
         self._log(
             "[VISION][DETECTOR][SCALE] "
-            f"target={self._expected_diameter_um:.3f}um "
+            f"control_target_ignored={self._expected_diameter_um:.3f}um "
             f"pixel_to_micron={self._pixel_to_micron:.6f} "
             f"broad_target_size_guard=False "
             f"radius_px={min_r:.2f}/{preferred_r:.2f}/{max_r:.2f}"
@@ -398,10 +424,6 @@ class PipelineVisionService:
                     f"采用用户选择的两条管壁：{self._channel_width_um:.1f} μm / "
                     f"{selected_width:.2f} px = {scale:.6f} μm/px"
                 )
-                pipeline.detector.configure_expected_diameter(
-                    self._expected_diameter_um,
-                    self._pixel_to_micron,
-                )
                 self._log(
                     "[VISION][CHANNEL_CALIBRATION][SELECTED_LINES] "
                     f"width_px={selected_width:.3f} pixel_to_micron={scale:.8f}"
@@ -434,10 +456,6 @@ class PipelineVisionService:
                         f"管道内宽 {self._channel_width_um:.1f} μm / {center:.2f} px，"
                         f"标定比例 {scale:.6f} μm/px"
                     )
-                    pipeline.detector.configure_expected_diameter(
-                        self._expected_diameter_um,
-                        self._pixel_to_micron,
-                    )
                     self._log(
                         "[VISION][CHANNEL_CALIBRATION][OK] "
                         f"width_um={self._channel_width_um:.3f} width_px={center:.3f} "
@@ -464,13 +482,13 @@ class PipelineVisionService:
             )
 
     def auto_calibrate_detection(self, duration_s: float = 3.0) -> dict[str, Any]:
-        started = time.time()
+        started = time.monotonic()
         with self._lock:
             baseline = self._processed_frame_count
             # Ensure calibration does not wait for the next normal control
             # period before it can collect a fresh five-frame sample.
             self._next_analysis_batch_time = 0.0
-        while time.time() - started < max(0.5, float(duration_s)) and not self._stop_event.is_set():
+        while time.monotonic() - started < max(0.5, float(duration_s)) and not self._stop_event.is_set():
             time.sleep(0.05)
         with self._lock:
             radii = [radius for sample_time, radius in self._observed_radii if sample_time >= started]
@@ -524,7 +542,7 @@ class PipelineVisionService:
         return float(len(recent))
 
     def _diagnostics(self) -> dict[str, float | int | str]:
-        now = time.time()
+        now = time.monotonic()
         with self._lock:
             period_start = now - self._control_interval_ms / 1000.0
             capture_fps = self._rate(self._capture_times, now)
@@ -787,9 +805,9 @@ class PipelineVisionService:
                 applied = self._camera_service.configure_camera(self._camera_parameters)
                 self._log(f"[VISION][CAMERA][PARAMETERS] {applied}")
             self._camera_service.start_camera_stream()
-            deadline = time.time() + 3.0
+            deadline = time.monotonic() + 3.0
             packet = self._camera_service.get_latest_frame()
-            while time.time() < deadline and (not packet.valid or packet.image is None):
+            while time.monotonic() < deadline and (not packet.valid or packet.image is None):
                 time.sleep(0.03)
                 packet = self._camera_service.get_latest_frame()
             if not packet.valid or packet.image is None:
@@ -962,6 +980,7 @@ class PipelineVisionService:
                 return False, None, ""
             self._last_processed_frame_id = frame_id
             self._last_processed_frame_timestamp = timestamp or time.time()
+            self._last_camera_packet = packet
             return True, packet.image, ""
 
         with self._lock:
@@ -990,7 +1009,7 @@ class PipelineVisionService:
         observed_ids = {int(track_id) for track_id, _ in result.tracking.matched_pairs}
         observed_ids.update(int(track_id) for track_id in result.tracking.new_track_ids)
         with self._lock:
-            sample_time = time.time()
+            sample_time = time.monotonic()
             calibration_frame = self._ensure_pipeline().rectify_selected_channel(frame)
             if calibration_frame is None:
                 calibration_frame = frame
@@ -1048,6 +1067,9 @@ class PipelineVisionService:
             frame_b64, width, height = self._encode_png_base64(frame)
         scale = float(self._pixel_to_micron)
         frame_diameters = [float(value) * scale for value in control.frame_diameters]
+        raw_frame_diameters = [
+            float(value) * scale for value in control.raw_frame_diameters
+        ]
         frame_avg_diameter = (float(avg_px) * scale) if avg_px is not None else None
         frame_diameter_sum = float(control.frame_diameter_sum) * scale
         frame_diameter_std = (
@@ -1056,6 +1078,8 @@ class PipelineVisionService:
             else None
         )
         diagnostics = self._diagnostics()
+        resolved_frame_id = int(frame_id if frame_id is not None else result.frame_index)
+        frame_meta = self._frame_metadata.get(resolved_frame_id, {})
         return RecognitionSnapshot(
             frame_droplet_count=active_count,
             total_droplet_count=total_count,
@@ -1074,8 +1098,8 @@ class PipelineVisionService:
             frame_height=height,
             video_source_type=self._video_source_type,
             video_source=self._video_source,
-            frame_id=int(frame_id if frame_id is not None else result.frame_index),
-            preview_frame_id=int(frame_id if frame_id is not None else result.frame_index),
+            frame_id=resolved_frame_id,
+            preview_frame_id=resolved_frame_id,
             preview_timestamp=float(timestamp or result.timestamp),
             frame_single_cell_count=int(control.frame_single_cell_count),
             frame_diameters=frame_diameters,
@@ -1084,6 +1108,14 @@ class PipelineVisionService:
             frame_single_cell_rate=control.frame_single_cell_rate,
             frame_diameter_std=frame_diameter_std,
             frame_diameter_cv=control.frame_diameter_cv,
+            raw_frame_diameters=raw_frame_diameters,
+            raw_frame_diameter_cv=control.raw_frame_diameter_cv,
+            filtering_rule=control.filtering_rule,
+            session_id=str(frame_meta.get("session_id", "") or ""),
+            run_generation=int(frame_meta.get("run_generation", 0) or 0),
+            capture_monotonic=float(frame_meta.get("capture_monotonic", 0.0) or 0.0),
+            hardware_frame_id=int(frame_meta.get("hardware_frame_id", 0) or 0),
+            hardware_timestamp=float(frame_meta.get("hardware_timestamp", 0.0) or 0.0),
             uniformity_valid=bool(control.uniformity_valid),
             uniformity_status=str(control.uniformity_status or ""),
             uniformity_reason=str(control.uniformity_reason or ""),
@@ -1093,12 +1125,22 @@ class PipelineVisionService:
             speed_sample_count=self._speed_sample_count,
             droplet_generation_rate_hz=self._droplet_generation_rate_hz,
             pixel_to_micron=scale,
-            scale_source=("channel_430um" if self._channel_calibration_status == "calibrated" else "configured"),
+            scale_source=(
+                "channel_430um"
+                if self._channel_calibration_status == "calibrated"
+                else ("calibration_file" if self._calibration_metadata else "configured_unverified")
+            ),
             channel_width_um=(self._channel_width_um if self._channel_calibration_enabled else None),
             channel_width_px=self._channel_width_px,
             channel_calibration_status=self._channel_calibration_status,
             channel_calibration_confidence=self._channel_calibration_confidence,
             channel_calibration_reason=self._channel_calibration_reason,
+            calibration_id=str(self._calibration_metadata.get("calibration_id", "") or ""),
+            calibration_uncertainty_um_per_px=(
+                None
+                if self._calibration_metadata.get("uncertainty_um_per_px") is None
+                else float(self._calibration_metadata["uncertainty_um_per_px"])
+            ),
             **diagnostics,
         )
 
@@ -1322,13 +1364,31 @@ class PipelineVisionService:
                 time.sleep(0.001 if not error else 0.03)
                 continue
             try:
+                packet = self._last_camera_packet if self._is_realtime_mode() else None
                 with self._lock:
-                    self._capture_frame_id += 1
-                    frame_id = self._capture_frame_id
-                timestamp = time.time()
+                    if packet is not None and int(packet.frame_id or 0) > 0:
+                        frame_id = int(packet.frame_id)
+                    else:
+                        self._capture_frame_id += 1
+                        frame_id = self._capture_frame_id
+                timestamp = float(packet.timestamp) if packet is not None else time.time()
+                capture_monotonic = (
+                    float(packet.host_monotonic_timestamp)
+                    if packet is not None and float(packet.host_monotonic_timestamp or 0.0) > 0.0
+                    else time.monotonic()
+                )
                 with self._lock:
-                    self._capture_times.append(timestamp)
-                if self._should_publish_preview(timestamp):
+                    self._capture_times.append(capture_monotonic)
+                    self._frame_metadata[frame_id] = {
+                        "capture_monotonic": capture_monotonic,
+                        "hardware_frame_id": int(getattr(packet, "hardware_frame_id", 0) or 0),
+                        "hardware_timestamp": float(getattr(packet, "hardware_timestamp_ticks", 0) or 0),
+                        "session_id": self._session_id,
+                        "run_generation": self._run_generation,
+                    }
+                    while len(self._frame_metadata) > 512:
+                        self._frame_metadata.pop(next(iter(self._frame_metadata)))
+                if self._should_publish_preview(capture_monotonic):
                     self._submit_preview_frame(frame_id, timestamp, frame)
                 self._submit_sampling_frame(frame_id, timestamp, frame)
             except Exception as exc:
@@ -1378,11 +1438,17 @@ class PipelineVisionService:
                         timestamp=timestamp,
                     )
                     with self._lock:
-                        completed_at = time.time()
+                        completed_at = time.monotonic()
+                        frame_meta = self._frame_metadata.get(int(frame_id), {})
+                        capture_monotonic = float(frame_meta.get("capture_monotonic", 0.0) or 0.0)
                         self._algorithm_processing_ms = max(0.0, (time.perf_counter() - processing_started) * 1000.0)
                         self._processing_times.append(completed_at)
                         self._processed_frame_count += 1
-                        self._recognition_latency_ms = max(0.0, (completed_at - timestamp) * 1000.0)
+                        self._recognition_latency_ms = (
+                            max(0.0, (completed_at - capture_monotonic) * 1000.0)
+                            if capture_monotonic > 0.0
+                            else self._algorithm_processing_ms
+                        )
                     # Candidate scoring contains Python loops. Yield briefly so
                     # the preview producer and Tk main loop are not starved by
                     # a five-frame analysis burst.
@@ -1416,6 +1482,7 @@ class PipelineVisionService:
         if frame_jpeg is None:
             return
         with self._lock:
+            frame_meta = self._frame_metadata.get(int(frame_id), {})
             self._latest_preview = FrameSnapshot(
                 frame_id=int(frame_id),
                 timestamp=float(timestamp),
@@ -1426,6 +1493,11 @@ class PipelineVisionService:
                 frame_pgm=None,
                 frame_jpeg=frame_jpeg,
                 reason="",
+                session_id=str(frame_meta.get("session_id", "") or ""),
+                run_generation=int(frame_meta.get("run_generation", 0) or 0),
+                capture_monotonic=float(frame_meta.get("capture_monotonic", 0.0) or 0.0),
+                hardware_frame_id=int(frame_meta.get("hardware_frame_id", 0) or 0),
+                hardware_timestamp=float(frame_meta.get("hardware_timestamp", 0.0) or 0.0),
             )
 
     def _submit_preview_frame(self, frame_id: int, timestamp: float, frame) -> None:
@@ -1508,7 +1580,7 @@ class PipelineVisionService:
             replaced = self._frame_queue.get_nowait()
             with self._lock:
                 self._replaced_processing_frames += len(replaced)
-                self._replacement_times.extend([time.time()] * len(replaced))
+                self._replacement_times.extend([time.monotonic()] * len(replaced))
         except queue.Empty:
             pass
         try:

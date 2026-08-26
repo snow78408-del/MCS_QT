@@ -28,12 +28,9 @@ class KalmanTracker(BaseTracker):
         self._config = config
         self._tracks: List[_KalmanTrack] = []
         self._next_id = 1
+        self._last_timestamp: float | None = None
 
-        dt = self._config.kalman.dt
-        self._f = np.array(
-            [[1.0, 0.0, dt, 0.0], [0.0, 1.0, 0.0, dt], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]],
-            dtype=np.float32,
-        )
+        self._f = self._transition(float(self._config.kalman.dt))
         self._h = np.array([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]], dtype=np.float32)
         self._q = np.eye(4, dtype=np.float32) * float(self._config.kalman.process_noise)
         self._r = np.eye(2, dtype=np.float32) * float(self._config.kalman.measurement_noise)
@@ -43,6 +40,13 @@ class KalmanTracker(BaseTracker):
         track.state = self._f @ track.state
         track.covariance = self._f @ track.covariance @ self._f.T + self._q
         return track.state[:2, 0].copy()
+
+    @staticmethod
+    def _transition(dt: float) -> np.ndarray:
+        return np.array(
+            [[1.0, 0.0, dt, 0.0], [0.0, 1.0, 0.0, dt], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]],
+            dtype=np.float32,
+        )
 
     def _update_with_measurement(self, track: _KalmanTrack, measurement: np.ndarray) -> None:
         z = measurement.reshape(2, 1)
@@ -71,7 +75,16 @@ class KalmanTracker(BaseTracker):
         self,
         detections: Sequence[np.ndarray],
         radii: Optional[Sequence[float]] = None,
+        timestamp: float | None = None,
     ) -> TrackingResult:
+        default_dt = max(1e-3, float(self._config.kalman.dt))
+        if timestamp is None or self._last_timestamp is None:
+            dt = default_dt
+        else:
+            dt = min(5.0, max(1e-3, float(timestamp) - self._last_timestamp))
+        if timestamp is not None:
+            self._last_timestamp = float(timestamp)
+        self._f = self._transition(dt)
         points = as_points(detections)
         radius_values = list(radii) if radii is not None else [0.0] * len(points)
         if len(radius_values) < len(points):
@@ -145,6 +158,7 @@ class KalmanTracker(BaseTracker):
     def reset(self) -> None:
         self._tracks = []
         self._next_id = 1
+        self._last_timestamp = None
 
     def get_active_tracks(self) -> List[DropletTrack]:
         tracks: List[DropletTrack] = []

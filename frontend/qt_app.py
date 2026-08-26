@@ -12,7 +12,7 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QObject, QPoint, QRect, QRunnable, QSize, Qt, QThread, QThreadPool, QTimer, Signal, Slot
+from PySide6.QtCore import QLockFile, QObject, QPoint, QRect, QRunnable, QSize, Qt, QThread, QThreadPool, QTimer, Signal, Slot
 from PySide6.QtGui import QColor, QCloseEvent, QFont, QFontDatabase, QImage, QMouseEvent, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout,
     QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
@@ -21,10 +21,12 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFil
 
 from backend.orchestrator import OrchestratorService
 from backend.orchestrator.models import SystemConfig
+from backend.vision.calibration import load_calibration
 from .config import APP_TITLE, DEFAULT_REFRESH_INTERVAL_MS
 from .runtime_logging import create_runtime_logger
 from .settings_store import FrontendSettingsStore
 from .vision_tuning import TuningWindow
+from .paths import ensure_user_subdir
 
 
 def jsonable(value):
@@ -260,18 +262,30 @@ class ParameterPage(Page):
         self.target = self.field(form, "目标液滴直径 (μm)", cfg.get("target_diameter", 60))
         self.mag = self.field(form, "总放大倍率", cfg.get("magnification", 10))
         self.pixel = self.field(form, "相机像元尺寸 (μm)", cfg.get("camera_pixel_size_um", 6.9))
-        self.interval = self.field(form, "控制周期 (ms)", cfg.get("control_interval_ms", 300))
+        self.interval = self.field(form, "控制周期 (ms)", cfg.get("control_interval_ms", 500))
+        calibration_row=QWidget(); calibration_layout=QHBoxLayout(calibration_row); calibration_layout.setContentsMargins(0,0,0,0)
+        self.calibration_path=QLineEdit(str(cfg.get("calibration_path",""))); calibration_button=QPushButton("选择…"); calibration_button.clicked.connect(self._browse_calibration)
+        calibration_layout.addWidget(self.calibration_path,1); calibration_layout.addWidget(calibration_button); form.addRow("版本化标定 JSON",calibration_row)
         button = QPushButton("保存并选择视频源"); button.clicked.connect(self.submit); form.addRow("", button)
         layout.addWidget(box); layout.addStretch()
+
+    def _browse_calibration(self):
+        path,_=QFileDialog.getOpenFileName(self,"选择像素标定文件",self.calibration_path.text(),"JSON 文件 (*.json)")
+        if path:self.calibration_path.setText(path)
 
     def submit(self):
         try:
             target, mag, pixel = float(self.target.text()), float(self.mag.text()), float(self.pixel.text())
             interval = int(float(self.interval.text()))
-            if min(target, mag, pixel, interval) <= 0: raise ValueError("所有参数都必须大于 0")
-        except ValueError as exc: return self.app.error("参数错误", str(exc))
+            if min(target, mag, pixel) <= 0 or not 500<=interval<=30000: raise ValueError("光学参数必须大于 0，控制周期必须为 500–30000 ms")
+            calibration_path=self.calibration_path.text().strip(); calibration={}
+            scale=pixel/mag
+            if calibration_path:
+                record=load_calibration(calibration_path); calibration=record.to_dict(); scale=record.pixel_to_micron
+        except (ValueError,OSError) as exc: return self.app.error("参数错误", str(exc))
         self.app.save(target_diameter=target, magnification=mag, camera_pixel_size_um=pixel,
-                      pixel_to_micron=pixel / mag, control_interval_ms=interval)
+                      pixel_to_micron=scale, control_interval_ms=interval,
+                      calibration_path=calibration_path,calibration=calibration)
         self.app.show_page("video")
 
 
@@ -577,7 +591,7 @@ class PumpPage(Page):
         data=self.ports.currentData()
         if not data: raise ValueError("未发现或未选择串口设备")
         address=int(self.address.text()); baud=int(self.baud.text()); q1=float(self.q1.text()); q2=float(self.q2.text())
-        if not 0<=address<=255 or min(baud,q1,q2)<=0: raise ValueError("地址、波特率或流量参数无效")
+        if not 1<=address<=31 or min(baud,q1,q2)<=0 or max(q1,q2)>5000: raise ValueError("泵地址必须为 1–31，流量必须在 (0, 5000] μL/min")
         if q1 < q2 + 0.2: raise ValueError("油相 Q1 必须至少比水相 Q2 大 0.2 uL/min")
         return {"port":str(data["device"]),"address":address,"baudrate":baud,"parity":self.parity.currentText(),"q1":q1,"q2":q2}
 
@@ -624,7 +638,7 @@ class InitPage(Page):
     def initialize(self):
         try:
             q1,q2=float(self.q1.text()),float(self.q2.text()); address,baud=int(self.address.text()),int(self.baud.text()); port=self.port.text().strip().upper()
-            if min(q1,q2,baud)<=0 or not 0<=address<=255: raise ValueError("流量、地址或波特率无效")
+            if min(q1,q2,baud)<=0 or max(q1,q2)>5000 or not 1<=address<=31: raise ValueError("泵地址必须为 1–31，流量必须在 (0, 5000] μL/min")
             if self.app.frontend_config.get("video_source_type")!="file" and not port: raise ValueError("泵串口不能为空")
         except ValueError as exc: return self.app.error("初始化参数错误",str(exc))
         self.app.save(initial_q1=q1,initial_q2=q2,pump_port=port,pump_address=address,pump_baudrate=baud,pump_parity=self.parity.currentText())
@@ -719,8 +733,10 @@ class MonitorPage(Page):
         layout = QVBoxLayout(self)
         layout.addWidget(app.title("运行监控", "视频、识别、泵机与 PID 状态分别刷新"))
         controls=QHBoxLayout()
-        for text,callback in (("初始化",app.configure_prepare_initialize),("开始",app.orchestrator.start),("暂停",app.orchestrator.pause),("继续",app.orchestrator.resume)):
-            button=QPushButton(text); button.clicked.connect(lambda _=False,cb=callback:app.task(cb)); controls.addWidget(button)
+        self.action_buttons={}
+        for text,callback in (("初始化",app.configure_prepare_initialize),("开始",app.orchestrator.start),("暂停",app.orchestrator.pause),("继续",app.orchestrator.resume),("复位安全锁",app.orchestrator.reset_safety_latch)):
+            button=QPushButton(text); button.clicked.connect(lambda _=False,cb=callback:app.task(cb)); controls.addWidget(button); self.action_buttons[text]=button
+        self.preflight_button=QPushButton("实验前检查"); self.preflight_button.clicked.connect(self._run_preflight); controls.addWidget(self.preflight_button)
         self.stop_button=QPushButton("停止"); self.stop_button.clicked.connect(self._stop_pid); controls.addWidget(self.stop_button)
         self.gallery_button = QPushButton("上一周期识别帧")
         self.gallery_button.clicked.connect(self._show_last_period_droplets)
@@ -800,6 +816,16 @@ class MonitorPage(Page):
             disable=self.gallery_button,
         )
 
+    def _run_preflight(self):
+        self.app.task(self.app.orchestrator.run_preflight_check,self._show_preflight,disable=self.preflight_button)
+
+    def _show_preflight(self,result):
+        issues=list((result or {}).get("issues",[]) or [])
+        if not issues:
+            QMessageBox.information(self,"实验前检查","检查通过：状态、停泵确认、像素标定和泵通信满足启动条件。")
+            return
+        QMessageBox.warning(self,"实验前检查未通过","\n".join(f"• {item}" for item in issues))
+
     def _open_droplet_gallery(self, gallery):
         if self._gallery_dialog is not None:
             self._gallery_dialog.close()
@@ -815,21 +841,21 @@ class MonitorPage(Page):
         self.app.task(self.app.orchestrator.stop, self._after_pid_stopped, disable=self.stop_button)
 
     def _after_pid_stopped(self, _result=None):
-        status=self.app.orchestrator.get_pid_session_data_status(); count=int(status.get("record_count",0) or 0)
+        status=self.app.orchestrator.get_pid_session_data_status(); count=int(status.get("record_count",0) or 0); summary=self._experiment_summary(count)
         if count <= 0 or not bool(status.get("has_unsaved_data",False)):
-            QMessageBox.information(self,"PID 已停止","本次运行没有尚未保存的 PID 数据。")
+            QMessageBox.information(self,"实验结束摘要",summary+"\n本次运行没有尚未保存的 PID 数据。")
             return
         answer=QMessageBox.question(
             self,
             "保存本次 PID 数据",
-            f"PID 已停止，本次共记录 {count} 个控制周期。\n是否保存到 SQLite 数据库？",
+            summary+"\n是否保存到 SQLite 数据库？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes,
         )
         if answer == QMessageBox.StandardButton.No:
             self.app.orchestrator.discard_pid_session_data()
             return
-        default_dir=Path(str(self.app.frontend_config.get("pid_database_dir",Path.cwd())))
+        default_dir=Path(str(self.app.frontend_config.get("pid_database_dir",ensure_user_subdir("experiments"))))
         default_name=f"pid_data_{time.strftime('%Y%m%d_%H%M%S')}.sqlite"
         selected,_=QFileDialog.getSaveFileName(
             self,
@@ -848,6 +874,15 @@ class MonitorPage(Page):
             lambda:self.app.orchestrator.save_pid_session_data(str(database_path)),
             self._pid_data_saved,
         )
+
+    def _experiment_summary(self,count):
+        try:snapshot=self.app.orchestrator.get_snapshot()
+        except Exception:return f"PID 已停止，本次共记录 {count} 个控制周期。"
+        recognition=getattr(snapshot,"recognition",None); pump=getattr(snapshot,"pump_state",None)
+        total=int(getattr(recognition,"total_droplet_count",0) or 0); cv=getattr(recognition,"raw_frame_diameter_cv",None)
+        cv_text="--" if cv is None else f"{float(cv):.2f}%"
+        physical="是" if bool(getattr(pump,"physical_flow_measured",False)) else "否（设备回读仅为参数换算值）"
+        return f"PID 已停止，本次记录 {count} 个控制周期；累计液滴 {total}；末周期原始 CV {cv_text}；物理流量测量：{physical}。"
 
     def _pid_data_saved(self, result):
         QMessageBox.information(
@@ -898,9 +933,24 @@ class MonitorPage(Page):
 
     def refresh_system_panel(self):
         try:
-            self._set_panel(self.system_panel, self._system_text(self.app.orchestrator.get_snapshot()))
+            snapshot=self.app.orchestrator.get_snapshot()
+            self._set_panel(self.system_panel, self._system_text(snapshot))
+            self._update_operation_matrix(snapshot)
         except Exception as exc:
             self._set_panel(self.system_panel, f"系统状态读取失败：{exc}")
+
+    def _update_operation_matrix(self, snapshot):
+        state=str(getattr(getattr(snapshot,"system_state",None),"value",getattr(snapshot,"system_state",""))).upper()
+        allowed={
+            "初始化":{"IDLE","CONFIGURED","VIDEO_READY","STOPPED","ERROR"},
+            "开始":{"INITIALIZED","PAUSED","STOPPED"},
+            "暂停":{"RUNNING"},
+            "继续":{"PAUSED"},
+            "复位安全锁":{"ERROR"},
+        }
+        for name,button in self.action_buttons.items():
+            button.setEnabled(state in allowed[name])
+        self.stop_button.setEnabled(state in {"RUNNING","PAUSED","INITIALIZING","ERROR"})
 
     def refresh_vision_panel(self):
         try:
@@ -971,20 +1021,25 @@ class MonitorPage(Page):
             f"平均直径：{number(getattr(rec,'avg_diameter',None))} μm",
             f"液滴速度：{number(getattr(rec,'average_droplet_speed_um_s',None))} μm/s",
             f"速度样本数：{getattr(rec,'speed_sample_count',0)}",
-            f"单细胞率：{number(getattr(rec,'single_cell_rate',None))}%",
+            f"累计液滴级单珠率：{number(getattr(rec,'single_cell_rate',None))}%",
+            f"本周期液滴级单珠率：{number(getattr(rec,'frame_single_cell_rate',None))}%",
+            f"原始/筛选后直径 CV：{number(getattr(rec,'raw_frame_diameter_cv',None))}% / {number(getattr(rec,'frame_diameter_cv',None))}%",
+            f"筛选规则：{getattr(rec,'filtering_rule','none')}",
             f"可用于控制：{yes(getattr(rec,'valid_for_control',False))}",
             f"管道标定：{calibration_status}",
             f"管道内宽：{number(getattr(rec,'channel_width_px',None))} px",
             f"比例：{number(getattr(rec,'pixel_to_micron',None),6)} μm/px",
+            f"比例来源/标定 ID：{getattr(rec,'scale_source','--')} / {getattr(rec,'calibration_id','') or '--'}",
+            f"硬件帧号：{getattr(rec,'hardware_frame_id',0) or '--'}",
             f"采集/处理：{number(getattr(rec,'capture_fps',0),1)} / {number(getattr(rec,'processing_fps',0),1)} FPS",
-            f"识别延迟：{number(getattr(rec,'recognition_latency_ms',0),1)} ms",
+            f"主机取帧后识别延迟：{number(getattr(rec,'recognition_latency_ms',0),1)} ms",
             f"说明：{getattr(rec,'reason','') or '无'}",
         ])
 
     @staticmethod
     def _pump_text(snap):
         pump = getattr(snap, "pump_state", None)
-        _state, _yes, _number = MonitorPage._display_helpers(snap)
+        _state, yes, number = MonitorPage._display_helpers(snap)
         if pump is None:
             return "等待泵机数据…"
         channels = dict(getattr(pump, "channels", {}) or {})
@@ -1009,6 +1064,10 @@ class MonitorPage(Page):
             f"泵机：{'正常运行' if pump_normal else '未正常运行'}",
             f"Q1：{channel_status(q1_channel)}",
             f"Q2：{channel_status(q2_channel)}",
+            f"设定值 Q1/Q2：{number(getattr(pump,'q1',None))} / {number(getattr(pump,'q2',None))} μL/min",
+            f"设备参数换算值 Q1/Q2：{number(getattr(pump,'q1_actual',None))} / {number(getattr(pump,'q2_actual',None))} μL/min",
+            f"物理流量已测量：{yes(getattr(pump,'physical_flow_measured',False))}",
+            f"泵物理响应延迟：{number(getattr(pump,'pump_response_delay_ms',None),1)} ms（{getattr(pump,'pump_response_measurement_status','unmeasured')}）",
         ])
 
     @staticmethod
@@ -1122,7 +1181,7 @@ class FrontendApp(QMainWindow):
     def build_system_config(self):
         cfg=self.frontend_config; required=("target_diameter","pixel_to_micron","video_source_type","video_source","initial_q1","initial_q2","control_interval_ms"); missing=[k for k in required if k not in cfg]
         if missing: raise ValueError(f"缺少配置字段: {', '.join(missing)}")
-        return SystemConfig(target_diameter=float(cfg["target_diameter"]),pixel_to_micron=float(cfg["pixel_to_micron"]),video_source_type=str(cfg["video_source_type"]),video_source=str(cfg["video_source"]),initial_q1=float(cfg["initial_q1"]),initial_q2=float(cfg["initial_q2"]),control_interval_ms=int(cfg["control_interval_ms"]),pump_port=str(cfg.get("pump_port","")),pump_address=int(cfg.get("pump_address",1)),pump_baudrate=int(cfg.get("pump_baudrate",1200)),pump_parity=str(cfg.get("pump_parity","N")),mvs_sdk_path=str(cfg.get("mvs_sdk_path","")),camera_backend=str(cfg.get("camera_backend","")),camera_parameters=dict(cfg.get("camera_parameters",{}) or {}),recognition_roi=dict(cfg.get("recognition_roi",{}) or {}))
+        return SystemConfig(target_diameter=float(cfg["target_diameter"]),pixel_to_micron=float(cfg["pixel_to_micron"]),video_source_type=str(cfg["video_source_type"]),video_source=str(cfg["video_source"]),initial_q1=float(cfg["initial_q1"]),initial_q2=float(cfg["initial_q2"]),control_interval_ms=int(cfg["control_interval_ms"]),pump_port=str(cfg.get("pump_port","")),pump_address=int(cfg.get("pump_address",1)),pump_baudrate=int(cfg.get("pump_baudrate",1200)),pump_parity=str(cfg.get("pump_parity","N")),mvs_sdk_path=str(cfg.get("mvs_sdk_path","")),camera_backend=str(cfg.get("camera_backend","")),camera_parameters=dict(cfg.get("camera_parameters",{}) or {}),recognition_roi=dict(cfg.get("recognition_roi",{}) or {}),calibration=dict(cfg.get("calibration",{}) or {}))
     def configure_prepare_initialize(self):
         cfg=self.build_system_config(); self.orchestrator.configure(cfg); self.orchestrator.prepare_video(); self.orchestrator.initialize_system()
     def task(self,task,on_success=None,on_error=None,disable=None):
@@ -1150,7 +1209,7 @@ class FrontendApp(QMainWindow):
                 QMessageBox.StandardButton.Yes,
             )
             if answer == QMessageBox.StandardButton.Yes:
-                default_dir=Path(str(self.frontend_config.get("pid_database_dir",Path.cwd())))
+                default_dir=Path(str(self.frontend_config.get("pid_database_dir",ensure_user_subdir("experiments"))))
                 default_name=f"pid_data_{time.strftime('%Y%m%d_%H%M%S')}.sqlite"
                 selected,_=QFileDialog.getSaveFileName(self,"选择 PID 数据库保存位置",str(default_dir/default_name),"SQLite 数据库 (*.sqlite *.db)")
                 if not selected:
@@ -1179,6 +1238,11 @@ def _configure_application_font(application: QApplication) -> None:
 
 
 def main():
-    mp.freeze_support(); application=QApplication.instance() or QApplication(sys.argv); _configure_application_font(application); application.setApplicationName(APP_TITLE); window=FrontendApp(); window.show(); raise SystemExit(application.exec())
+    mp.freeze_support(); application=QApplication.instance() or QApplication(sys.argv); _configure_application_font(application); application.setApplicationName(APP_TITLE)
+    instance_lock=QLockFile(str(ensure_user_subdir("runtime") / "application.lock")); instance_lock.setStaleLockTime(0)
+    if not instance_lock.tryLock(100):
+        QMessageBox.critical(None,"程序已在运行","检测到另一个程序实例；为避免串口和数据文件冲突，本次启动已取消。")
+        raise SystemExit(2)
+    window=FrontendApp(); window.show(); raise SystemExit(application.exec())
 
 if __name__ == "__main__": main()

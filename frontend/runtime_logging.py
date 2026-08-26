@@ -5,6 +5,8 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+from .paths import ensure_user_subdir
+
 
 class RuntimeLogger:
     def __init__(self, log_path: Path) -> None:
@@ -16,9 +18,8 @@ class RuntimeLogger:
 
 
 def create_runtime_logger() -> RuntimeLogger:
-    project_root = Path(__file__).resolve().parents[1]
-    log_dir = project_root / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = ensure_user_subdir("logs")
+    _prune_runtime_logs(log_dir)
     log_path = log_dir / f"runtime_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 
     handler = RotatingFileHandler(
@@ -41,3 +42,25 @@ def create_runtime_logger() -> RuntimeLogger:
     logger = RuntimeLogger(log_path)
     logger(f"[APP][START] runtime log file={log_path}")
     return logger
+
+
+def _prune_runtime_logs(log_dir: Path, *, max_files: int = 50, max_total_bytes: int = 250 * 1024 * 1024) -> None:
+    resolved_dir = log_dir.resolve()
+    files = sorted(
+        (path for path in resolved_dir.glob("runtime_*.log*") if path.is_file()),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    retained_bytes = 0
+    for index, path in enumerate(files):
+        try:
+            size = path.stat().st_size
+            keep = index < max_files and retained_bytes + size <= max_total_bytes
+            if keep:
+                retained_bytes += size
+                continue
+            resolved = path.resolve()
+            if resolved.parent == resolved_dir:
+                resolved.unlink(missing_ok=True)
+        except OSError:
+            continue

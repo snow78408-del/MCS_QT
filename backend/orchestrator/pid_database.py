@@ -5,6 +5,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from collections import deque
 from contextlib import closing
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -46,13 +47,16 @@ class PIDFlowSample:
 class PIDSessionRecorder:
     """Collect one PID run in memory and persist it only when requested."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_samples: int = 100_000) -> None:
         self._lock = threading.RLock()
         self._session_id: str | None = None
         self._started_at: float | None = None
         self._stopped_at: float | None = None
         self._metadata: dict[str, Any] = {}
-        self._samples: list[PIDFlowSample] = []
+        self._max_samples = max(1, int(max_samples))
+        self._samples: deque[PIDFlowSample] = deque(maxlen=self._max_samples)
+        self._next_sequence_no = 1
+        self._dropped_sample_count = 0
         self._active = False
         self._saved = False
 
@@ -64,7 +68,9 @@ class PIDSessionRecorder:
             self._started_at = time.time()
             self._stopped_at = None
             self._metadata = dict(metadata or {})
-            self._samples = []
+            self._samples = deque(maxlen=self._max_samples)
+            self._next_sequence_no = 1
+            self._dropped_sample_count = 0
             self._active = True
             self._saved = False
             return self._session_id
@@ -73,7 +79,12 @@ class PIDSessionRecorder:
         with self._lock:
             if not self._active:
                 return
-            self._samples.append(PIDFlowSample(sequence_no=len(self._samples) + 1, **values))
+            if len(self._samples) == self._max_samples:
+                self._dropped_sample_count += 1
+            self._samples.append(
+                PIDFlowSample(sequence_no=self._next_sequence_no, **values)
+            )
+            self._next_sequence_no += 1
 
     def finish_session(self) -> None:
         with self._lock:
@@ -95,6 +106,8 @@ class PIDSessionRecorder:
                 "has_unsaved_data": bool(self._samples) and not self._saved,
                 "started_at": self._started_at,
                 "stopped_at": self._stopped_at,
+                "max_samples": self._max_samples,
+                "dropped_sample_count": self._dropped_sample_count,
             }
 
     def discard(self) -> None:
@@ -103,7 +116,9 @@ class PIDSessionRecorder:
             self._started_at = None
             self._stopped_at = None
             self._metadata = {}
-            self._samples = []
+            self._samples = deque(maxlen=self._max_samples)
+            self._next_sequence_no = 1
+            self._dropped_sample_count = 0
             self._active = False
             self._saved = False
 
@@ -121,6 +136,7 @@ class PIDSessionRecorder:
             started_at = self._started_at
             stopped_at = self._stopped_at or time.time()
             metadata = dict(self._metadata)
+            metadata["dropped_sample_count"] = self._dropped_sample_count
             samples = [PIDFlowSample(**asdict(sample)) for sample in self._samples]
 
         with closing(sqlite3.connect(str(path))) as connection:

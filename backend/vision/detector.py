@@ -47,30 +47,14 @@ class DropletDetector:
         self._configured_preferred_radius = float(self._runtime_preferred_radius)
 
     def configure_expected_diameter(self, diameter_um: float, pixel_to_micron: float) -> None:
-        """Adapt pixel-domain detector limits to the configured physical size."""
-        diameter = float(diameter_um)
-        scale = float(pixel_to_micron)
-        if diameter <= 0.0 or scale <= 0.0:
-            return
+        """Compatibility hook; the PID target must never alter measurement.
 
-        expected = diameter / scale / 2.0
-        absolute_min = max(1.0, float(self._config.min_radius))
-        absolute_max = max(absolute_min + 1.0, float(self._config.max_radius))
-        if bool(self._config.expected_size_hard_gate):
-            runtime_min = max(absolute_min, expected * float(self._config.adaptive_min_radius_ratio))
-            runtime_max = min(absolute_max, expected * float(self._config.adaptive_max_radius_ratio))
-            if runtime_max <= runtime_min:
-                runtime_min = max(absolute_min, min(expected * 0.5, absolute_max - 1.0))
-                runtime_max = min(absolute_max, max(expected * 1.6, runtime_min + 1.0))
-        else:
-            runtime_min = absolute_min
-            runtime_max = absolute_max
-
-        self._runtime_min_radius = runtime_min
-        self._runtime_max_radius = runtime_max
-        self._runtime_preferred_radius = min(runtime_max, max(runtime_min, expected))
-        self._configured_preferred_radius = float(self._runtime_preferred_radius)
-        self._has_expected_size = True
+        Detector priors come only from detector configuration or an explicit
+        image-based calibration (`calibrate_preferred_radius`).  Keeping this
+        method as a no-op avoids silently reintroducing target leakage through
+        older callers.
+        """
+        _ = (diameter_um, pixel_to_micron)
 
     def reset_adaptive_size(self) -> None:
         self._runtime_preferred_radius = float(self._configured_preferred_radius)

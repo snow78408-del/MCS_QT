@@ -15,3 +15,21 @@ class SystemState(str, Enum):
     STOPPED = "STOPPED"
     ERROR = "ERROR"
 
+
+ALLOWED_TRANSITIONS: dict[SystemState, frozenset[SystemState]] = {
+    SystemState.IDLE: frozenset({SystemState.CONFIGURED, SystemState.ERROR}),
+    SystemState.CONFIGURED: frozenset({SystemState.VIDEO_READY, SystemState.INITIALIZING, SystemState.ERROR}),
+    SystemState.VIDEO_READY: frozenset({SystemState.INITIALIZING, SystemState.CONFIGURED, SystemState.ERROR}),
+    SystemState.INITIALIZING: frozenset({SystemState.INITIALIZED, SystemState.ERROR, SystemState.STOPPING}),
+    SystemState.INITIALIZED: frozenset({SystemState.RUNNING, SystemState.CONFIGURED, SystemState.STOPPING, SystemState.ERROR}),
+    SystemState.RUNNING: frozenset({SystemState.PAUSED, SystemState.STOPPING, SystemState.ERROR}),
+    SystemState.PAUSED: frozenset({SystemState.INITIALIZED, SystemState.STOPPING, SystemState.ERROR}),
+    SystemState.STOPPING: frozenset({SystemState.STOPPED, SystemState.ERROR}),
+    SystemState.STOPPED: frozenset({SystemState.CONFIGURED, SystemState.INITIALIZING, SystemState.RUNNING, SystemState.ERROR}),
+    SystemState.ERROR: frozenset({SystemState.CONFIGURED, SystemState.INITIALIZING, SystemState.STOPPING, SystemState.STOPPED}),
+}
+
+
+def transition_allowed(current: SystemState, target: SystemState) -> bool:
+    return current == target or target in ALLOWED_TRANSITIONS[current]
+

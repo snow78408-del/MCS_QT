@@ -138,6 +138,8 @@ class DirectHikrobotDllCamera:
         self._last_width = 0
         self._last_height = 0
         self._last_pixel_format = ""
+        self._frame_buffer = None
+        self._frame_buffer_size = 0
 
     @classmethod
     def find_dll(cls, config: Any | None = None) -> Path | None:
@@ -256,6 +258,8 @@ class DirectHikrobotDllCamera:
             self._safe_call("MV_CC_DestroyHandle")
         self._handle = c_void_p()
         self._opened = False
+        self._frame_buffer = None
+        self._frame_buffer_size = 0
         self._device = None
 
     def start_stream(self) -> None:
@@ -275,10 +279,15 @@ class DirectHikrobotDllCamera:
     def read_frame(self, timeout_ms: int = 1000) -> FrameData:
         if not self._streaming:
             return FrameData(None, self._frame_id, time.time(), source_backend=self.backend_name, valid=False, error="HIKROBOT direct camera is not streaming")
-        buffer_size = int(getattr(self.config, "hikrobot_direct_buffer_mb", 64) or 64) * 1024 * 1024
-        buffer = (c_ubyte * buffer_size)()
+        buffer_size = int(getattr(self.config, "hikrobot_direct_buffer_mb", 16) or 16) * 1024 * 1024
+        if self._frame_buffer is None or self._frame_buffer_size != buffer_size:
+            self._frame_buffer = (c_ubyte * buffer_size)()
+            self._frame_buffer_size = buffer_size
+        buffer = self._frame_buffer
         info = DirectFrameInfo()
         ret = self._dll.MV_CC_GetOneFrameTimeout(self._handle, buffer, buffer_size, byref(info), int(timeout_ms))
+        host_wall = time.time()
+        host_monotonic = time.monotonic()
         if ret != 0:
             self._last_error = f"MV_CC_GetOneFrameTimeout failed: {_ret_hex(ret)}"
             return FrameData(None, self._frame_id, time.time(), source_backend=self.backend_name, valid=False, error=self._last_error)
@@ -296,19 +305,28 @@ class DirectHikrobotDllCamera:
             raw = np.ctypeslib.as_array(buffer)[:actual_len].copy()
             image, pixel_name = self._convert_frame(raw, width, height, pixel_type, actual_len)
             self._frame_id += 1
+            hardware_frame_id = int(info.nFrameNum)
+            device_ticks = (int(info.nDevTimeStampHigh) << 32) | int(info.nDevTimeStampLow)
+            sdk_host_ticks = (int(info.nHostTimeStamp[0]) << 32) | int(info.nHostTimeStamp[1])
             self._last_width = width
             self._last_height = height
             self._last_pixel_format = pixel_name
             return FrameData(
                 image=image,
-                frame_id=self._frame_id,
-                timestamp=time.time(),
+                frame_id=hardware_frame_id or self._frame_id,
+                timestamp=host_wall,
                 width=width,
                 height=height,
                 pixel_format=pixel_name,
                 source_backend=self.backend_name,
                 device_unique_id=self._device.unique_id if self._device else "",
                 valid=True,
+                host_monotonic_timestamp=host_monotonic,
+                hardware_frame_id=hardware_frame_id,
+                hardware_timestamp_ticks=device_ticks,
+                sdk_host_timestamp_ticks=sdk_host_ticks,
+                lost_packet_count=int(info.nLostPacket),
+                exposure_time_us=float(info.fExposureTime),
             )
         except Exception as exc:
             self._last_error = str(exc)

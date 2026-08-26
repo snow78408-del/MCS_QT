@@ -18,6 +18,7 @@ class DropletTrack:
     age: int = 1
     is_active: bool = True
     metadata: Dict[str, float] = field(default_factory=dict)
+    last_timestamp: float | None = None
 
     def __post_init__(self) -> None:
         self.position = np.asarray(self.position, dtype=np.float32)
@@ -41,6 +42,7 @@ class BaseTracker(ABC):
         self,
         detections: Sequence[np.ndarray],
         radii: Optional[Sequence[float]] = None,
+        timestamp: float | None = None,
     ) -> TrackingResult:
         raise NotImplementedError
 

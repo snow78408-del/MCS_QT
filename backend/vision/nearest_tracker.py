@@ -17,12 +17,21 @@ class NearestTracker(BaseTracker):
         self._config = config
         self._tracks: List[DropletTrack] = []
         self._next_id = 1
+        self._last_timestamp: float | None = None
 
     def update(
         self,
         detections: Sequence[np.ndarray],
         radii: Optional[Sequence[float]] = None,
+        timestamp: float | None = None,
     ) -> TrackingResult:
+        default_dt = max(1e-3, float(self._config.kalman.dt))
+        if timestamp is None or self._last_timestamp is None:
+            dt = default_dt
+        else:
+            dt = min(5.0, max(1e-3, float(timestamp) - self._last_timestamp))
+        if timestamp is not None:
+            self._last_timestamp = float(timestamp)
         points = as_points(detections)
         radius_values = list(radii) if radii is not None else [0.0] * len(points)
         if len(radius_values) < len(points):
@@ -46,7 +55,8 @@ class NearestTracker(BaseTracker):
             prev = track.position.copy()
             track.position = points[det_idx]
             track.predicted_position = points[det_idx].copy()
-            track.velocity = track.position - prev
+            track.velocity = (track.position - prev) / dt
+            track.last_timestamp = float(timestamp) if timestamp is not None else track.last_timestamp
             alpha = min(1.0, max(0.0, float(self._config.radius_smoothing_alpha)))
             track.radius = (1.0 - alpha) * float(track.radius) + alpha * float(radius_values[det_idx])
             track.unmatched_frames = 0
@@ -56,7 +66,7 @@ class NearestTracker(BaseTracker):
         removed_track_ids: List[int] = []
         for track_idx in unmatched_tracks:
             track = self._tracks[track_idx]
-            track.position = track.position + track.velocity
+            track.position = track.position + track.velocity * dt
             track.predicted_position = track.position.copy()
             track.unmatched_frames += 1
             track.age += 1
@@ -72,6 +82,7 @@ class NearestTracker(BaseTracker):
                 id=self._next_id,
                 position=points[det_idx],
                 radius=float(radius_values[det_idx]),
+                last_timestamp=float(timestamp) if timestamp is not None else None,
             )
             track.predicted_position = track.position.copy()
             self._tracks.append(track)
@@ -90,6 +101,7 @@ class NearestTracker(BaseTracker):
     def reset(self) -> None:
         self._tracks = []
         self._next_id = 1
+        self._last_timestamp = None
 
     def get_active_tracks(self) -> List[DropletTrack]:
         return [track for track in self._tracks if track.is_active]

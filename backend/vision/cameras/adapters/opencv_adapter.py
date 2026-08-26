@@ -151,6 +151,7 @@ class OpenCVCameraAdapter(BaseCameraAdapter):
         if self._cap is None or not self._streaming:
             return FrameData(None, self._frame_id, time.time(), source_backend=self.backend_name, valid=False, error="OpenCV camera is not streaming")
         ok, frame = self._cap.read()
+        host_monotonic = time.monotonic()
         now = time.time()
         if not ok or frame is None:
             self._last_error = "OpenCV camera read failed"
@@ -166,6 +167,7 @@ class OpenCVCameraAdapter(BaseCameraAdapter):
             source_backend=self.backend_name,
             device_unique_id=self._device.unique_id if self._device else "",
             valid=True,
+            host_monotonic_timestamp=host_monotonic,
         )
         return self._latest
 

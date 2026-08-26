@@ -387,7 +387,7 @@ class PumpHardwareService:
             # 多通道设备上，RSS 有时把位分散在 enable/copy 中返回。
             exp = int(setup.enable_mask) & 0x0F
             got_eff = _effective_enable(got)
-            if (got_eff & exp) != exp:
+            if got_eff != exp:
                 mismatch.append(
                     f"enable_mask expect=0x{exp:02X}, got_enable=0x{int(got.enable_mask) & 0x0F:02X}, "
                     f"got_copy=0x{int(got.copy_mask) & 0x0F:02X}, effective=0x{got_eff:02X}"
@@ -597,12 +597,7 @@ class PumpHardwareService:
             return self._fail(f"enable_channels 前读取 RSS 失败: {rss.error}")
         setup: SystemSetup = rss.parsed_reply
         enable = int(mask) & 0x0F
-        copy_mask = setup.copy_mask & 0x0F
-        if enable == 0:
-            copy_mask = 0
-        elif (copy_mask & enable) != enable:
-            # 多通道使能时，copy_mask 必须覆盖全部目标通道，否则设备可能只保留最低位通道。
-            copy_mask = enable
+        copy_mask = enable if enable else 0
         req = SystemSetup(
             enable_mask=enable,
             copy_mask=copy_mask & 0x0F,
@@ -620,12 +615,7 @@ class PumpHardwareService:
             return self._fail(f"enable_channels_and_verify 前读取 RSS 失败: {rss.error}")
         setup: SystemSetup = rss.parsed_reply
         enable = int(mask) & 0x0F
-        copy_mask = setup.copy_mask & 0x0F
-        if enable == 0:
-            copy_mask = 0
-        elif (copy_mask & enable) != enable:
-            # 多通道使能时，copy_mask 必须覆盖全部目标通道，否则设备可能只保留最低位通道。
-            copy_mask = enable
+        copy_mask = enable if enable else 0
         req = SystemSetup(
             enable_mask=enable,
             copy_mask=copy_mask & 0x0F,
@@ -645,7 +635,7 @@ class PumpHardwareService:
             return first
         cur_setup: SystemSetup = rd.parsed_reply
         cur_enable = _effective(cur_setup.enable_mask, cur_setup.copy_mask)
-        if (cur_enable & enable) == enable:
+        if cur_enable == enable:
             self.log("[WSS][OK] 多通道收敛前已满足目标使能")
             return self._ok(parsed=cur_setup, raw=rd.raw_reply, verified=True, reason="WSS 多通道收敛校验通过")
 
@@ -654,7 +644,7 @@ class PumpHardwareService:
             bit = 1 << bit_idx
             if (missing & bit) == 0:
                 continue
-            target_enable = (cur_enable | bit) & 0x0F
+            target_enable = ((cur_enable & enable) | bit) & 0x0F
             step = SystemSetup(
                 enable_mask=target_enable,
                 # 使用目标掩码覆盖 copy，避免 0x01/0x02 互相覆盖。
@@ -670,7 +660,7 @@ class PumpHardwareService:
             if rd2.ok and rd2.parsed_reply is not None:
                 cur_setup = rd2.parsed_reply
                 cur_enable = _effective(cur_setup.enable_mask, cur_setup.copy_mask)
-                if (cur_enable & enable) == enable:
+                if cur_enable == enable:
                     self.log("[WSS][OK] 多通道收敛校验通过")
                     return self._ok(
                         parsed=cur_setup,
@@ -683,7 +673,7 @@ class PumpHardwareService:
         if final_rd.ok and final_rd.parsed_reply is not None:
             final_setup: SystemSetup = final_rd.parsed_reply
             final_enable = _effective(final_setup.enable_mask, final_setup.copy_mask)
-            if (final_enable & enable) == enable:
+            if final_enable == enable:
                 self.log("[WSS][OK] 多通道收敛最终校验通过")
                 return self._ok(
                     parsed=final_setup,
@@ -729,8 +719,8 @@ class PumpHardwareService:
 
         setup: SystemSetup = rss.parsed_reply
         req = SystemSetup(
-            enable_mask=(int(setup.enable_mask) | target) & 0x0F,
-            copy_mask=(int(setup.copy_mask) | target) & 0x0F,
+            enable_mask=target,
+            copy_mask=target,
             delay_values=list(setup.delay_values),
             delay_units=list(setup.delay_units),
         )
@@ -812,7 +802,7 @@ class PumpHardwareService:
                         self.log("[WSE][OK] 停机态回读校验通过")
                         return self._ok(parsed=got, raw=rd.raw_reply, verified=True, reason="WSE 校验通过")
                 else:
-                    if bool(got.system_running) and ((got_mask & run_mask) == run_mask):
+                    if bool(got.system_running) and got_mask == run_mask:
                         self.log("[WSE][OK] 启动态回读校验通过")
                         return self._ok(parsed=got, raw=rd.raw_reply, verified=True, reason="WSE 校验通过")
             time.sleep(0.12)
@@ -863,6 +853,12 @@ class PumpHardwareService:
                 return self._fail(f"非法通道: {ch}")
             mask |= (1 << (int(ch) - 1))
 
+        def _abort_started_pump(reason: str) -> PumpOperationResult:
+            stopped = self.stop_system_and_verify()
+            suffix = "safe stop verified" if stopped.ok else f"safe stop failed: {stopped.reason or stopped.error}"
+            self.log(f"[PUMP][START][ABORT] {reason}; {suffix}")
+            return self._fail("启动灌注失败", reason=f"{reason}; {suffix}")
+
         self.log("[PUMP][START] 开始灌注命令已发送")
         en = self.enable_channels_and_verify(mask)
         if not en.ok:
@@ -874,18 +870,18 @@ class PumpHardwareService:
         if not st.ok:
             reason = st.reason or st.error or "启动失败"
             self.log(f"[PUMP][START][FAIL] {reason}")
-            return self._fail("启动灌注失败", reason=reason)
+            return _abort_started_pump(reason)
 
         rs = self.read_run_state()
         if not rs.ok or rs.parsed_reply is None:
             reason = rs.error or rs.reason or "RSE回读失败"
             self.log(f"[PUMP][START][FAIL] {reason}")
-            return self._fail("启动灌注失败", reason=reason)
+            return _abort_started_pump(reason)
 
         running_ok, running_reason = self.are_required_channels_running(q_channels, run_state=rs.parsed_reply)
         if not running_ok:
             self.log(f"[PUMP][START][FAIL] {running_reason}")
-            return self._fail("启动灌注失败", parsed=rs.parsed_reply, raw=rs.raw_reply, reason=running_reason)
+            return _abort_started_pump(running_reason)
 
         self.log("[PUMP][START][OK] 回读确认灌注中")
         return self._ok(parsed=rs.parsed_reply, raw=rs.raw_reply, verified=True, reason="启动并确认灌注成功")
@@ -954,6 +950,7 @@ class PumpHardwareService:
         return self._channel_params_with_flow(channel, q)
 
     def update_flow_while_running(self, q1: float, q2: float) -> FlowUpdateResult:
+        transaction_started = time.monotonic()
         self.log(f"[PUMP][UPDATE] 运行中参数更新: q1={q1:.6f}, q2={q2:.6f}")
         if not math.isfinite(float(q1)) or not math.isfinite(float(q2)) or float(q1) <= 0.0 or float(q2) <= 0.0:
             reason = "拒绝泵流量更新：Q1 和 Q2 必须为有限正数"
@@ -1005,7 +1002,9 @@ class PumpHardwareService:
             )
 
         p1 = self._channel_params_with_flow(1, q1)
+        before_p1 = self.last_channel_params.get(1)
         p2 = self._channel_params_with_flow(2, q2)
+        before_p2 = self.last_channel_params.get(2)
         encoded_q1 = self.flow_from_channel_params(p1)
         encoded_q2 = self.flow_from_channel_params(p2)
         if (
@@ -1055,24 +1054,27 @@ class PumpHardwareService:
             int(getattr(self.runtime_config, "q2_update_max_attempts", 1)),
         )
         wr2 = PumpOperationResult(ok=False, error="Q2 尚未写入")
-        for attempt in range(1, q2_attempts + 1):
-            wr2 = self.write_wsp_and_verify(2, p2)
-            if wr2.ok:
-                if attempt > 1:
-                    self.log(f"[PUMP][Q2][RECOVERED] 第 {attempt} 次独立写入/回读成功")
-                break
-            q2_attempt_error = wr2.reason or wr2.error or "Q2下发失败"
-            self.log(
-                f"[PUMP][Q2][RETRY] 第 {attempt}/{q2_attempts} 次写入/回读失败: "
-                f"{q2_attempt_error}"
-            )
-            if attempt < q2_attempts:
-                time.sleep(
-                    max(
-                        0.0,
-                        float(getattr(self.runtime_config, "q2_update_retry_interval", 0.0)),
-                    )
+        if q1_ok:
+            for attempt in range(1, q2_attempts + 1):
+                wr2 = self.write_wsp_and_verify(2, p2)
+                if wr2.ok:
+                    if attempt > 1:
+                        self.log(f"[PUMP][Q2][RECOVERED] 第 {attempt} 次独立写入/回读成功")
+                    break
+                q2_attempt_error = wr2.reason or wr2.error or "Q2下发失败"
+                self.log(
+                    f"[PUMP][Q2][RETRY] 第 {attempt}/{q2_attempts} 次写入/回读失败: "
+                    f"{q2_attempt_error}"
                 )
+                if attempt < q2_attempts:
+                    time.sleep(
+                        max(
+                            0.0,
+                            float(getattr(self.runtime_config, "q2_update_retry_interval", 0.0)),
+                        )
+                    )
+        else:
+            wr2 = PumpOperationResult(ok=False, error="Q1 未验证，禁止继续写入 Q2")
         q2_ok = bool(wr2.ok)
         q2_error = None if wr2.ok else (wr2.reason or wr2.error or "Q2下发失败")
         if q2_ok:
@@ -1104,6 +1106,66 @@ class PumpHardwareService:
             reason_parts.append(f"运行状态异常:{run_state_error}")
         reason = "；".join(reason_parts) if reason_parts else "ok"
 
+        if not ok:
+            # The TS protocol cannot atomically commit two channels.  Treat a
+            # partial result as a failed transaction: stop first, restore every
+            # channel that may have changed, and deliberately remain stopped.
+            stop_result = self.stop_system_and_verify()
+            safe_stop_verified = bool(stop_result.ok)
+            rollback_errors: list[str] = []
+            rollback_attempted = False
+            if safe_stop_verified:
+                for channel, changed, previous in (
+                    (1, q1_ok, before_p1),
+                    (2, q2_ok, before_p2),
+                ):
+                    if not changed:
+                        continue
+                    rollback_attempted = True
+                    if previous is None:
+                        rollback_errors.append(f"CH{channel} 缺少事务前快照")
+                        continue
+                    restored = self.write_wsp_and_verify(channel, previous)
+                    if not restored.ok:
+                        rollback_errors.append(
+                            f"CH{channel} 回滚失败:{restored.reason or restored.error}"
+                        )
+                final_stop = self.stop_system_and_verify()
+                safe_stop_verified = bool(final_stop.ok)
+                if not final_stop.ok:
+                    rollback_errors.append(
+                        f"回滚后停泵验证失败:{final_stop.reason or final_stop.error}"
+                    )
+            else:
+                rollback_errors.append(
+                    f"安全停泵失败:{stop_result.reason or stop_result.error}"
+                )
+            rolled_back = rollback_attempted and not rollback_errors
+            reason = f"{reason}；双通道事务失败，系统保持停机"
+            if rollback_errors:
+                reason = f"{reason}；{'；'.join(rollback_errors)}"
+            self.log(
+                f"[PUMP][UPDATE][SAFE_DEGRADE] stopped={safe_stop_verified} "
+                f"rolled_back={rolled_back} reason={reason}"
+            )
+            return FlowUpdateResult(
+                ok=False,
+                q1_ok=q1_ok,
+                q2_ok=q2_ok,
+                still_running=False,
+                q1_error=q1_error,
+                q2_error=q2_error,
+                run_state_error=run_state_error,
+                verified_q1=wr1.parsed_reply if wr1.ok else None,
+                verified_q2=wr2.parsed_reply if wr2.ok else None,
+                reason=reason,
+                rolled_back=rolled_back,
+                rollback_error="；".join(rollback_errors) or None,
+                safe_stop_verified=safe_stop_verified,
+                command_started_monotonic=transaction_started,
+                readback_completed_monotonic=time.monotonic(),
+            )
+
         return FlowUpdateResult(
             ok=ok,
             q1_ok=q1_ok,
@@ -1115,6 +1177,9 @@ class PumpHardwareService:
             verified_q1=wr1.parsed_reply if wr1.ok else None,
             verified_q2=wr2.parsed_reply if wr2.ok else None,
             reason=reason,
+            safe_stop_verified=False,
+            command_started_monotonic=transaction_started,
+            readback_completed_monotonic=time.monotonic(),
         )
 
     def get_current_q_state(self) -> tuple[float, float]:

@@ -11,6 +11,20 @@ from backend.pid_control.models import PIDCommand
 from backend.pump_hardware.models import FlowUpdateResult, PumpConnectionState, PumpOperationResult, RunState
 
 
+def _calibration() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "calibration_id": "test-calibration",
+        "created_at": "2026-08-26T10:00:00+08:00",
+        "magnification": "20x",
+        "view_id": "test-view",
+        "pixel_to_micron": 1.0,
+        "uncertainty_um_per_px": 0.01,
+        "calibration_image_sha256": "a" * 64,
+        "cross_view_cv_percent": 1.0,
+    }
+
+
 class _PumpStub:
     def __init__(self, *, stop_ok: bool = True, start_ok: bool = True) -> None:
         self.serial_config = SimpleNamespace(port="", address=1, baudrate=1200, parity="N")
@@ -149,9 +163,12 @@ class PumpInteractionFlowTests(unittest.TestCase):
             initial_q1=50.0,
             initial_q2=20.0,
             control_interval_ms=500,
+            calibration=_calibration(),
         )
         service._state = SystemState.INITIALIZED
         service._pump_control_enabled = True
+        service._pump_state.connected = True
+        service._pump_state.comm_established = True
 
         with self.assertRaises(RuntimeError):
             service.start()
@@ -162,7 +179,7 @@ class PumpInteractionFlowTests(unittest.TestCase):
         self.assertFalse(service._pid_data_recorder.status()["active"])
         self.assertFalse(service._pid_data_recorder.has_unsaved_data())
 
-    def test_resume_failure_protectively_stops_and_enters_error(self) -> None:
+    def test_resume_never_starts_infusion(self) -> None:
         pump = _PumpStub(start_ok=False)
         service = OrchestratorService(
             vision_service=SimpleNamespace(),
@@ -176,15 +193,13 @@ class PumpInteractionFlowTests(unittest.TestCase):
         service._pump_state.connected = True
         service._pump_state.comm_established = True
 
-        with self.assertRaises(RuntimeError):
-            service.resume()
+        service.resume()
 
-        self.assertEqual(service._state, SystemState.ERROR)
-        self.assertFalse(service._pump_control_enabled)
-        self.assertIn("start:[1, 2]", pump.calls)
-        self.assertIn("stop", pump.calls)
+        self.assertEqual(service._state, SystemState.INITIALIZED)
+        self.assertTrue(service._pump_control_enabled)
+        self.assertEqual(pump.calls, [])
 
-    def test_resume_readback_failure_rolls_back_before_publishing_running(self) -> None:
+    def test_resume_does_not_readback_or_restart(self) -> None:
         pump = _PumpStub()
         pump.get_current_q_state = lambda: (_ for _ in ()).throw(RuntimeError("readback timeout"))
         service = OrchestratorService(
@@ -198,13 +213,12 @@ class PumpInteractionFlowTests(unittest.TestCase):
         service._pump_control_enabled = True
         service._pump_state.comm_established = True
 
-        with self.assertRaises(RuntimeError):
-            service.resume()
+        service.resume()
 
-        self.assertEqual(service._state, SystemState.ERROR)
-        self.assertFalse(service._pump_control_enabled)
+        self.assertEqual(service._state, SystemState.INITIALIZED)
+        self.assertTrue(service._pump_control_enabled)
         self.assertFalse(service._pump_state.running)
-        self.assertGreaterEqual(pump.calls.count("stop"), 1)
+        self.assertEqual(pump.calls, [])
 
     def test_start_invalidated_by_stop_rolls_back_without_resurrecting_running(self) -> None:
         entered = threading.Event()
@@ -224,7 +238,16 @@ class PumpInteractionFlowTests(unittest.TestCase):
             vision_adapter=BlockingAdapter(),
             pump_service=pump,
         )
-        service._cfg = SystemConfig(50.0, 1.0, "camera", "", 50.0, 20.0, 500)
+        service._cfg = SystemConfig(
+            50.0,
+            1.0,
+            "camera",
+            "",
+            50.0,
+            20.0,
+            500,
+            calibration=_calibration(),
+        )
         service._state = SystemState.INITIALIZED
         service._pump_control_enabled = True
         service._pump_state.connected = True
@@ -322,18 +345,8 @@ class PumpInteractionFlowTests(unittest.TestCase):
         self.assertTrue(service._pump_state.running)
         self.assertIn("serial stop timeout", service._pump_state.last_error)
 
-    def test_stop_invalidates_inflight_resume_before_it_can_publish_running(self) -> None:
-        entered = threading.Event()
-        release = threading.Event()
-
-        class BlockingPump(_PumpStub):
-            def start_infusion_and_verify(self, channels):
-                self.calls.append(f"start:{channels}")
-                entered.set()
-                release.wait(timeout=2.0)
-                return PumpOperationResult(ok=True, verified=True)
-
-        pump = BlockingPump()
+    def test_stop_after_resume_never_publishes_running(self) -> None:
+        pump = _PumpStub()
         service = OrchestratorService(
             vision_service=SimpleNamespace(),
             vision_adapter=SimpleNamespace(stop=lambda: None),
@@ -346,14 +359,11 @@ class PumpInteractionFlowTests(unittest.TestCase):
         service._pump_state.connected = True
         service._pump_state.comm_established = True
 
-        resume_thread = threading.Thread(target=service.resume)
-        resume_thread.start()
-        self.assertTrue(entered.wait(timeout=1.0))
+        service.resume()
+        self.assertEqual(service._state, SystemState.INITIALIZED)
+        self.assertNotIn("start:[1, 2]", pump.calls)
         service.stop()
-        release.set()
-        resume_thread.join(timeout=2.0)
 
-        self.assertFalse(resume_thread.is_alive())
         self.assertEqual(service._state, SystemState.STOPPED)
         self.assertFalse(service._pump_state.running)
         self.assertNotEqual(service._state, SystemState.RUNNING)
@@ -381,6 +391,9 @@ class PumpInteractionFlowTests(unittest.TestCase):
         service._pump_state.comm_established = True
         service._pump_state.q1 = 50.0
         service._pump_state.q2 = 20.0
+        token = service._safety.begin_session()
+        service._safety.arm(token, heartbeat_timeout_s=5.0)
+        service._run_token = token
         service._read_recognition = lambda: SimpleNamespace(
             control_period_id=1,
             frame_id=1,
@@ -392,6 +405,10 @@ class PumpInteractionFlowTests(unittest.TestCase):
             avg_diameter=50.0,
             frame_droplet_count=1,
             frame_diameter_cv=0.0,
+            scale_source="calibration_file",
+            session_id=token.session_id,
+            run_generation=token.generation,
+            capture_monotonic=0.0,
         )
         service.disturbance_service = SimpleNamespace(
             build_and_submit_sample=lambda **_kwargs: SimpleNamespace(pump_response_delay_ms=0.0),
@@ -415,17 +432,7 @@ class PumpInteractionFlowTests(unittest.TestCase):
         self.assertIn("stop", pump.calls)
 
     def test_pause_invalidates_inflight_automatic_recovery(self) -> None:
-        entered = threading.Event()
-        release = threading.Event()
-
-        class BlockingPump(_PumpStub):
-            def start_infusion_and_verify(self, channels):
-                self.calls.append(f"start:{channels}")
-                entered.set()
-                release.wait(timeout=2.0)
-                return PumpOperationResult(ok=True, verified=True)
-
-        pump = BlockingPump()
+        pump = _PumpStub()
         service = OrchestratorService(
             vision_service=SimpleNamespace(),
             vision_adapter=SimpleNamespace(stop=lambda: None),
@@ -436,29 +443,17 @@ class PumpInteractionFlowTests(unittest.TestCase):
         service._pump_control_enabled = True
         service._pump_state.comm_established = True
 
-        recovery_thread = threading.Thread(target=lambda: service._try_resume_infusion("test"))
-        recovery_thread.start()
-        self.assertTrue(entered.wait(timeout=1.0))
+        recovered, reason = service._try_resume_infusion("test")
+        self.assertFalse(recovered)
+        self.assertIn("disabled", reason)
         service.pause()
-        release.set()
-        recovery_thread.join(timeout=2.0)
 
-        self.assertFalse(recovery_thread.is_alive())
         self.assertEqual(service._state, SystemState.PAUSED)
         self.assertFalse(service._pump_state.running)
+        self.assertNotIn("start:[1, 2]", pump.calls)
 
     def test_stop_invalidates_inflight_automatic_recovery(self) -> None:
-        entered = threading.Event()
-        release = threading.Event()
-
-        class BlockingPump(_PumpStub):
-            def start_infusion_and_verify(self, channels):
-                self.calls.append(f"start:{channels}")
-                entered.set()
-                release.wait(timeout=2.0)
-                return PumpOperationResult(ok=True, verified=True)
-
-        pump = BlockingPump()
+        pump = _PumpStub()
         service = OrchestratorService(
             vision_service=SimpleNamespace(),
             vision_adapter=SimpleNamespace(stop=lambda: None),
@@ -469,20 +464,13 @@ class PumpInteractionFlowTests(unittest.TestCase):
         service._pump_control_enabled = True
         service._pump_state.comm_established = True
 
-        recovery_result: list[tuple[bool, str]] = []
-        recovery_thread = threading.Thread(
-            target=lambda: recovery_result.append(service._try_resume_infusion("test"))
-        )
-        recovery_thread.start()
-        self.assertTrue(entered.wait(timeout=1.0))
+        recovery_result = service._try_resume_infusion("test")
         service.stop()
-        release.set()
-        recovery_thread.join(timeout=2.0)
 
-        self.assertFalse(recovery_thread.is_alive())
         self.assertEqual(service._state, SystemState.STOPPED)
-        self.assertEqual(recovery_result[0][0], False)
+        self.assertFalse(recovery_result[0])
         self.assertFalse(service._pump_state.running)
+        self.assertNotIn("start:[1, 2]", pump.calls)
 
     def test_start_failure_rolls_back_adapter_recorder_and_pump(self) -> None:
         pump = _PumpStub(start_ok=False)
@@ -496,6 +484,7 @@ class PumpInteractionFlowTests(unittest.TestCase):
             initial_q1=50.0,
             initial_q2=20.0,
             control_interval_ms=500,
+            calibration=_calibration(),
         )
         service._state = SystemState.INITIALIZED
         service._pump_control_enabled = True

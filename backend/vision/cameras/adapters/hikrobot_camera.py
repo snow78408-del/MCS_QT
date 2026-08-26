@@ -170,9 +170,9 @@ class HikrobotCameraAdapter(BaseCameraAdapter):
     def read_frame(self, timeout_ms: int = 1000) -> FrameData:
         if self._active == "direct":
             return self._direct.read_frame(timeout_ms)
-        deadline = time.time() + max(0.001, timeout_ms / 1000.0)
+        deadline = time.monotonic() + max(0.001, timeout_ms / 1000.0)
         packet = None
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             packet = self._legacy.read_frame()
             if packet.valid and packet.frame is not None:
                 frame = packet.frame
@@ -188,7 +188,7 @@ class HikrobotCameraAdapter(BaseCameraAdapter):
                     valid=True,
                 )
             time.sleep(0.01)
-        error = packet.error if packet is not None else "婵炴潙鍢查幃宥夋儎閸涘﹥绨氶柛娆愮墪閹舵氨鎼鹃崨顔筋槯"
+        error = packet.error if packet is not None else "HIKROBOT camera frame timeout"
         self._last_error = error
         return FrameData(None, 0, time.time(), source_backend=self.backend_name, valid=False, error=error)
 

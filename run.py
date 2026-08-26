@@ -9,11 +9,15 @@ from collections.abc import Sequence
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent
 
-REQUIRED_MODULES = {
+FRONTEND_REQUIRED_MODULES = {
     "cv2": "opencv-python",
     "numpy": "numpy",
     "PySide6": "PySide6",
     "serial": "pyserial",
+}
+VISION_REQUIRED_MODULES = {
+    "cv2": "opencv-python",
+    "numpy": "numpy",
 }
 
 
@@ -23,9 +27,9 @@ def ensure_project_root_on_path() -> None:
         sys.path.insert(0, root)
 
 
-def missing_runtime_packages() -> list[str]:
+def missing_runtime_packages(required_modules: dict[str, str] | None = None) -> list[str]:
     missing: list[str] = []
-    for module_name, package_name in REQUIRED_MODULES.items():
+    for module_name, package_name in (required_modules or FRONTEND_REQUIRED_MODULES).items():
         if importlib.util.find_spec(module_name) is None:
             missing.append(package_name)
     return missing
@@ -37,7 +41,7 @@ def print_dependency_help(missing: Sequence[str]) -> None:
     print(f"  {packages}", file=sys.stderr)
     print("", file=sys.stderr)
     print("任选一种方式安装后再启动：", file=sys.stderr)
-    print("  python -m pip install -r requirements.txt", file=sys.stderr)
+    print("  python -m pip install -r requirements.lock", file=sys.stderr)
     print("  conda install -c conda-forge numpy opencv pyserial", file=sys.stderr)
     print("  uv sync", file=sys.stderr)
     print("  uv run python run.py", file=sys.stderr)
@@ -46,7 +50,7 @@ def print_dependency_help(missing: Sequence[str]) -> None:
 def run_frontend() -> None:
     ensure_project_root_on_path()
 
-    missing = missing_runtime_packages()
+    missing = missing_runtime_packages(FRONTEND_REQUIRED_MODULES)
     if missing:
         print_dependency_help(missing)
         raise SystemExit(1)
@@ -75,7 +79,7 @@ def run_tuning(argv: Sequence[str]) -> None:
 def run_vision(argv: Sequence[str]) -> None:
     ensure_project_root_on_path()
 
-    missing = missing_runtime_packages()
+    missing = missing_runtime_packages(VISION_REQUIRED_MODULES)
     if missing:
         print_dependency_help(missing)
         raise SystemExit(1)

@@ -2,7 +2,7 @@ import pytest
 
 from backend.pump_hardware.client import CommandMismatchError, PumpClient
 from backend.pump_hardware.config import PumpHardwareConfig, SerialConfig
-from backend.pump_hardware.models import PumpOperationResult, RunState, SystemSetup
+from backend.pump_hardware.models import ChannelParams, PumpOperationResult, RunState, SystemSetup
 from backend.pump_hardware.service import PumpHardwareService
 from backend.pump_hardware import protocol
 
@@ -201,3 +201,53 @@ def test_running_update_retries_only_q2_after_transient_failure(monkeypatch):
     assert result.ok
     assert result.q1_ok and result.q2_ok
     assert calls == [1, 2, 2]
+
+
+def test_partial_two_channel_update_stops_rolls_back_and_stays_stopped(monkeypatch):
+    service = PumpHardwareService()
+    service.runtime_config.inter_channel_update_delay = 0.0
+    service.runtime_config.q2_update_retry_interval = 0.0
+    service.runtime_config.q2_update_max_attempts = 1
+    run_state = RunState(1, 0x03, True, [True, True, False, False])
+    monkeypatch.setattr(
+        service,
+        "read_run_state",
+        lambda: PumpOperationResult(ok=True, parsed_reply=run_state),
+    )
+    old = {
+        1: service._default_channel_params_for_q(1, 50.0),
+        2: service._default_channel_params_for_q(2, 20.0),
+    }
+
+    def build(channel, flow):
+        service.last_channel_params[channel] = old[channel]
+        return service._default_channel_params_for_q(channel, flow)
+
+    monkeypatch.setattr(service, "_channel_params_with_flow", build)
+    writes: list[tuple[int, ChannelParams]] = []
+
+    def write(channel, params):
+        writes.append((channel, params))
+        if channel == 2:
+            return PumpOperationResult(ok=False, error="Q2 failed")
+        return PumpOperationResult(ok=True, parsed_reply=params, verified=True)
+
+    monkeypatch.setattr(service, "write_wsp_and_verify", write)
+    stop_calls = 0
+
+    def stop():
+        nonlocal stop_calls
+        stop_calls += 1
+        return PumpOperationResult(ok=True, verified=True)
+
+    monkeypatch.setattr(service, "stop_system_and_verify", stop)
+
+    result = service.update_flow_while_running(55.0, 22.0)
+
+    assert not result.ok
+    assert not result.still_running
+    assert result.safe_stop_verified
+    assert result.rolled_back
+    assert stop_calls == 2
+    assert [channel for channel, _ in writes] == [1, 2, 1]
+    assert writes[-1][1] == old[1]

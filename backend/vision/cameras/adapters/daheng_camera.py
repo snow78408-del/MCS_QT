@@ -114,7 +114,10 @@ class DahengCameraAdapter(BaseCameraAdapter):
             if image is None:
                 return FrameData(None, self._frame_id, time.time(), source_backend=self.backend_name, valid=False, error="大恒图像转换失败")
             image = image[:, :, ::-1].copy()
-            self._frame_id += 1
+            host_monotonic = time.monotonic()
+            hardware_id = _sdk_integer(raw, "frame_id", "get_frame_id")
+            hardware_timestamp = _sdk_integer(raw, "timestamp", "get_timestamp")
+            self._frame_id = hardware_id or (self._frame_id + 1)
             self._latest = FrameData(
                 image=image,
                 frame_id=self._frame_id,
@@ -125,6 +128,9 @@ class DahengCameraAdapter(BaseCameraAdapter):
                 source_backend=self.backend_name,
                 device_unique_id=self._device.unique_id if self._device else "",
                 valid=True,
+                host_monotonic_timestamp=host_monotonic,
+                hardware_frame_id=hardware_id,
+                hardware_timestamp_ticks=hardware_timestamp,
             )
             return self._latest
         except Exception as exc:
@@ -163,6 +169,16 @@ class DahengCameraAdapter(BaseCameraAdapter):
 
     def is_streaming(self) -> bool:
         return self._streaming
+
+
+def _sdk_integer(value: Any, attribute: str, method: str) -> int:
+    raw = getattr(value, attribute, None)
+    if raw is None:
+        raw = getattr(value, method, None)
+    try:
+        return int(raw() if callable(raw) else raw or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _transport(value: str) -> str:

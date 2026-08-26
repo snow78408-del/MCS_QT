@@ -38,6 +38,9 @@ class ControlMetrics:
     uniformity_valid: bool
     uniformity_status: str
     uniformity_reason: str
+    raw_frame_diameters: list[float]
+    raw_frame_diameter_cv: float | None
+    filtering_rule: str
     # IDs that crossed in the current processed frame. These are used only to
     # capture evidence thumbnails; control aggregation remains period-based.
     crossed_track_ids: list[int] = field(default_factory=list)
@@ -69,6 +72,9 @@ class AnalysisMetrics:
     uniformity_valid: bool
     uniformity_status: str
     uniformity_reason: str
+    raw_frame_diameters: list[float]
+    raw_frame_diameter_cv: float | None
+    filtering_rule: str
     crossed_track_ids: list[int] = field(default_factory=list)
     valid_track_ids: list[int] = field(default_factory=list)
 
@@ -103,6 +109,10 @@ class MetricsCalculator:
         self._track_bead_max: Dict[int, int] = {}
         self._track_state: Dict[int, _TrackState] = {}
         self._counted_track_ids: set[int] = set()
+        self._total_counted = 0
+        self._finalized_empty = 0
+        self._finalized_single = 0
+        self._finalized_multi = 0
         self._last_no_droplet_log_time = 0.0
 
     @staticmethod
@@ -141,12 +151,18 @@ class MetricsCalculator:
             return False, None
 
         crossed = self._did_cross_line(prev_coord, cur_coord, line_y)
+        direction = str(self._config.flow_direction).strip().lower()
+        if direction == "positive":
+            crossed = crossed and cur_coord > prev_coord
+        elif direction == "negative":
+            crossed = crossed and cur_coord < prev_coord
         displacement = abs(cur_coord - state.start_coord)
         age_ok = int(track.age) >= int(self._config.min_track_age_for_count)
         disp_ok = displacement >= float(self._config.min_track_displacement_for_count)
         if crossed and age_ok and disp_ok:
             state.counted = True
             self._counted_track_ids.add(track.id)
+            self._total_counted += 1
             self._log(
                 f"[VISION][COUNT] new real droplet count: track_id={track.id}, "
                 f"total={len(self._counted_track_ids)}"
@@ -215,8 +231,18 @@ class MetricsCalculator:
                     crossed_track_bead_counts[track_id] = self._track_bead_max.get(track_id, 0)
 
         for track_id in tracking.removed_track_ids:
-            self._track_state.pop(int(track_id), None)
-            self._track_bead_max.pop(int(track_id), None)
+            key = int(track_id)
+            if key in self._counted_track_ids:
+                bead_count = int(self._track_bead_max.get(key, 0))
+                if bead_count == 0:
+                    self._finalized_empty += 1
+                elif bead_count == 1:
+                    self._finalized_single += 1
+                else:
+                    self._finalized_multi += 1
+                self._counted_track_ids.discard(key)
+            self._track_state.pop(key, None)
+            self._track_bead_max.pop(key, None)
 
         if frame_diameters:
             self._diameter_history.extend(frame_diameters)
@@ -229,11 +255,10 @@ class MetricsCalculator:
 
         counted_ids = sorted(self._counted_track_ids)
         bead_counts = [self._track_bead_max.get(track_id, 0) for track_id in counted_ids]
-        total_droplets = len(counted_ids)
-
-        empty_count = sum(1 for value in bead_counts if value == 0)
-        single_count = sum(1 for value in bead_counts if value == 1)
-        multi_count = sum(1 for value in bead_counts if value >= 2)
+        empty_count = self._finalized_empty + sum(1 for value in bead_counts if value == 0)
+        single_count = self._finalized_single + sum(1 for value in bead_counts if value == 1)
+        multi_count = self._finalized_multi + sum(1 for value in bead_counts if value >= 2)
+        total_droplets = int(self._total_counted)
 
         frame_single_cell_count = sum(1 for value in frame_bead_counts.values() if int(value) == 1)
         window_diameters, window_single_cell_count, window_droplet_count, new_crossing_count, period_id = self._update_realtime_window(
@@ -245,7 +270,20 @@ class MetricsCalculator:
         # Use the robust sample set for feedback. Detector false positives and
         # partial circles otherwise inflate CV and can keep PID frozen forever.
         # Raw track/count statistics remain available through the period count.
-        frame_diameters = self._robust_diameter_samples(list(window_diameters))
+        raw_frame_diameters = [float(value) for value in window_diameters]
+        raw_mean = float(np.mean(raw_frame_diameters)) if raw_frame_diameters else None
+        raw_std = float(np.std(raw_frame_diameters, ddof=0)) if raw_frame_diameters else None
+        raw_frame_diameter_cv = (
+            float(raw_std / raw_mean * 100.0)
+            if raw_mean is not None and raw_mean > 0.0 and raw_std is not None
+            else None
+        )
+        frame_diameters = self._robust_diameter_samples(raw_frame_diameters)
+        filtering_rule = (
+            f"MAD x {float(self._config.robust_mad_multiplier):g}"
+            if len(frame_diameters) != len(raw_frame_diameters)
+            else "none"
+        )
         # Public "frame_*" fields are retained for API compatibility, but the
         # control/monitoring values represent droplets that actually crossed
         # the count line during the configured control-period window.
@@ -315,7 +353,7 @@ class MetricsCalculator:
             average_diameter=average_diameter,
             current_valid_droplets=frame_droplet_count,
             single_bead_count=single_count,
-            single_bead_rate=frame_single_cell_rate if frame_single_cell_rate is not None else 0.0,
+            single_bead_rate=(single_count / denom) * 100.0 if total_droplets else 0.0,
             empty_count=empty_count,
             empty_rate=(empty_count / denom) * 100.0 if total_droplets else 0.0,
             multi_bead_count=multi_count,
@@ -332,6 +370,9 @@ class MetricsCalculator:
             uniformity_valid=uniformity_valid,
             uniformity_status=uniformity_status,
             uniformity_reason=uniformity_reason,
+            raw_frame_diameters=raw_frame_diameters,
+            raw_frame_diameter_cv=raw_frame_diameter_cv,
+            filtering_rule=filtering_rule,
             crossed_track_ids=list(crossed_track_ids),
             valid_track_ids=sorted(valid_track_ids),
         )
@@ -356,6 +397,9 @@ class MetricsCalculator:
             uniformity_valid=uniformity_valid,
             uniformity_status=uniformity_status,
             uniformity_reason=uniformity_reason,
+            raw_frame_diameters=raw_frame_diameters,
+            raw_frame_diameter_cv=raw_frame_diameter_cv,
+            filtering_rule=filtering_rule,
             crossed_track_ids=list(crossed_track_ids),
             valid_track_ids=sorted(valid_track_ids),
         )
@@ -437,4 +481,8 @@ class MetricsCalculator:
         self._track_bead_max.clear()
         self._track_state.clear()
         self._counted_track_ids.clear()
+        self._total_counted = 0
+        self._finalized_empty = 0
+        self._finalized_single = 0
+        self._finalized_multi = 0
         self._last_no_droplet_log_time = 0.0

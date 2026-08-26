@@ -37,17 +37,11 @@ class ROIConfig:
 
 @dataclass
 class DetectorConfig:
-    # Absolute safety range. The runtime range is derived from the configured
-    # target diameter and pixel calibration, so the detector is not tied to a
-    # specific droplet size.
+    # Image-domain measurement bounds. These are independent of the PID target.
     min_radius: float = 8.0
     max_radius: float = 80.0
     expected_radius: float = 0.0
-    # The accepted range follows the user-configured target and calibration.
-    # It remains broad (0.65x-1.4x radius by default), so this is
-    # not tied to 50 um while still rejecting unrelated channel structures.
-    # Do not discard otherwise valid droplets merely because their size differs
-    # from the target; the target is a control reference, not a detection gate.
+    # Retained for settings compatibility; PID targets never change this gate.
     expected_size_hard_gate: bool = False
     adaptive_min_radius_ratio: float = 0.50
     adaptive_max_radius_ratio: float = 1.60
@@ -113,7 +107,9 @@ class DetectorConfig:
     intensity_peak_max_radius_ratio: float = 1.20
     intensity_peak_min_edge_support: float = 0.18
     intensity_peak_max_candidates: int = 120
-    reject_multi_droplet_circles: bool = True
+    # Disabled by default: without an independently calibrated size prior this
+    # heuristic can misclassify one large droplet as several smaller circles.
+    reject_multi_droplet_circles: bool = False
     multi_droplet_child_radius_ratio: float = 0.82
     multi_droplet_child_distance_ratio: float = 0.90
     multi_droplet_child_count: int = 2
@@ -175,6 +171,7 @@ class MetricsConfig:
     realtime_window_ms: int = 500
     rolling_window: int = 120
     flow_axis: Literal["x", "y"] = "x"
+    flow_direction: Literal["positive", "negative", "any"] = "positive"
     count_line_ratio: float = 0.6
     min_track_age_for_count: int = 1
     min_track_displacement_for_count: float = 8.0

@@ -67,7 +67,7 @@ class VisionPipeline:
 
         gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY) if roi_frame.ndim == 3 else roi_frame
         detections = self.detector.detect(gray)
-        tracking = self.tracker.update(detections.centers, detections.radii)
+        tracking = self.tracker.update(detections.centers, detections.radii, timestamp=timestamp)
         self._align_tracks_to_current_detections(tracking, detections)
         confirmed_observed_tracks = [
             track

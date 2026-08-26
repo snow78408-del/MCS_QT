@@ -122,6 +122,12 @@ class FrameData:
     device_unique_id: str = ""
     valid: bool = False
     error: str = ""
+    host_monotonic_timestamp: float = 0.0
+    hardware_frame_id: int = 0
+    hardware_timestamp_ticks: int = 0
+    sdk_host_timestamp_ticks: int = 0
+    lost_packet_count: int = 0
+    exposure_time_us: float | None = None
 
 
 @dataclass(slots=True)
@@ -140,6 +146,8 @@ class CameraStatus:
     height: int = 0
     pixel_format: str = ""
     frame_rate: float = 0.0
+    reconnecting: bool = False
+    reconnect_attempts: int = 0
 
 
 @dataclass(slots=True)

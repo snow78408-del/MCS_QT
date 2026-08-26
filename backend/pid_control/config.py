@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
+import math
 try:
     from enum import StrEnum
 except ImportError:  # Python 3.10 compatibility
@@ -86,6 +87,10 @@ class PIDConfig:
     adjustment_max: float | None = None
 
     def __post_init__(self) -> None:
+        for item in fields(self):
+            value = getattr(self, item.name)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and not math.isfinite(float(value)):
+                raise ValueError(f"{item.name} must be finite")
         if self.kp is not None:
             self.base_kp = float(self.kp)
         if self.ki is not None:
@@ -107,5 +112,7 @@ class PIDConfig:
             raise ValueError("pump output gains must be greater than zero")
         if not self.min_q1_q2_gap > 0.0:
             raise ValueError("min_q1_q2_gap must be greater than zero")
+        if not 0.0 < self.q1_min <= self.q1_max or not 0.0 < self.q2_min <= self.q2_max:
+            raise ValueError("pump min/max limits must be positive and ordered")
         self.q1_control_sign = 1.0 if self.q1_control_sign > 0.0 else -1.0
         self.q2_control_sign = 1.0 if self.q2_control_sign > 0.0 else -1.0

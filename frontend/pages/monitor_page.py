@@ -158,10 +158,10 @@ class MonitorPage(ttk.Frame):
             ("反馈冻结", self.freeze_var),
             ("建议停机", self.stop_var),
             ("Q1 指令", self.q1_cmd_var),
-            ("Q1 回读流速", self.q1_actual_var),
+            ("Q1 设备参数换算值（非物理流量）", self.q1_actual_var),
             ("CH1执行状态", self.ch1_exec_var),
             ("Q2 指令", self.q2_cmd_var),
-            ("Q2 回读流速", self.q2_actual_var),
+            ("Q2 设备参数换算值（非物理流量）", self.q2_actual_var),
             ("CH2执行状态", self.ch2_exec_var),
             ("原因", self.reason_var),
         ]

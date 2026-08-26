@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import math
 import threading
 import time
 from dataclasses import asdict
@@ -35,6 +36,9 @@ class CameraManager:
         self._worker: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._last_discovery_result = CameraDiscoveryResult()
+        self._camera_config: dict[str, Any] = {}
+        self._reconnecting = False
+        self._reconnect_attempts = 0
 
     def discover_all_result(self) -> CameraDiscoveryResult:
         self.close_selected()
@@ -126,10 +130,10 @@ class CameraManager:
             parameter_result = self._configure_adapter(adapter, camera_config or {})
             _apply_continuous_mode(adapter, caps)
             adapter.start_stream()
-            deadline = time.time() + 6.0
+            deadline = time.monotonic() + 6.0
             required = int(getattr(self.config, "test_frame_count", 3) or 3)
             seen: set[int] = set()
-            while time.time() < deadline and len(frames) < required:
+            while time.monotonic() < deadline and len(frames) < required:
                 frame = adapter.read_frame(int(getattr(self.config, "frame_timeout_ms", 1000) or 1000))
                 if frame.valid and frame.image is not None and frame.frame_id not in seen:
                     if frame.width > 0 and frame.height > 0 and int(frame.image.size) > 0:
@@ -204,7 +208,8 @@ class CameraManager:
 
     def configure_selected(self, camera_config: dict[str, Any] | None = None) -> dict[str, Any]:
         adapter = self._require_adapter()
-        return self._configure_adapter(adapter, camera_config or {})
+        self._camera_config = dict(camera_config or {})
+        return self._configure_adapter(adapter, self._camera_config)
 
     def _configure_adapter(
         self,
@@ -225,6 +230,8 @@ class CameraManager:
                 continue
             if value in (None, ""):
                 continue
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and not math.isfinite(float(value)):
+                raise CameraBackendError(f"{name} must be finite")
             if cap.min_value is not None and float(value) < float(cap.min_value):
                 raise CameraBackendError(f"{name} 超出允许范围: {cap.min_value} - {cap.max_value}")
             if cap.max_value is not None and float(value) > float(cap.max_value):
@@ -234,6 +241,11 @@ class CameraManager:
             if cap.readable:
                 actual = adapter.get_feature(name)
                 readback[name] = actual
+                if not _feature_values_match(value, actual, cap.increment):
+                    raise CameraBackendError(
+                        f"camera parameter readback mismatch: {name} "
+                        f"requested={value!r}, actual={actual!r}"
+                    )
             self._log(
                 f"[CAMERA][PARAMETER][SET] backend={adapter.backend_name} "
                 f"name={name} requested={value} readback={readback.get(name, 'unavailable')}"
@@ -290,6 +302,8 @@ class CameraManager:
                 width=frame.width,
                 height=frame.height,
                 pixel_format=frame.pixel_format,
+                reconnecting=self._reconnecting,
+                reconnect_attempts=self._reconnect_attempts,
             )
 
     def close_selected(self) -> None:
@@ -309,10 +323,14 @@ class CameraManager:
         threshold = int(getattr(self.config, "frame_failure_threshold", 10) or 10)
         while not self._stop_event.is_set():
             frame = adapter.read_frame(timeout)
+            reconnect = False
             with self._lock:
                 if frame.valid and frame.image is not None:
-                    if frame.frame_id == self._latest_frame.frame_id:
-                        self._dropped_frame_count += 1
+                    previous_id = int(self._latest_frame.frame_id or 0)
+                    current_id = int(frame.frame_id or 0)
+                    if previous_id > 0 and current_id > previous_id + 1:
+                        self._dropped_frame_count += current_id - previous_id - 1
+                    self._dropped_frame_count += max(0, int(frame.lost_packet_count or 0))
                     self._latest_frame = frame
                     self._camera_connected = True
                     self._camera_streaming = True
@@ -325,10 +343,79 @@ class CameraManager:
                     if self._consecutive_frame_failures >= threshold:
                         self._camera_connected = False
                         self._camera_streaming = False
-                        self._latest_frame = FrameData(None, self._latest_frame.frame_id, time.time(), valid=False, error=self._last_error)
-                        self._stop_event.set()
-                        self._log(f"[CAMERA][DISCONNECTED] backend={adapter.backend_name} error={self._last_error}")
+                        self._latest_frame = FrameData(
+                            None,
+                            self._latest_frame.frame_id,
+                            time.time(),
+                            valid=False,
+                            error=self._last_error,
+                            host_monotonic_timestamp=time.monotonic(),
+                        )
+                        reconnect = True
+                        self._log(
+                            f"[CAMERA][DISCONNECTED] backend={adapter.backend_name} "
+                            f"error={self._last_error}"
+                        )
+            if reconnect:
+                replacement = self._reconnect(adapter)
+                if replacement is not None:
+                    adapter = replacement
             time.sleep(0.001)
+
+    def _reconnect(self, failed_adapter: BaseCameraAdapter) -> BaseCameraAdapter | None:
+        max_attempts = max(1, int(getattr(self.config, "reconnect_max_attempts", 5) or 5))
+        delay = max(
+            0.05,
+            float(getattr(self.config, "reconnect_initial_delay_s", 0.25) or 0.25),
+        )
+        max_delay = max(
+            delay,
+            float(getattr(self.config, "reconnect_max_delay_s", 5.0) or 5.0),
+        )
+        with self._lock:
+            self._reconnecting = True
+        for attempt in range(1, max_attempts + 1):
+            if self._stop_event.wait(delay):
+                break
+            with self._lock:
+                self._reconnect_attempts = attempt
+                device = self._selected_device
+            if device is None:
+                break
+            replacement = self._build_adapter(device)
+            try:
+                self._log(f"[CAMERA][RECONNECT] attempt={attempt}/{max_attempts}")
+                replacement.open(device)
+                self._configure_adapter(replacement, self._camera_config)
+                _apply_continuous_mode(replacement, replacement.get_capabilities())
+                replacement.start_stream()
+                with self._lock:
+                    self._adapter = replacement
+                    self._camera_connected = True
+                    self._camera_streaming = True
+                    self._consecutive_frame_failures = 0
+                    self._last_error = ""
+                    self._reconnecting = False
+                try:
+                    failed_adapter.stop_stream()
+                    failed_adapter.close()
+                except Exception:
+                    pass
+                self._log(f"[CAMERA][RECONNECT][OK] attempt={attempt}")
+                return replacement
+            except Exception as exc:
+                self._last_error = str(exc)
+                self._log(f"[CAMERA][RECONNECT][FAIL] attempt={attempt} error={exc}")
+                try:
+                    replacement.close()
+                except Exception:
+                    pass
+                delay = min(max_delay, delay * 2.0)
+        with self._lock:
+            self._reconnecting = False
+            self._camera_connected = False
+            self._camera_streaming = False
+        return None
 
     def _require_selected(self) -> CameraDeviceInfo:
         with self._lock:
@@ -348,6 +435,20 @@ def _apply_continuous_mode(adapter: BaseCameraAdapter, caps) -> None:
         adapter.set_feature("acquisition_mode", "Continuous")
     if caps.trigger_mode.supported and caps.trigger_mode.writable:
         adapter.set_feature("trigger_mode", "Off")
+
+
+def _feature_values_match(requested: Any, actual: Any, increment: Any = None) -> bool:
+    try:
+        expected_number = float(requested)
+        actual_number = float(actual)
+    except (TypeError, ValueError):
+        return str(requested).strip().casefold() == str(actual).strip().casefold()
+    try:
+        step = abs(float(increment)) if increment not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        step = 0.0
+    tolerance = max(step * 0.51, abs(expected_number) * 1e-6, 1e-9)
+    return abs(actual_number - expected_number) <= tolerance
 
 
 def _preview_png(frame: FrameData) -> str | None:

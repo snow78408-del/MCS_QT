@@ -127,8 +127,11 @@ class AlliedVisionCameraAdapter(BaseCameraAdapter):
                 fmt = "BGR8"
             else:
                 fmt = "Mono8"
-            self._frame_id += 1
-            self._latest = FrameData(arr, self._frame_id, time.time(), int(arr.shape[1]), int(arr.shape[0]), fmt, self.backend_name, self._device.unique_id if self._device else "", True)
+            host_monotonic = time.monotonic()
+            hardware_id = int(getattr(frame, "get_id", lambda: 0)() or 0)
+            hardware_timestamp = int(getattr(frame, "get_timestamp", lambda: 0)() or 0)
+            self._frame_id = hardware_id or (self._frame_id + 1)
+            self._latest = FrameData(arr, self._frame_id, time.time(), int(arr.shape[1]), int(arr.shape[0]), fmt, self.backend_name, self._device.unique_id if self._device else "", True, host_monotonic_timestamp=host_monotonic, hardware_frame_id=hardware_id, hardware_timestamp_ticks=hardware_timestamp)
             return self._latest
         except Exception as exc:
             self._last_error = str(exc)

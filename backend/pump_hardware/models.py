@@ -25,6 +25,8 @@ class PumpChannelState:
     flow_rate_unit: str = "uL/min"
     last_readback_time: float | None = None
     error: str = ""
+    measurement_kind: str = "device_parameter_estimate"
+    physically_measured: bool = False
 
 
 @dataclass(slots=True)
@@ -80,3 +82,10 @@ class FlowUpdateResult:
     verified_q1: ChannelParams | None = None
     verified_q2: ChannelParams | None = None
     reason: str | None = None
+    rolled_back: bool = False
+    rollback_error: str | None = None
+    safe_stop_verified: bool = False
+    command_started_monotonic: float = 0.0
+    readback_completed_monotonic: float = 0.0
+    physical_response_started_monotonic: float | None = None
+    physical_response_stable_monotonic: float | None = None

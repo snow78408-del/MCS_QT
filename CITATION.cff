@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using this metadata."
+title: "Microfluidic Control System"
+type: software
+version: 0.1.0
+date-released: 2026-08-26
+license: MIT
+authors:
+  - name: "Microfluidic Control System contributors"
+repository-code: "https://github.com/snow78408-del/microfluidic_control_system1"

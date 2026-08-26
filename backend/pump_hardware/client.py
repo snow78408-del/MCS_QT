@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from itertools import count
 from dataclasses import dataclass
 from typing import Callable
 
@@ -50,6 +51,7 @@ class PumpClient:
         self._logger = logger or (lambda _msg: None)
         self._ser = None
         self._lock = threading.RLock()
+        self._request_ids = count(1)
         self.connected_parity = serial_config.parity
 
     def log(self, msg: str) -> None:
@@ -204,11 +206,16 @@ class PumpClient:
 
         frame = protocol.build_frame(addr=addr, pdu=pdu)
         last_err: Exception | None = None
+        request_id = next(self._request_ids)
 
         for attempt in range(1, retries + 1):
             with self._lock:
                 try:
                     self._reset_input_only()
+                    self.log(
+                        f"[PUMP][TX] request_id={request_id} attempt={attempt}/{retries} "
+                        f"addr={addr} expect={expect_cmd or 'ANY'} frame={frame.hex(' ').upper()}"
+                    )
                     self._ser.write(frame)
                     self._ser.flush()
                 except Exception as e:
@@ -227,21 +234,27 @@ class PumpClient:
                 try:
                     raw = self._read_one_frame(timeout=timeout, idle_timeout=idle_timeout)
                     parsed = protocol.parse_frame(raw)
-                    if parsed.addr != addr:
+                    if int(parsed.addr) != addr:
                         raise CommandMismatchError(
-                            f"应答设备地址不匹配: expect={addr}, got={parsed.addr}"
+                            f"应答地址不匹配: expect={addr}, got={parsed.addr}, "
+                            f"request_id={request_id}"
                         )
                     cmd = protocol.identify_command(parsed.pdu)
                     if expect_cmd and cmd != expect_cmd:
                         raise CommandMismatchError(
                             f"应答命令不匹配: expect={expect_cmd}, got={cmd}, pdu={parsed.pdu.hex(' ').upper()}"
                         )
-                    return PDUReply(
+                    reply = PDUReply(
                         raw_frame=raw,
                         cmd=cmd,
                         pdu=parsed.pdu,
                         addr=parsed.addr,
                     )
+                    self.log(
+                        f"[PUMP][RX] request_id={request_id} addr={parsed.addr} "
+                        f"cmd={cmd} frame={raw.hex(' ').upper()}"
+                    )
+                    return reply
                 except NoReplyError as e:
                     last_err = e
                     if allow_no_reply:

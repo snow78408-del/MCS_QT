@@ -28,7 +28,7 @@ class MultiscaleDropletDetectorTests(unittest.TestCase):
                 self.assertEqual(len(result.centers), 2)
                 self.assertTrue(all(abs(float(value) - radius) <= max(3.0, radius * 0.20) for value in result.radii))
 
-    def test_target_size_changes_preference_without_excluding_other_sizes(self) -> None:
+    def test_control_target_does_not_change_detector_output_domain(self) -> None:
         config = default_config()
         detector = DropletDetector(config.detector, config.debug)
         detector.configure_expected_diameter(20.0, 1.0)
@@ -36,8 +36,8 @@ class MultiscaleDropletDetectorTests(unittest.TestCase):
         detector.configure_expected_diameter(80.0, 1.0)
         large_range = detector.runtime_radius_range()
 
-        self.assertEqual(small_range, (8.0, 10.0, 80.0))
-        self.assertEqual(large_range, (8.0, 40.0, 80.0))
+        self.assertEqual(small_range, large_range)
+        self.assertEqual(small_range, (8.0, float((8.0 * 80.0) ** 0.5), 80.0))
 
     def test_expected_size_filter_only_rejects_wrong_radius_in_hard_mode(self) -> None:
         config = default_config()

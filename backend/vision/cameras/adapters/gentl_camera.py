@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import os
-import tempfile
 import time
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -198,11 +196,16 @@ class GenTLCameraAdapter(BaseCameraAdapter):
             return FrameData(None, self._frame_id, time.time(), source_backend=self.backend_name, valid=False, error="GenTL 未开始采集")
         try:
             with self._ia.fetch(timeout=timeout_ms / 1000.0) as buffer:
+                host_monotonic = time.monotonic()
                 component = buffer.payload.components[0]
                 width = int(component.width)
                 height = int(component.height)
                 fmt = str(getattr(component, "data_format", "") or "Mono8")
-                self._frame_id += 1
+                hardware_id = int(getattr(buffer, "frame_id", 0) or 0)
+                hardware_timestamp = int(
+                    getattr(buffer, "timestamp_ns", 0) or getattr(buffer, "timestamp", 0) or 0
+                )
+                self._frame_id = hardware_id or (self._frame_id + 1)
                 self._latest = make_frame_data(
                     component.data,
                     width,
@@ -212,6 +215,9 @@ class GenTLCameraAdapter(BaseCameraAdapter):
                     self.backend_name,
                     self._device.unique_id if self._device else "",
                 )
+                self._latest.host_monotonic_timestamp = host_monotonic
+                self._latest.hardware_frame_id = hardware_id
+                self._latest.hardware_timestamp_ticks = hardware_timestamp
                 return self._latest
         except Exception as exc:
             self._last_error = str(exc)
@@ -281,69 +287,16 @@ def _cti_paths(config: Any | None) -> list[Path]:
 
 def _prepare_harvesters_xml_dir(config: Any | None) -> Path:
     configured = getattr(config, "gentl_xml_cache_dir", "") or os.environ.get("HARVESTERS_XML_FILE_DIR", "")
-    cache_dir = Path(configured).expanduser() if configured else Path.cwd() / ".camera_cache" / "gentl_xml"
+    if configured:
+        cache_dir = Path(configured).expanduser()
+    else:
+        from ....runtime_paths import user_data_dir
+
+        cache_dir = user_data_dir() / "cache" / "gentl_xml"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    os.environ["HARVESTERS_XML_FILE_DIR"] = str(cache_dir)
-    os.environ["TMP"] = str(cache_dir)
-    os.environ["TEMP"] = str(cache_dir)
-    tempfile.tempdir = str(cache_dir)
-    _patch_tempfile_mkdtemp_for_harvesters(cache_dir)
-    _patch_harvesters_cleanup()
+    # Do not mutate TEMP/TMP, GenTL or process-global tempfile behavior at
+    # runtime. Vendor SDK discovery must be configured before process start.
     return cache_dir
-
-
-def _patch_tempfile_mkdtemp_for_harvesters(cache_dir: Path) -> None:
-    if getattr(tempfile, "_camera_gentl_mkdtemp_patched", False):
-        return
-    original_mkdtemp = tempfile.mkdtemp
-
-    def _camera_mkdtemp(suffix: str | None = None, prefix: str | None = None, dir: str | None = None) -> str:
-        base_dir = Path(dir).expanduser() if dir else cache_dir
-        base_dir.mkdir(parents=True, exist_ok=True)
-        name_prefix = prefix or "tmp"
-        name_suffix = suffix or ""
-        for _ in range(100):
-            candidate = base_dir / f"{name_prefix}{uuid.uuid4().hex}{name_suffix}"
-            try:
-                candidate.mkdir(parents=True, exist_ok=False)
-                return str(candidate)
-            except FileExistsError:
-                continue
-        return original_mkdtemp(suffix=suffix or "", prefix=prefix or "tmp", dir=str(base_dir))
-
-    tempfile._camera_gentl_original_mkdtemp = original_mkdtemp  # type: ignore[attr-defined]
-    tempfile.mkdtemp = _camera_mkdtemp  # type: ignore[assignment]
-    tempfile._camera_gentl_mkdtemp_patched = True  # type: ignore[attr-defined]
-
-
-def _patch_harvesters_cleanup() -> None:
-    try:
-        import harvesters.core as harvesters_core
-    except Exception:
-        return
-    module_cls = getattr(harvesters_core, "Module", None)
-    if module_cls is None or getattr(module_cls, "_camera_gentl_cleanup_patched", False):
-        return
-    original_remove = module_cls._remove_intermediate_file
-    original_retrieve = module_cls._retrieve_file_path
-
-    def _safe_remove_intermediate_file(file_path: str) -> None:
-        try:
-            original_remove(file_path)
-        except OSError:
-            return
-
-    def _safe_retrieve_file_path(*args, **kwargs):
-        try:
-            return original_retrieve(*args, **kwargs)
-        except UnicodeDecodeError:
-            return False, None
-
-    module_cls._camera_gentl_original_remove_intermediate_file = original_remove
-    module_cls._camera_gentl_original_retrieve_file_path = original_retrieve
-    module_cls._remove_intermediate_file = staticmethod(_safe_remove_intermediate_file)
-    module_cls._retrieve_file_path = staticmethod(_safe_retrieve_file_path)
-    module_cls._camera_gentl_cleanup_patched = True
 
 
 _FEATURE_NODES = {

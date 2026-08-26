@@ -118,7 +118,10 @@ class BaslerCameraAdapter(BaseCameraAdapter):
                 self._last_error = err
                 return FrameData(None, self._frame_id, time.time(), source_backend=self.backend_name, valid=False, error=err)
             image = self._converter.Convert(result).GetArray()
-            self._frame_id += 1
+            host_monotonic = time.monotonic()
+            hardware_id = int(getattr(result, "GetBlockID", lambda: 0)() or 0)
+            hardware_timestamp = int(getattr(result, "GetTimeStamp", lambda: 0)() or 0)
+            self._frame_id = hardware_id or (self._frame_id + 1)
             self._latest = FrameData(
                 image=image,
                 frame_id=self._frame_id,
@@ -129,6 +132,9 @@ class BaslerCameraAdapter(BaseCameraAdapter):
                 source_backend=self.backend_name,
                 device_unique_id=self._device.unique_id if self._device else "",
                 valid=True,
+                host_monotonic_timestamp=host_monotonic,
+                hardware_frame_id=hardware_id,
+                hardware_timestamp_ticks=hardware_timestamp,
             )
             return self._latest
         finally:
