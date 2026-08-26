@@ -9,7 +9,7 @@ from frontend.video_process import _jpeg_to_tk_payload
 
 
 class VideoProcessTransportTests(unittest.TestCase):
-    def test_jpeg_is_decoded_to_tk_native_ppm(self) -> None:
+    def test_jpeg_is_decoded_to_renderer_ppm(self) -> None:
         image = np.zeros((12, 16, 3), dtype=np.uint8)
         image[:, :, 1] = 180
         ok, encoded = cv2.imencode(".jpg", image)

@@ -55,7 +55,7 @@ class DahengCameraAdapter(BaseCameraAdapter):
                     transport_type=_transport(transport),
                     ip_address=str(info.get("ip", "") or ""),
                     available=True,
-                    capabilities=_caps(),
+                    capabilities=_empty_caps(),
                     available_backends=[cls.backend_name],
                     selected_backend=cls.backend_name,
                     backend_priority=cls.backend_priority,
@@ -75,6 +75,7 @@ class DahengCameraAdapter(BaseCameraAdapter):
         else:
             self._camera = self._manager.open_device_by_index(1)
         self._device = device_info
+        self._device.capabilities = self.get_capabilities()
 
     def close(self) -> None:
         self.stop_stream()
@@ -137,16 +138,25 @@ class DahengCameraAdapter(BaseCameraAdapter):
         return self._device
 
     def get_capabilities(self) -> CameraCapabilities:
-        return _caps()
+        return _caps_for_camera(self._camera) if self._camera is not None else _empty_caps()
 
     def get_feature(self, name: str) -> Any:
-        feature = getattr(self._camera, _node(name), None) if self._camera is not None else None
-        return feature.get() if feature is not None else None
+        feature = _feature_node(self._camera, name)
+        if feature is None or not _feature_readable(feature):
+            return None
+        return feature.get()
 
     def set_feature(self, name: str, value: Any) -> None:
-        feature = getattr(self._camera, _node(name), None) if self._camera is not None else None
-        if feature is not None:
-            feature.set(value)
+        feature = _feature_node(self._camera, name)
+        if feature is None or not _feature_writable(feature) or not _feature_readable(feature):
+            raise CameraBackendError(f"大恒参数 {name} 不支持可验证写入")
+        try:
+            result = feature.set(value)
+            if result is False:
+                raise RuntimeError("SDK rejected the value")
+        except Exception as exc:
+            self._last_error = str(exc)
+            raise CameraBackendError(f"大恒参数 {name} 写入失败: {exc}") from exc
 
     def is_open(self) -> bool:
         return self._camera is not None
@@ -164,32 +174,82 @@ def _transport(value: str) -> str:
     return value or "Unknown"
 
 
-def _node(name: str) -> str:
-    return {
-        "exposure": "ExposureTime",
-        "gain": "Gain",
-        "frame_rate": "AcquisitionFrameRate",
-        "width": "Width",
-        "height": "Height",
-        "offset_x": "OffsetX",
-        "offset_y": "OffsetY",
-        "pixel_format": "PixelFormat",
-        "trigger_mode": "TriggerMode",
-    }.get(name, name)
+_FEATURE_NODES = {
+    "exposure": "ExposureTime",
+    "exposure_auto": "ExposureAuto",
+    "gain": "Gain",
+    "gain_auto": "GainAuto",
+    "frame_rate": "AcquisitionFrameRate",
+    "width": "Width",
+    "height": "Height",
+    "offset_x": "OffsetX",
+    "offset_y": "OffsetY",
+    "pixel_format": "PixelFormat",
+    "trigger_mode": "TriggerMode",
+    "trigger_source": "TriggerSource",
+    "packet_size": "GevSCPSPacketSize",
+    "acquisition_mode": "AcquisitionMode",
+}
 
 
-def _caps() -> CameraCapabilities:
-    return CameraCapabilities(
-        exposure=CameraFeatureCapability(True, True, True),
-        exposure_auto=CameraFeatureCapability(True, True, True),
-        gain=CameraFeatureCapability(True, True, True),
-        frame_rate=CameraFeatureCapability(True, True, True),
-        width=CameraFeatureCapability(True, True, True),
-        height=CameraFeatureCapability(True, True, True),
-        offset_x=CameraFeatureCapability(True, True, True),
-        offset_y=CameraFeatureCapability(True, True, True),
-        pixel_format=CameraFeatureCapability(True, True, True),
-        trigger_mode=CameraFeatureCapability(True, True, True),
-        acquisition_mode=CameraFeatureCapability(True, True, True, "Continuous"),
-    )
+def _feature_node(camera: Any, name: str) -> Any:
+    if camera is None:
+        return None
+    return getattr(camera, _FEATURE_NODES.get(name, name), None)
+
+
+def _feature_readable(feature: Any) -> bool:
+    for name in ("is_readable", "IsReadable"):
+        status = getattr(feature, name, None)
+        if callable(status):
+            try:
+                return bool(status())
+            except Exception:
+                return False
+        if status is not None:
+            return bool(status)
+    return bool(getattr(feature, "readable", callable(getattr(feature, "get", None))))
+
+
+def _feature_writable(feature: Any) -> bool:
+    for name in ("is_writable", "is_writeable", "IsWritable"):
+        status = getattr(feature, name, None)
+        if callable(status):
+            try:
+                return bool(status())
+            except Exception:
+                return False
+        if status is not None:
+            return bool(status)
+    return bool(getattr(feature, "writable", callable(getattr(feature, "set", None))))
+
+
+def _caps_for_camera(camera: Any) -> CameraCapabilities:
+    values = {}
+    for name in CameraCapabilities.__dataclass_fields__:
+        feature = _feature_node(camera, name)
+        readable = feature is not None and _feature_readable(feature)
+        writable = readable and _feature_writable(feature)
+        current = None
+        if readable:
+            try:
+                current = feature.get()
+            except Exception:
+                readable = False
+                writable = False
+        values[name] = CameraFeatureCapability(
+            supported=bool(feature is not None and (readable or writable)),
+            readable=readable,
+            writable=writable,
+            current_value=current,
+            error="大恒参数不可验证写入" if feature is not None and not writable else ("大恒参数不可用" if feature is None else ""),
+        )
+    return CameraCapabilities(**values)
+
+
+def _empty_caps() -> CameraCapabilities:
+    return CameraCapabilities(**{
+        name: CameraFeatureCapability(False, False, False, error="大恒参数能力需在相机打开后验证")
+        for name in CameraCapabilities.__dataclass_fields__
+    })
 

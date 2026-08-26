@@ -407,7 +407,7 @@ class HikrobotCameraAdapter(BaseCameraAdapter):
                 return device, raw_info
         raise CameraAdapterError(f"鏈壘鍒版捣搴峰伐涓氱浉鏈? {device_id}")
 
-    def open(self, device_id: str) -> None:
+    def open(self, device_id: str, *, start_stream: bool = True) -> None:
         self.close()
         mvs = self._ensure_sdk()
         device: CameraDevice | None = None
@@ -435,6 +435,13 @@ class HikrobotCameraAdapter(BaseCameraAdapter):
                 self._configure_gige_packet_size(cam, device)
 
             self._refresh_basic_info()
+            if not start_stream:
+                # The unified manager applies user parameters between open and
+                # start_stream. Keep the historical eager behavior by default,
+                # while allowing modern adapters to configure safely first.
+                self._log("[HIKROBOT][OPEN][OK] handle_ready=True")
+                return
+
             self._set_enum_value("AcquisitionMode", "Continuous", raise_on_fail=False)
             self.set_trigger_mode(self.config.trigger_mode or "Off")
             self.configure(self.config)
@@ -903,6 +910,9 @@ class HikrobotCameraAdapter(BaseCameraAdapter):
 
     def set_trigger_mode(self, trigger_mode: str) -> None:
         self._set_enum_value("TriggerMode", trigger_mode or "Off")
+
+    def set_acquisition_mode(self, acquisition_mode: str) -> None:
+        self._set_enum_value("AcquisitionMode", acquisition_mode or "Continuous")
 
     def _refresh_basic_info(self) -> None:
         for name, attr in (("Width", "_width"), ("Height", "_height")):

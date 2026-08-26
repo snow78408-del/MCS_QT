@@ -154,7 +154,9 @@ class HikrobotCameraAdapter(BaseCameraAdapter):
             self._direct.open(device_info)
             return
         self._active = "legacy"
-        self._legacy.open(device_info.device_id)
+        # Legacy open() remains eager for existing callers. The unified
+        # manager must instead configure GenICam nodes before acquisition.
+        self._legacy.open(device_info.device_id, start_stream=False)
 
     def close(self) -> None:
         self._active_adapter().close()
@@ -226,6 +228,8 @@ class HikrobotCameraAdapter(BaseCameraAdapter):
             self._legacy.set_resolution(**current)
         elif name == "trigger_mode":
             self._legacy.set_trigger_mode(str(value))
+        elif name == "acquisition_mode":
+            self._legacy.set_acquisition_mode(str(value))
 
     def is_open(self) -> bool:
         return self._active_adapter().is_open()

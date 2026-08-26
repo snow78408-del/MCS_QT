@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import math
 import time
 from typing import Callable
 
@@ -954,6 +955,16 @@ class PumpHardwareService:
 
     def update_flow_while_running(self, q1: float, q2: float) -> FlowUpdateResult:
         self.log(f"[PUMP][UPDATE] 运行中参数更新: q1={q1:.6f}, q2={q2:.6f}")
+        if not math.isfinite(float(q1)) or not math.isfinite(float(q2)) or float(q1) <= 0.0 or float(q2) <= 0.0:
+            reason = "拒绝泵流量更新：Q1 和 Q2 必须为有限正数"
+            self.log(f"[PUMP][UPDATE][REJECT] {reason}")
+            return FlowUpdateResult(
+                ok=False,
+                q1_ok=False,
+                q2_ok=False,
+                still_running=False,
+                reason=reason,
+            )
         min_gap = max(1e-9, float(self.runtime_config.min_q1_q2_gap))
         if float(q1) < float(q2) + min_gap:
             reason = (

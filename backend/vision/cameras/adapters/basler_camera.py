@@ -51,7 +51,7 @@ class BaslerCameraAdapter(BaseCameraAdapter):
                     device_type=DEVICE_TYPE_INDUSTRIAL,
                     transport_type=_transport(transport),
                     available=True,
-                    capabilities=_caps(),
+                    capabilities=_empty_caps(),
                     available_backends=[cls.backend_name],
                     selected_backend=cls.backend_name,
                     backend_priority=cls.backend_priority,
@@ -81,6 +81,7 @@ class BaslerCameraAdapter(BaseCameraAdapter):
         self._converter.OutputPixelFormat = pylon.PixelType_BGR8packed
         self._converter.OutputBitAlignment = pylon.OutputBitAlignment_MsbAligned
         self._device = device_info
+        self._device.capabilities = self.get_capabilities()
 
     def close(self) -> None:
         self.stop_stream()
@@ -141,20 +142,25 @@ class BaslerCameraAdapter(BaseCameraAdapter):
         return self._device
 
     def get_capabilities(self) -> CameraCapabilities:
-        return _caps()
+        return _caps_for_camera(self._camera) if self._camera is not None else _empty_caps()
 
     def get_feature(self, name: str) -> Any:
-        if self._camera is None:
+        node = _feature_node(self._camera, name)
+        if node is None or not _node_readable(node):
             return None
-        node = getattr(self._camera, _node(name), None)
-        return node.GetValue() if node is not None else None
+        return node.GetValue()
 
     def set_feature(self, name: str, value: Any) -> None:
-        if self._camera is None:
-            return
-        node = getattr(self._camera, _node(name), None)
-        if node is not None:
-            node.SetValue(value)
+        node = _feature_node(self._camera, name)
+        if node is None or not _node_writable(node) or not _node_readable(node):
+            raise CameraBackendError(f"Basler 参数 {name} 不支持可验证写入")
+        try:
+            result = node.SetValue(value)
+            if result is False:
+                raise RuntimeError("SDK rejected the value")
+        except Exception as exc:
+            self._last_error = str(exc)
+            raise CameraBackendError(f"Basler 参数 {name} 写入失败: {exc}") from exc
 
     def is_open(self) -> bool:
         return bool(self._camera is not None and self._camera.IsOpen())
@@ -172,33 +178,82 @@ def _transport(value: str) -> str:
     return value or "Unknown"
 
 
-def _node(name: str) -> str:
-    return {
-        "exposure": "ExposureTime",
-        "gain": "Gain",
-        "frame_rate": "AcquisitionFrameRate",
-        "width": "Width",
-        "height": "Height",
-        "offset_x": "OffsetX",
-        "offset_y": "OffsetY",
-        "pixel_format": "PixelFormat",
-        "trigger_mode": "TriggerMode",
-    }.get(name, name)
+_FEATURE_NODES = {
+    "exposure": "ExposureTime",
+    "exposure_auto": "ExposureAuto",
+    "gain": "Gain",
+    "gain_auto": "GainAuto",
+    "frame_rate": "AcquisitionFrameRate",
+    "width": "Width",
+    "height": "Height",
+    "offset_x": "OffsetX",
+    "offset_y": "OffsetY",
+    "pixel_format": "PixelFormat",
+    "trigger_mode": "TriggerMode",
+    "trigger_source": "TriggerSource",
+    "packet_size": "GevSCPSPacketSize",
+    "acquisition_mode": "AcquisitionMode",
+}
 
 
-def _caps() -> CameraCapabilities:
-    return CameraCapabilities(
-        exposure=CameraFeatureCapability(True, True, True),
-        exposure_auto=CameraFeatureCapability(True, True, True),
-        gain=CameraFeatureCapability(True, True, True),
-        gain_auto=CameraFeatureCapability(True, True, True),
-        frame_rate=CameraFeatureCapability(True, True, True),
-        width=CameraFeatureCapability(True, True, True),
-        height=CameraFeatureCapability(True, True, True),
-        offset_x=CameraFeatureCapability(True, True, True),
-        offset_y=CameraFeatureCapability(True, True, True),
-        pixel_format=CameraFeatureCapability(True, True, True),
-        trigger_mode=CameraFeatureCapability(True, True, True),
-        acquisition_mode=CameraFeatureCapability(True, True, True, "Continuous"),
-    )
+def _feature_node(camera: Any, name: str) -> Any:
+    if camera is None:
+        return None
+    return getattr(camera, _FEATURE_NODES.get(name, name), None)
+
+
+def _node_readable(node: Any) -> bool:
+    for name in ("IsReadable", "is_readable"):
+        status = getattr(node, name, None)
+        if callable(status):
+            try:
+                return bool(status())
+            except Exception:
+                return False
+        if status is not None:
+            return bool(status)
+    return bool(getattr(node, "readable", callable(getattr(node, "GetValue", None))))
+
+
+def _node_writable(node: Any) -> bool:
+    for name in ("IsWritable", "is_writable", "is_writeable"):
+        status = getattr(node, name, None)
+        if callable(status):
+            try:
+                return bool(status())
+            except Exception:
+                return False
+        if status is not None:
+            return bool(status)
+    return bool(getattr(node, "writable", callable(getattr(node, "SetValue", None))))
+
+
+def _caps_for_camera(camera: Any) -> CameraCapabilities:
+    values = {}
+    for name in CameraCapabilities.__dataclass_fields__:
+        node = _feature_node(camera, name)
+        readable = node is not None and _node_readable(node)
+        writable = readable and _node_writable(node)
+        current = None
+        if readable:
+            try:
+                current = node.GetValue()
+            except Exception:
+                readable = False
+                writable = False
+        values[name] = CameraFeatureCapability(
+            supported=bool(node is not None and (readable or writable)),
+            readable=readable,
+            writable=writable,
+            current_value=current,
+            error="Basler 参数不可验证写入" if node is not None and not writable else ("Basler 参数不可用" if node is None else ""),
+        )
+    return CameraCapabilities(**values)
+
+
+def _empty_caps() -> CameraCapabilities:
+    return CameraCapabilities(**{
+        name: CameraFeatureCapability(False, False, False, error="Basler 参数能力需在相机打开后验证")
+        for name in CameraCapabilities.__dataclass_fields__
+    })
 

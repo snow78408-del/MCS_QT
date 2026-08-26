@@ -19,6 +19,9 @@ dependencies = [
 [project.scripts]
 microfluidic-control = "run:main"
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [tool.setuptools]
 py-modules = ["run"]
 

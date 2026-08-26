@@ -56,7 +56,7 @@ def preprocess_video_if_needed(args: argparse.Namespace) -> str:
     return output_path
 
 
-def main() -> None:
+def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the standalone vision pipeline.")
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--video", type=str, help="Local video path")
@@ -66,7 +66,7 @@ def main() -> None:
     parser.add_argument("--display", action="store_true", help="Show visualization window during processing")
     parser.add_argument("--max-frames", type=int, default=None, help="Process only first N frames")
 
-    parser.add_argument("--tracker", choices=["nearest", "kalman"], default="nearest")
+    parser.add_argument("--tracker", choices=["nearest", "kalman"], default="kalman")
     parser.add_argument("--bead-mode", choices=["intensity", "connected"], default="intensity")
 
     parser.add_argument("--min-radius", type=float, default=18.0)
@@ -97,7 +97,11 @@ def main() -> None:
 
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
 
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = build_argument_parser().parse_args()
     config = build_config_from_args(args)
     pipeline = VisionPipeline(config)
 

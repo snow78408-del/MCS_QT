@@ -1,12 +1,8 @@
-from .control_buttons import ControlButtons
-from .pump_panel import PumpPanel
-from .recognition_panel import RecognitionPanel
-from .status_panel import StatusPanel
+"""Legacy Tk components.
 
-__all__ = [
-    "StatusPanel",
-    "PumpPanel",
-    "RecognitionPanel",
-    "ControlButtons",
-]
+The active frontend is implemented in :mod:`frontend.qt_app`.  Legacy Tk
+components remain available when imported explicitly, but are not re-exported
+here so importing the frontend package does not require Tk bindings.
+"""
 
+__all__: list[str] = []

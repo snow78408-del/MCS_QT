@@ -272,7 +272,14 @@ class DropletDetector:
         self,
         candidates: List[Tuple[float, float, float]],
     ) -> List[Tuple[float, float, float]]:
-        if not self._config.enable_expected_size_filter or not self._has_expected_size:
+        # A configured target is a preference in soft mode.  Only the
+        # explicit hard-gate option is allowed to reject Hough candidates by
+        # radius; runtime bounds still protect the absolute detector range.
+        if (
+            not self._config.enable_expected_size_filter
+            or not self._has_expected_size
+            or not bool(self._config.expected_size_hard_gate)
+        ):
             return candidates
         tolerance = max(0.0, float(self._config.expected_radius_tolerance_ratio))
         preferred = float(self._runtime_preferred_radius)

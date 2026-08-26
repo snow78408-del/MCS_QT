@@ -234,10 +234,10 @@ class DirectHikrobotDllCamera:
             opened = True
             self._handle = handle
             self._device = device
-            self._set_enum_value("TriggerMode", 0, raise_on_fail=False)
+            self._set_enum_value("TriggerMode", 0, raise_on_fail=True)
             packet_size = int(self._dll.MV_CC_GetOptimalPacketSize(self._handle))
             if packet_size > 0:
-                self._set_int_value("GevSCPSPacketSize", packet_size, raise_on_fail=False)
+                self._set_int_value("GevSCPSPacketSize", packet_size, raise_on_fail=True)
             self._opened = True
             self._last_error = ""
             self._log(f"[HIKROBOT][DIRECT][OPEN][OK] index={index} dll={self._dll_path}")
@@ -330,20 +330,25 @@ class DirectHikrobotDllCamera:
     def set_feature(self, name: str, value: Any) -> None:
         key = _feature_name(name)
         try:
-            if key in {"TriggerMode", "AcquisitionMode"}:
-                enum_value = 0 if str(value).lower() in {"off", "continuous", "0"} else 1
-                self._set_enum_value(key, enum_value, raise_on_fail=False)
+            if key == "TriggerMode":
+                enum_value = _trigger_mode_value(value)
+                self._set_enum_value(key, enum_value, raise_on_fail=True)
+            elif key == "AcquisitionMode":
+                enum_value = _acquisition_mode_value(value)
+                self._set_enum_value(key, enum_value, raise_on_fail=True)
             elif key in {"Width", "Height", "OffsetX", "OffsetY", "GevSCPSPacketSize"}:
                 self._set_int_value(key, int(value), raise_on_fail=True)
             elif key == "ExposureTime":
-                self._set_enum_value("ExposureAuto", 0, raise_on_fail=False)
+                self._set_enum_value("ExposureAuto", 0, raise_on_fail=True)
                 self._set_float_value(key, float(value), raise_on_fail=True)
             elif key == "Gain":
-                self._set_enum_value("GainAuto", 0, raise_on_fail=False)
+                self._set_enum_value("GainAuto", 0, raise_on_fail=True)
                 self._set_float_value(key, float(value), raise_on_fail=True)
             elif key == "AcquisitionFrameRate":
-                self._set_bool_value("AcquisitionFrameRateEnable", True, raise_on_fail=False)
+                self._set_bool_value("AcquisitionFrameRateEnable", True, raise_on_fail=True)
                 self._set_float_value(key, float(value), raise_on_fail=True)
+            else:
+                raise CameraBackendError(f"HIKROBOT 参数 {name} 不可用")
         except Exception as exc:
             self._last_error = str(exc)
             raise
@@ -425,6 +430,8 @@ class DirectHikrobotDllCamera:
     def _set_bool_value(self, name: str, value: bool, raise_on_fail: bool) -> None:
         setter = getattr(self._dll, "MV_CC_SetBoolValue", None)
         if setter is None:
+            if raise_on_fail:
+                raise CameraBackendError(f"MV_CC_SetBoolValue {name} is unavailable")
             return
         ret = setter(self._handle, name.encode("ascii"), c_bool(bool(value)))
         if ret != 0 and raise_on_fail:
@@ -547,7 +554,26 @@ def _feature_name(name: str) -> str:
         "offset_y": "OffsetY",
         "pixel_format": "PixelFormat",
         "trigger_mode": "TriggerMode",
+        "acquisition_mode": "AcquisitionMode",
     }.get(str(name), str(name))
+
+
+def _trigger_mode_value(value: Any) -> int:
+    normalized = str(value).strip().lower()
+    if normalized in {"off", "0"}:
+        return 0
+    if normalized in {"on", "1"}:
+        return 1
+    return int(value)
+
+
+def _acquisition_mode_value(value: Any) -> int:
+    normalized = str(value).strip().lower()
+    if normalized in {"continuous", "2"}:
+        # HIKROBOT MVS uses 2 for AcquisitionMode=Continuous.  Zero is
+        # TriggerMode=Off and is not a valid continuous acquisition value.
+        return 2
+    return int(value)
 
 
 def _ret_hex(ret: int) -> str:

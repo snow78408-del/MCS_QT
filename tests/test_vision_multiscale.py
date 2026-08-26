@@ -39,17 +39,26 @@ class MultiscaleDropletDetectorTests(unittest.TestCase):
         self.assertEqual(small_range, (8.0, 10.0, 80.0))
         self.assertEqual(large_range, (8.0, 40.0, 80.0))
 
-    def test_expected_size_filter_rejects_wrong_hough_radius(self) -> None:
+    def test_expected_size_filter_only_rejects_wrong_radius_in_hard_mode(self) -> None:
+        config = default_config()
+        config.detector.expected_radius = 20.0
+        config.detector.expected_radius_tolerance_ratio = 0.25
+        config.detector.expected_size_hard_gate = True
+        detector = DropletDetector(config.detector, config.debug)
+        candidates = [(40.0, 40.0, 19.0), (80.0, 40.0, 28.0), (120.0, 40.0, 12.0)]
+
+        filtered = detector._filter_expected_size(candidates)
+
+        self.assertEqual(filtered, [(40.0, 40.0, 19.0)])
+
+    def test_expected_size_soft_mode_preserves_other_radii(self) -> None:
         config = default_config()
         config.detector.expected_radius = 20.0
         config.detector.expected_radius_tolerance_ratio = 0.25
         detector = DropletDetector(config.detector, config.debug)
+        candidates = [(40.0, 40.0, 10.0), (80.0, 40.0, 20.0), (120.0, 40.0, 30.0)]
 
-        filtered = detector._filter_expected_size(
-            [(40.0, 40.0, 19.0), (80.0, 40.0, 28.0), (120.0, 40.0, 12.0)]
-        )
-
-        self.assertEqual(filtered, [(40.0, 40.0, 19.0)])
+        self.assertEqual(detector._filter_expected_size(candidates), candidates)
 
     def test_edge_ownership_rejects_circle_built_from_neighbor_edges(self) -> None:
         config = default_config()

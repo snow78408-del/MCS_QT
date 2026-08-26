@@ -1081,12 +1081,32 @@ class FrontendApp(QMainWindow):
         self.pool=QThreadPool.globalInstance(); self.workers=set(); self.current=None; self._build(); self.show_page("parameter")
 
     def _build(self):
-        root=QWidget(); self.setCentralWidget(root); outer=QHBoxLayout(root); outer.setContentsMargins(0,0,0,0); self.nav=QListWidget(); self.nav.setObjectName("nav"); self.nav.setFixedWidth(205); self.stack=QStackedWidget(); outer.addWidget(self.nav); outer.addWidget(self.stack,1)
+        root=QWidget(); self.setCentralWidget(root); outer=QHBoxLayout(root); outer.setContentsMargins(0,0,0,0); outer.setSpacing(0)
+        self.nav_panel=QFrame(); self.nav_panel.setObjectName("navPanel"); self.nav_panel.setFixedWidth(248)
+        nav_layout=QVBoxLayout(self.nav_panel); nav_layout.setContentsMargins(12,14,12,14); nav_layout.setSpacing(10)
+        self.nav_toggle=QPushButton("收起导航"); self.nav_toggle.setObjectName("navToggle"); self.nav_toggle.setToolTip("收起左侧导航栏"); self.nav_toggle.clicked.connect(self._toggle_nav)
+        nav_layout.addWidget(self.nav_toggle)
+        self.nav=QListWidget(); self.nav.setObjectName("nav"); nav_layout.addWidget(self.nav,1)
+        self.stack=QStackedWidget(); outer.addWidget(self.nav_panel); outer.addWidget(self.stack,1)
+        self._nav_collapsed=False
+        self._nav_entries=(("parameter","1  基础参数"),("video","2  相机识别与读写"),("pump","3  泵机识别与读写"),("init","4  系统初始化"),("monitor","5  运行监控"),("status","6  系统状态"),("tuning","7  液滴算法调参"))
         self.pages={"parameter":ParameterPage(self),"video":VideoPage(self),"pump":PumpPage(self),"init":InitPage(self),"monitor":MonitorPage(self),"status":StatusPage(self),"tuning":TuningPage(self)}
-        for key,label in (("parameter","1  基础参数"),("video","2  相机识别与读写"),("pump","3  泵机识别与读写"),("init","4  系统初始化"),("monitor","5  运行监控"),("status","6  系统状态"),("tuning","7  液滴算法调参")):
-            item=QListWidgetItem(label); item.setData(Qt.UserRole,key); item.setSizeHint(QSize(190,48)); self.nav.addItem(item); self.stack.addWidget(self.pages[key])
+        for key,label in self._nav_entries:
+            item=QListWidgetItem(label); item.setData(Qt.UserRole,key); item.setToolTip(label); item.setSizeHint(QSize(220,48)); self.nav.addItem(item); self.stack.addWidget(self.pages[key])
         self.nav.currentItemChanged.connect(lambda current,_: current and self.show_page(str(current.data(Qt.UserRole))))
-        self.setStyleSheet("QMainWindow,QWidget{background:#f4f7fb;color:#172033;font-size:14px}#nav{background:#152238;color:#dbe7f7;border:0;padding:18px 8px}#nav::item{border-radius:7px;padding-left:12px;margin:2px}#nav::item:selected{background:#2b6de5;color:white}QGroupBox{background:white;border:1px solid #dce3ed;border-radius:10px;margin-top:14px;padding:20px;font-weight:600}QGroupBox::title{subcontrol-origin:margin;left:16px;padding:0 6px}QLineEdit,QComboBox,QPlainTextEdit{background:white;border:1px solid #cbd5e1;border-radius:6px;padding:7px}QPushButton{background:#2b6de5;color:white;border:0;border-radius:6px;padding:8px 16px}QPushButton:disabled{background:#aab5c4}")
+        self.setStyleSheet("QMainWindow,QWidget{background:#f4f7fb;color:#172033;font-size:14px}#navPanel{background:#152238}#navToggle{background:#223554;color:#dbe7f7;border:1px solid #3b5275;border-radius:8px;padding:9px 12px;text-align:left}#navToggle:hover{background:#2b6de5;color:white}#nav{background:transparent;color:#dbe7f7;border:0;padding:4px 0}#nav::item{border-radius:8px;padding:10px 12px;margin:2px 0}#nav::item:hover{background:#203554}#nav::item:selected{background:#2b6de5;color:white}QGroupBox{background:white;border:1px solid #dce3ed;border-radius:10px;margin-top:14px;padding:20px;font-weight:600}QGroupBox::title{subcontrol-origin:margin;left:16px;padding:0 6px}QLineEdit,QComboBox,QPlainTextEdit{background:white;border:1px solid #cbd5e1;border-radius:6px;padding:7px}QPushButton{background:#2b6de5;color:white;border:0;border-radius:6px;padding:8px 16px}QPushButton:disabled{background:#aab5c4}")
+
+    def _toggle_nav(self):
+        self._nav_collapsed=not self._nav_collapsed
+        width=68 if self._nav_collapsed else 248
+        self.nav_panel.setFixedWidth(width)
+        self.nav_toggle.setText("展开" if self._nav_collapsed else "收起导航")
+        self.nav_toggle.setToolTip("展开左侧导航栏" if self._nav_collapsed else "收起左侧导航栏")
+        for index,(_, label) in enumerate(self._nav_entries):
+            item=self.nav.item(index)
+            item.setText(label.split("  ",1)[0] if self._nav_collapsed else label)
+            item.setSizeHint(QSize(42 if self._nav_collapsed else 220,48))
+        self.nav.repaint()
 
     def title(self,heading,subtitle):
         widget=QFrame(); layout=QVBoxLayout(widget); label=QLabel(heading); label.setStyleSheet("font-size:26px;font-weight:700"); detail=QLabel(subtitle); detail.setStyleSheet("color:#64748b"); layout.addWidget(label); layout.addWidget(detail); return widget

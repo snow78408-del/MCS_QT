@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from typing import Any, Callable
 
 from .config import CameraDiscoveryConfig, CameraSystemConfig
@@ -14,16 +14,11 @@ def _coerce_camera_system_config(config: Any | None) -> CameraSystemConfig:
     result = CameraSystemConfig()
     if config is None:
         return result
-    for name in (
-        "mvs_sdk_path",
-        "hikrobot_mvs_sdk_path",
-        "opencv_scan_indices",
-        "gentl_producer_paths",
-        "enabled_camera_backends",
-        "preferred_backend_order",
-    ):
-        if hasattr(config, name):
-            setattr(result, name, getattr(config, name))
+    # Keep custom config objects compatible while ensuring every current
+    # CameraSystemConfig field survives service coercion.
+    for item in fields(result):
+        if hasattr(config, item.name):
+            setattr(result, item.name, getattr(config, item.name))
     return result
 
 

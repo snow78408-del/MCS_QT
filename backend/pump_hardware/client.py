@@ -227,6 +227,10 @@ class PumpClient:
                 try:
                     raw = self._read_one_frame(timeout=timeout, idle_timeout=idle_timeout)
                     parsed = protocol.parse_frame(raw)
+                    if parsed.addr != addr:
+                        raise CommandMismatchError(
+                            f"应答设备地址不匹配: expect={addr}, got={parsed.addr}"
+                        )
                     cmd = protocol.identify_command(parsed.pdu)
                     if expect_cmd and cmd != expect_cmd:
                         raise CommandMismatchError(

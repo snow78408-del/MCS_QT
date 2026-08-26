@@ -119,7 +119,7 @@ class GenTLCameraAdapter(BaseCameraAdapter):
                     transport_type=TRANSPORT_GENTL,
                     gentl_producer=producer,
                     available=True,
-                    capabilities=_generic_caps(),
+                    capabilities=_empty_caps(),
                     available_backends=[cls.backend_name],
                     selected_backend=cls.backend_name,
                     backend_priority=cls.backend_priority,
@@ -145,6 +145,7 @@ class GenTLCameraAdapter(BaseCameraAdapter):
             index = _resolve_device_index(device_info, self._harvester.device_info_list)
             self._ia = self._harvester.create(index)
             self._device = device_info
+            self._device.capabilities = self.get_capabilities()
         except CameraBackendError:
             self.close()
             raise
@@ -223,16 +224,24 @@ class GenTLCameraAdapter(BaseCameraAdapter):
         return self._device
 
     def get_capabilities(self) -> CameraCapabilities:
-        return _generic_caps()
+        node_map = getattr(getattr(self._ia, "remote_device", None), "node_map", None)
+        return _caps_for_node_map(node_map) if node_map is not None else _empty_caps()
 
     def get_feature(self, name: str) -> Any:
-        node = getattr(getattr(self._ia, "remote_device", None), "node_map", None)
-        return getattr(node, name).value if node is not None and hasattr(node, name) else None
+        feature = _feature_node(self._ia, name)
+        if feature is None or not _feature_readable(feature):
+            return None
+        return feature.value
 
     def set_feature(self, name: str, value: Any) -> None:
-        node = getattr(getattr(self._ia, "remote_device", None), "node_map", None)
-        if node is not None and hasattr(node, name):
-            getattr(node, name).value = value
+        feature = _feature_node(self._ia, name)
+        if feature is None or not _feature_writable(feature) or not _feature_readable(feature):
+            raise CameraBackendError(f"GenTL 参数 {name} 不支持可验证写入")
+        try:
+            feature.value = value
+        except Exception as exc:
+            self._last_error = str(exc)
+            raise CameraBackendError(f"GenTL 参数 {name} 写入失败: {exc}") from exc
 
     def is_open(self) -> bool:
         return self._ia is not None
@@ -337,23 +346,104 @@ def _patch_harvesters_cleanup() -> None:
     module_cls._camera_gentl_cleanup_patched = True
 
 
-def _generic_caps() -> CameraCapabilities:
-    return CameraCapabilities(
-        exposure=CameraFeatureCapability(True, True, True),
-        exposure_auto=CameraFeatureCapability(True, True, True),
-        gain=CameraFeatureCapability(True, True, True),
-        gain_auto=CameraFeatureCapability(True, True, True),
-        frame_rate=CameraFeatureCapability(True, True, True),
-        width=CameraFeatureCapability(True, True, True),
-        height=CameraFeatureCapability(True, True, True),
-        offset_x=CameraFeatureCapability(True, True, True),
-        offset_y=CameraFeatureCapability(True, True, True),
-        pixel_format=CameraFeatureCapability(True, True, True),
-        trigger_mode=CameraFeatureCapability(True, True, True),
-        trigger_source=CameraFeatureCapability(True, True, True),
-        packet_size=CameraFeatureCapability(True, True, True),
-        acquisition_mode=CameraFeatureCapability(True, True, True, "Continuous"),
-    )
+_FEATURE_NODES = {
+    "exposure": "ExposureTime",
+    "exposure_auto": "ExposureAuto",
+    "gain": "Gain",
+    "gain_auto": "GainAuto",
+    "frame_rate": "AcquisitionFrameRate",
+    "width": "Width",
+    "height": "Height",
+    "offset_x": "OffsetX",
+    "offset_y": "OffsetY",
+    "pixel_format": "PixelFormat",
+    "trigger_mode": "TriggerMode",
+    "trigger_source": "TriggerSource",
+    "packet_size": "GevSCPSPacketSize",
+    "acquisition_mode": "AcquisitionMode",
+}
+
+
+def _feature_node(ia: Any, name: str) -> Any:
+    node_map = getattr(getattr(ia, "remote_device", None), "node_map", None)
+    if node_map is None:
+        return None
+    node_name = _FEATURE_NODES.get(name, name)
+    feature = getattr(node_map, node_name, None)
+    if feature is None:
+        getter = getattr(node_map, "get_node_by_name", None)
+        if callable(getter):
+            try:
+                feature = getter(node_name)
+            except Exception:
+                return None
+    return feature
+
+
+def _feature_readable(feature: Any) -> bool:
+    for name in ("is_readable", "is_readable_node"):
+        status = getattr(feature, name, None)
+        if callable(status):
+            try:
+                return bool(status())
+            except Exception:
+                return False
+        if status is not None:
+            return bool(status)
+    return bool(getattr(feature, "readable", hasattr(feature, "value")))
+
+
+def _feature_writable(feature: Any) -> bool:
+    for name in ("is_writable", "is_writeable", "is_writable_node"):
+        status = getattr(feature, name, None)
+        if callable(status):
+            try:
+                return bool(status())
+            except Exception:
+                return False
+        if status is not None:
+            return bool(status)
+    return bool(getattr(feature, "writable", hasattr(feature, "value")))
+
+
+def _caps_for_node_map(node_map: Any) -> CameraCapabilities:
+    values = {}
+    for name in CameraCapabilities.__dataclass_fields__:
+        feature = None
+        if node_map is not None:
+            node_name = _FEATURE_NODES.get(name, name)
+            feature = getattr(node_map, node_name, None)
+            if feature is None:
+                getter = getattr(node_map, "get_node_by_name", None)
+                if callable(getter):
+                    try:
+                        feature = getter(node_name)
+                    except Exception:
+                        feature = None
+        readable = feature is not None and _feature_readable(feature)
+        writable = readable and _feature_writable(feature)
+        current = None
+        if readable:
+            try:
+                current = feature.value
+            except Exception:
+                readable = False
+                writable = False
+        values[name] = CameraFeatureCapability(
+            supported=bool(feature is not None and (readable or writable)),
+            readable=readable,
+            writable=writable,
+            current_value=current,
+            error="GenTL 参数不可验证写入" if feature is not None and not writable else ("GenTL 参数不可用" if feature is None else ""),
+        )
+    return CameraCapabilities(**values)
+
+
+def _empty_caps() -> CameraCapabilities:
+    return CameraCapabilities(**{
+        name: CameraFeatureCapability(False, False, False, error="GenTL 参数能力需在相机打开后验证")
+        for name in CameraCapabilities.__dataclass_fields__
+    })
 
 
 def _unique_id(manufacturer: str, model: str, serial: str, fallback: str) -> str:

@@ -1,10 +1,25 @@
 from __future__ import annotations
 
+import math
 import time
 from typing import Any
 
 from ..base import BaseCameraAdapter, CameraBackendError
 from ..models import CameraCapabilities, CameraDeviceInfo, CameraFeatureCapability, DEVICE_TYPE_INDUSTRIAL, FrameData
+
+
+_FEATURE_NODES: dict[str, tuple[str, str]] = {
+    "exposure": ("ExposureTime", "float"),
+    "gain": ("Gain", "float"),
+    "frame_rate": ("AcquisitionFrameRate", "float"),
+    "width": ("Width", "int"),
+    "height": ("Height", "int"),
+    "offset_x": ("OffsetX", "int"),
+    "offset_y": ("OffsetY", "int"),
+    "pixel_format": ("PixelFormat", "enum"),
+    "trigger_mode": ("TriggerMode", "enum"),
+    "acquisition_mode": ("AcquisitionMode", "enum"),
+}
 
 
 class FlirCameraAdapter(BaseCameraAdapter):
@@ -45,6 +60,8 @@ class FlirCameraAdapter(BaseCameraAdapter):
                 serial = _node_string(PySpin, nodemap, "DeviceSerialNumber")
                 transport = _node_string(PySpin, nodemap, "DeviceType") or "Unknown"
                 unique = f"{manufacturer}:{model}:{serial}" if serial else f"flir:{idx}"
+                # Feature writability is established only after Init(), so the
+                # discovery record must not advertise guessed writable nodes.
                 devices.append(
                     CameraDeviceInfo(
                         device_id=f"flir:{serial or idx}",
@@ -156,19 +173,157 @@ class FlirCameraAdapter(BaseCameraAdapter):
         return self._device
 
     def get_capabilities(self) -> CameraCapabilities:
-        return _caps()
+        if self._camera is None:
+            return _caps()
+        import PySpin
+
+        return _caps_for_camera(PySpin, self._camera)
 
     def get_feature(self, name: str) -> Any:
-        return None
+        node, kind = self._feature_node(name)
+        if node is None or not _is_readable(_pyspin(), node):
+            return None
+        return _read_node(_pyspin(), node, kind)
 
     def set_feature(self, name: str, value: Any) -> None:
-        return
+        pyspin = _pyspin()
+        node, kind = self._feature_node(name)
+        if node is None:
+            raise CameraBackendError(f"FLIR 参数 {name} 不可用")
+        if not _is_writable(pyspin, node) or not _is_readable(pyspin, node):
+            raise CameraBackendError(f"FLIR 参数 {name} 不支持可验证写入")
+        try:
+            _write_node(pyspin, node, kind, value)
+            actual = _read_node(pyspin, node, kind)
+        except Exception as exc:
+            self._last_error = str(exc)
+            raise CameraBackendError(f"FLIR 参数 {name} 写入失败: {exc}") from exc
+        if not _feature_values_equal(actual, value, kind):
+            raise CameraBackendError(f"FLIR 参数 {name} 写入校验失败: requested={value}, readback={actual}")
 
     def is_open(self) -> bool:
         return self._camera is not None
 
     def is_streaming(self) -> bool:
         return self._streaming
+
+    def _feature_node(self, name: str):
+        canonical = "exposure" if name == "exposure_time" else name
+        spec = _FEATURE_NODES.get(canonical)
+        if self._camera is None or spec is None:
+            return None, spec[1] if spec else "float"
+        try:
+            import PySpin
+
+            raw = self._camera.GetNodeMap().GetNode(spec[0])
+            if raw is None:
+                return None, spec[1]
+            converter = {
+                "float": "CFloatPtr",
+                "int": "CIntegerPtr",
+                "enum": "CEnumerationPtr",
+            }[spec[1]]
+            return getattr(PySpin, converter)(raw), spec[1]
+        except Exception:
+            return None, spec[1]
+
+
+def _pyspin():
+    import PySpin
+
+    return PySpin
+
+
+def _is_readable(PySpin, node) -> bool:
+    try:
+        return bool(PySpin.IsReadable(node))
+    except Exception:
+        return bool(getattr(node, "readable", False))
+
+
+def _is_writable(PySpin, node) -> bool:
+    try:
+        return bool(PySpin.IsWritable(node))
+    except Exception:
+        return bool(getattr(node, "writable", False))
+
+
+def _read_node(PySpin, node, kind: str) -> Any:
+    if kind == "enum":
+        try:
+            entry = node.GetCurrentEntry()
+            if _is_readable(PySpin, entry):
+                return str(entry.GetSymbolic())
+        except Exception:
+            pass
+        return node.GetValue()
+    return node.GetValue()
+
+
+def _write_node(PySpin, node, kind: str, value: Any) -> None:
+    if kind == "enum":
+        text = str(value)
+        try:
+            entry = node.GetEntryByName(text)
+            if entry is not None and _is_readable(PySpin, entry):
+                node.SetIntValue(entry.GetValue())
+                return
+        except Exception:
+            pass
+        node.SetValue(text)
+    elif kind == "int":
+        node.SetValue(int(value))
+    else:
+        node.SetValue(float(value))
+
+
+def _feature_values_equal(actual: Any, requested: Any, kind: str) -> bool:
+    if kind == "enum":
+        return str(actual).lower() == str(requested).lower()
+    try:
+        return math.isclose(float(actual), float(requested), rel_tol=1e-5, abs_tol=1e-5)
+    except (TypeError, ValueError):
+        return actual == requested
+
+
+def _caps_for_camera(PySpin, camera) -> CameraCapabilities:
+    values: dict[str, CameraFeatureCapability] = {}
+    for name, (node_name, kind) in _FEATURE_NODES.items():
+        try:
+            raw = camera.GetNodeMap().GetNode(node_name)
+            if raw is None:
+                raise ValueError("node missing")
+            converter = {"float": "CFloatPtr", "int": "CIntegerPtr", "enum": "CEnumerationPtr"}[kind]
+            node = getattr(PySpin, converter)(raw)
+            readable = _is_readable(PySpin, node)
+            writable = _is_writable(PySpin, node) and readable
+            current = _read_node(PySpin, node, kind) if readable else None
+            minimum = _node_limit(node, "GetMin") if kind != "enum" and readable else None
+            maximum = _node_limit(node, "GetMax") if kind != "enum" and readable else None
+            increment = _node_limit(node, "GetInc") if kind == "int" and readable else None
+            error = "" if writable else "FLIR 参数不可验证写入"
+            values[name] = CameraFeatureCapability(True, readable, writable, current, minimum, maximum, increment, error=error)
+        except Exception as exc:
+            values[name] = CameraFeatureCapability(False, False, False, error=f"FLIR 参数不可用: {exc}")
+    return CameraCapabilities(**values)
+
+
+def _node_limit(node, method_name: str):
+    method = getattr(node, method_name, None)
+    if not callable(method):
+        return None
+    try:
+        return method()
+    except Exception:
+        return None
+
+
+def _caps() -> CameraCapabilities:
+    unsupported = {
+        name: CameraFeatureCapability(False, False, False, error="FLIR 参数能力需在相机打开后验证")
+        for name in CameraCapabilities.__dataclass_fields__
+    }
+    return CameraCapabilities(**unsupported)
 
 
 def _node_string(PySpin, nodemap, name: str) -> str:
@@ -188,19 +343,3 @@ def _transport(value: str) -> str:
     if "GIGE" in v or "GEV" in v:
         return "GigE"
     return value or "Unknown"
-
-
-def _caps() -> CameraCapabilities:
-    return CameraCapabilities(
-        exposure=CameraFeatureCapability(True, True, True),
-        gain=CameraFeatureCapability(True, True, True),
-        frame_rate=CameraFeatureCapability(True, True, True),
-        width=CameraFeatureCapability(True, True, True),
-        height=CameraFeatureCapability(True, True, True),
-        offset_x=CameraFeatureCapability(True, True, True),
-        offset_y=CameraFeatureCapability(True, True, True),
-        pixel_format=CameraFeatureCapability(True, True, True),
-        trigger_mode=CameraFeatureCapability(True, True, True),
-        acquisition_mode=CameraFeatureCapability(True, True, True, "Continuous"),
-    )
-

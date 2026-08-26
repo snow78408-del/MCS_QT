@@ -65,10 +65,6 @@ class DiameterPIDController(BaseDiameterController):
     def update_input(self, pid_input: PIDInput) -> PIDCommand:
         q1_current = float(pid_input.current_q1)
         q2_current = float(pid_input.current_q2)
-        if self._q1_bias is None:
-            self._q1_bias = q1_current
-        if self._q2_bias is None:
-            self._q2_bias = q2_current
         mode = str(self.config.control_mode or PIDControlMode.CLASSIC_PID.value)
         adaptive_enabled = mode in {
             PIDControlMode.ADAPTIVE_PID.value,
@@ -79,8 +75,17 @@ class DiameterPIDController(BaseDiameterController):
         if freeze:
             return self._frozen(pid_input, freeze, mode)
 
-        if pid_input.frame_id > 0 and self._last_frame_id == int(pid_input.frame_id):
-            return self._frozen(pid_input, "same frame_id already controlled", mode)
+        if self._q1_bias is None:
+            self._q1_bias = q1_current
+        if self._q2_bias is None:
+            self._q2_bias = q2_current
+
+        if (
+            pid_input.frame_id > 0
+            and self._last_frame_id is not None
+            and int(pid_input.frame_id) <= self._last_frame_id
+        ):
+            return self._frozen(pid_input, "stale or regressed frame_id", mode)
 
         target = float(pid_input.target_diameter_um)
         current = float(pid_input.current_diameter_um)
@@ -279,6 +284,10 @@ class DiameterPIDController(BaseDiameterController):
     def _validate_input(self, pid_input: PIDInput) -> str:
         if float(pid_input.dt) <= 0:
             return "dt <= 0"
+        if not is_finite(pid_input.current_q1) or float(pid_input.current_q1) <= 0:
+            return "current Q1 flow invalid; critical flow requires stop"
+        if not is_finite(pid_input.current_q2) or float(pid_input.current_q2) <= 0:
+            return "current Q2 flow invalid; critical flow requires stop"
         if not bool(pid_input.vision_valid):
             return "vision invalid"
         if not bool(pid_input.pump_communication_ok):
@@ -296,13 +305,17 @@ class DiameterPIDController(BaseDiameterController):
             PIDControlMode.ADAPTIVE_PID.value,
             PIDControlMode.ADAPTIVE_PID_WITH_FEEDFORWARD.value,
         }
+        critical_flow_invalid = (
+            reason.startswith("current Q1 flow invalid")
+            or reason.startswith("current Q2 flow invalid")
+        )
         return PIDCommand(
             q1=float(pid_input.current_q1),
             q2=float(pid_input.current_q2),
             diameter_error=0.0,
             adjustment=0.0,
             freeze_feedback=True,
-            suggested_stop=False,
+            suggested_stop=critical_flow_invalid,
             reason=f"feedback frozen: {reason}",
             kp=self.kp,
             ki=self.ki,

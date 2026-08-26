@@ -22,6 +22,22 @@ def _input(*, frame_id: int, q1: float, q2: float, current: float = 40.0) -> PID
 
 
 class DiameterPidTests(unittest.TestCase):
+    def test_invalid_current_flow_requests_stop_without_control_output(self) -> None:
+        controller = DiameterPIDController(PIDConfig())
+        for q1, q2 in ((0.0, 20.0), (-1.0, 20.0), (float("nan"), 20.0), (50.0, float("inf"))):
+            command = controller.update_input(_input(frame_id=1, q1=q1, q2=q2))
+            self.assertTrue(command.freeze_feedback)
+            self.assertTrue(command.suggested_stop)
+            self.assertIn("flow invalid", command.reason)
+
+    def test_regressed_frame_id_is_rejected(self) -> None:
+        controller = DiameterPIDController(PIDConfig(control_mode=PIDControlMode.CLASSIC_PID.value))
+        controller.update_input(_input(frame_id=2, q1=50.0, q2=20.0))
+        command = controller.update_input(_input(frame_id=1, q1=50.0, q2=20.0))
+        self.assertTrue(command.freeze_feedback)
+        self.assertFalse(command.suggested_stop)
+        self.assertIn("stale or regressed", command.reason)
+
     def test_default_adaptive_mode_is_wired_and_tunes_after_three_valid_periods(self) -> None:
         config = PIDConfig(feedforward_enabled=False)
         controller = DiameterPIDController(config)

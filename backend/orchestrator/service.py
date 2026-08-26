@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import copy
+import math
 import threading
 import time
 from dataclasses import asdict
 from typing import Any, Callable
 
 from ..disturbance_model import DisturbanceModelConfig, DisturbanceModelService
-from ..pid_control import PIDConfig, PIDInput, PumpState, TargetParams, VisionMetrics
-from ..pid_control.service import build_controller, reset_controller, run_feedback_step
+from ..pid_control import DiameterPIDController, PIDConfig, PIDInput, PumpState, TargetParams, VisionMetrics
 from ..pump_hardware import ChannelParams, PumpHardwareService
 from .config import OrchestratorConfig
 from .models import (
@@ -52,6 +52,7 @@ class OrchestratorService:
         self.pump_service = pump_service or PumpHardwareService(logger=logger)
         self.runtime = orchestrator_config or OrchestratorConfig()
         self.pid_config = pid_config or PIDConfig()
+        self._pid_controller = DiameterPIDController(self.pid_config)
         pump_runtime = getattr(self.pump_service, "runtime_config", None)
         if pump_runtime is not None and hasattr(pump_runtime, "min_q1_q2_gap"):
             pump_runtime.min_q1_q2_gap = float(self.pid_config.min_q1_q2_gap)
@@ -81,6 +82,12 @@ class OrchestratorService:
         self._error = ""
 
         self._lock = threading.RLock()
+        # Hardware starts run outside _lock so stop/pause can invalidate the
+        # attempt while the pump is waiting on serial I/O. The generation and
+        # this narrow gate prevent two recovery callers from starting at once.
+        self._pump_lifecycle_lock = threading.Lock()
+        self._lifecycle_generation = 0
+        self._start_in_progress = False
         self._control_condition = threading.Condition(self._lock)
         self._loop_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -168,7 +175,10 @@ class OrchestratorService:
         except Exception as exc:
             self._pump_state.q1_actual = None
             self._pump_state.q2_actual = None
+            self._pump_state.comm_established = False
             self._pump_state.last_error = str(exc)
+            self._pump_control_enabled = False
+            self._pump_state.running = False
             self._refresh_pump_channels(communication_ok=False, error=str(exc))
             self._log(f"[PUMP][READBACK][FAIL] source={source} error={exc}")
             return False
@@ -370,9 +380,13 @@ class OrchestratorService:
             serial_cfg.parity = "N"
 
     def _require_valid_phase_flows(self, q1: float, q2: float) -> None:
+        q1_f = float(q1)
+        q2_f = float(q2)
+        if not math.isfinite(q1_f) or not math.isfinite(q2_f) or q1_f <= 0.0 or q2_f <= 0.0:
+            raise ValueError("Q1 和 Q2 必须为有限正数")
         pid_cfg = getattr(self, "pid_config", None)
         min_gap = max(1e-9, float(getattr(pid_cfg, "min_q1_q2_gap", 0.2)))
-        if float(q1) < float(q2) + min_gap:
+        if q1_f < q2_f + min_gap:
             raise ValueError(
                 f"油相 Q1 必须至少比水相 Q2 大 {min_gap:.1f} uL/min；"
                 f"当前 Q1={float(q1):.6f}, Q2={float(q2):.6f}"
@@ -405,7 +419,8 @@ class OrchestratorService:
             raise RuntimeError("系统正在运行，不能执行泵机交互测试")
 
         steps: list[dict[str, Any]] = []
-        infusion_started = False
+        start_attempted = False
+        stop_verified = False
 
         def record(name: str, ok: bool, detail: str) -> None:
             steps.append({"name": name, "ok": bool(ok), "detail": str(detail or "")})
@@ -428,6 +443,10 @@ class OrchestratorService:
             if not write_ok:
                 return {"ok": False, "steps": steps}
 
+            # A connected start command can have taken effect even when its
+            # verification reply is lost. Always protectively stop it unless
+            # a verified stop has already completed.
+            start_attempted = True
             start_result = self.pump_service.start_infusion_and_verify([1, 2])
             infusion_started = bool(start_result.ok)
             record(
@@ -441,7 +460,7 @@ class OrchestratorService:
             stop_result = self.pump_service.stop_system_and_verify()
             stop_ok = bool(stop_result.ok)
             if stop_ok:
-                infusion_started = False
+                stop_verified = True
             record(
                 "关闭灌注",
                 stop_ok,
@@ -449,15 +468,14 @@ class OrchestratorService:
             )
             return {"ok": bool(stop_ok), "steps": steps}
         finally:
-            if infusion_started:
+            if start_attempted and not stop_verified:
                 try:
                     emergency_stop = self.pump_service.stop_system_and_verify()
-                    if not any(step["name"] == "关闭灌注" for step in steps):
-                        record(
-                            "异常保护停止",
-                            bool(emergency_stop.ok),
-                            "灌注已停止" if emergency_stop.ok else (emergency_stop.reason or emergency_stop.error),
-                        )
+                    record(
+                        "异常保护停止",
+                        bool(emergency_stop.ok),
+                        "灌注已停止" if emergency_stop.ok else (emergency_stop.reason or emergency_stop.error),
+                    )
                 except Exception as exc:
                     record("异常保护停止", False, str(exc))
 
@@ -576,21 +594,188 @@ class OrchestratorService:
             f"error={error:.6f} tolerance={tolerance:.6f}",
         )
 
-    def _try_resume_infusion(self, source: str) -> tuple[bool, str]:
-        self._log(f"[PUMP][RECOVER] {source}: try resume infusion")
-        start_res = self.pump_service.start_infusion_and_verify([1, 2])
-        if start_res.ok:
-            self._pump_state.running = True
+    def _stop_pump_verified(self, source: str) -> tuple[bool, str]:
+        """Stop the pump and keep the runtime state conservative on failure."""
+        try:
+            result = self.pump_service.stop_system_and_verify()
+        except Exception as exc:
+            result = None
+            reason = str(exc)
+        else:
+            reason = result.reason or result.error or "pump stop verification failed"
+        if result is not None and result.ok:
+            self._pump_state.running = False
             self._pump_state.last_error = ""
             self._refresh_pump_channels(communication_ok=True, error="")
-            self._log("[PUMP][RECOVER][OK] infusion resumed")
-            return True, "infusion resumed"
-        reason = start_res.reason or start_res.error or "infusion resume failed"
-        self._pump_state.running = False
+            self._log(f"[PUMP][STOP][OK] source={source}")
+            return True, "pump stopped and verified"
         self._pump_state.last_error = str(reason)
         self._refresh_pump_channels(communication_ok=False, error=str(reason))
-        self._log(f"[PUMP][RECOVER][FAIL] {reason}")
+        self._log(f"[PUMP][STOP][FAIL] source={source} reason={reason}")
         return False, str(reason)
+
+    def _try_resume_infusion(self, source: str) -> tuple[bool, str]:
+        # Do not hold the orchestration lock over serial I/O. stop()/pause()
+        # must be able to invalidate this attempt while it is in progress.
+        with self._pump_lifecycle_lock:
+            with self._lock:
+                if (
+                    self._state != SystemState.RUNNING
+                    or self._pause_event.is_set()
+                    or self._stop_event.is_set()
+                    or not self._pump_control_enabled
+                ):
+                    return False, "infusion resume suppressed by lifecycle state"
+                generation = self._lifecycle_generation
+            self._log(f"[PUMP][RECOVER] {source}: try resume infusion")
+            try:
+                start_res = self.pump_service.start_infusion_and_verify([1, 2])
+            except Exception as exc:
+                start_res = None
+                reason = str(exc) or "infusion resume failed"
+            else:
+                reason = start_res.reason or start_res.error or "infusion resume failed"
+
+            with self._lock:
+                lifecycle_valid = (
+                    generation == self._lifecycle_generation
+                    and self._state == SystemState.RUNNING
+                    and not self._pause_event.is_set()
+                    and not self._stop_event.is_set()
+                    and self._pump_control_enabled
+                )
+                start_ok = bool(start_res is not None and start_res.ok)
+
+            if start_ok and lifecycle_valid:
+                with self._lock:
+                    self._pump_state.running = True
+                    self._pump_state.last_error = ""
+                    self._refresh_pump_channels(communication_ok=True, error="")
+                self._log("[PUMP][RECOVER][OK] infusion resumed")
+                return True, "infusion resumed"
+
+            # A failed or invalidated start is indeterminate: WSE may have
+            # reached the pump even if verification did not. Stop and verify.
+            stop_ok, stop_reason = self._stop_pump_verified("infusion resume rollback")
+            with self._lock:
+                paused_valid = (
+                    self._state == SystemState.PAUSED
+                    and self._pause_event.is_set()
+                    and not self._stop_event.is_set()
+                )
+            if stop_ok and paused_valid:
+                # Pause invalidated the recovery, but the verified rollback
+                # leaves PAUSED resumable rather than silently disabling it.
+                with self._lock:
+                    self._pump_state.running = False
+                    self._pump_control_enabled = True
+                    self._pump_state.last_error = ""
+                    self._refresh_pump_channels(communication_ok=True, error="")
+                return False, "infusion resume superseded by pause"
+            with self._lock:
+                self._pump_state.running = False
+                if start_ok and not lifecycle_valid:
+                    reason = "infusion resume superseded by lifecycle transition"
+                if not stop_ok:
+                    reason = f"{reason}; rollback stop failed: {stop_reason}"
+                self._pump_state.last_error = str(reason)
+                self._pump_control_enabled = False
+                self._stop_event.set()
+                self._refresh_pump_channels(communication_ok=False, error=str(reason))
+                if lifecycle_valid or self._state == SystemState.PAUSED:
+                    self._state = SystemState.ERROR
+            self._log(f"[PUMP][RECOVER][FAIL] {reason}")
+            return False, str(reason)
+
+    def _start_lifecycle_is_current(self, generation: int) -> bool:
+        with self._lock:
+            return (
+                generation == self._lifecycle_generation
+                and self._state in {SystemState.INITIALIZED, SystemState.PAUSED, SystemState.STOPPED}
+            )
+
+    def _rollback_start_if_stale(
+        self,
+        generation: int,
+        *,
+        adapter_started: bool,
+        recorder_started: bool,
+    ) -> None:
+        if self._start_lifecycle_is_current(generation):
+            return
+        self._rollback_start(
+            adapter_started=adapter_started,
+            recorder_started=recorder_started,
+            stop_pump=True,
+        )
+        raise RuntimeError("start superseded by a lifecycle transition")
+
+    def _update_flow_with_lifecycle_guard(self, q1: float, q2: float, generation: int):
+        """Run a flow update without letting lifecycle changes trigger retries."""
+        with self._lock:
+            if (
+                generation != self._lifecycle_generation
+                or self._state != SystemState.RUNNING
+                or self._stop_event.is_set()
+                or self._pause_event.is_set()
+            ):
+                return None
+        update_res = self.pump_service.update_flow_while_running(float(q1), float(q2))
+        with self._lock:
+            current = (
+                generation == self._lifecycle_generation
+                and self._state == SystemState.RUNNING
+                and not self._stop_event.is_set()
+                and not self._pause_event.is_set()
+            )
+        if not current:
+            return None
+        if (
+            not update_res.ok
+            and bool(update_res.still_running)
+            and not bool(update_res.q1_ok)
+            and not bool(update_res.q2_ok)
+        ):
+            # A channel that already passed readback must not be rewritten.
+            # Guard the retry independently because pause/stop may occur
+            # between the two blocking pump transactions.
+            with self._lock:
+                if (
+                    generation != self._lifecycle_generation
+                    or self._state != SystemState.RUNNING
+                    or self._stop_event.is_set()
+                    or self._pause_event.is_set()
+                ):
+                    return None
+            update_res = self.pump_service.update_flow_while_running(float(q1), float(q2))
+            with self._lock:
+                current = (
+                    generation == self._lifecycle_generation
+                    and self._state == SystemState.RUNNING
+                    and not self._stop_event.is_set()
+                    and not self._pause_event.is_set()
+                )
+            if not current:
+                return None
+        return update_res
+
+    def _rollback_start(self, *, adapter_started: bool, recorder_started: bool, stop_pump: bool) -> bool:
+        """Undo resources acquired by a partially completed start."""
+        self._pump_control_enabled = False
+        self._stop_event.set()
+        self._pause_event.set()
+        stop_ok = True
+        if stop_pump and self._is_realtime_mode():
+            stop_ok, _ = self._stop_pump_verified("start rollback")
+        if adapter_started:
+            try:
+                self.vision_adapter.stop()
+            except Exception as exc:
+                self._log(f"[ORCH][WARN] start rollback adapter stop failed: {exc}")
+        if recorder_started:
+            self._pid_data_recorder.finish_session()
+            self._pid_data_recorder.discard()
+        return stop_ok
 
     def initialize_system(self) -> None:
         with self._lock:
@@ -625,12 +810,12 @@ class OrchestratorService:
                 self._pump_control_enabled = True
                 self._pump_state.last_error = ""
                 self._refresh_pump_channels(communication_ok=True, error="")
-                self._sync_pump_flow_readback("initialize", update_command=False)
+                if not self._sync_pump_flow_readback("initialize", update_command=False):
+                    raise RuntimeError(self._pump_state.last_error or "initial flow readback failed")
             else:
                 self._message = "local video mode: skip pump initialization and PID output"
 
-            build_controller(self.pid_config)
-            reset_controller()
+            self._pid_controller.reset()
             self._log(
                 "[PID][INIT] "
                 f"mode={self.pid_config.control_mode} "
@@ -651,6 +836,19 @@ class OrchestratorService:
             raise
 
     def start(self) -> None:
+        # Serialize start attempts while allowing stop() to invalidate the
+        # attempt without waiting for adapter or pump I/O.
+        with self._lock:
+            if self._start_in_progress:
+                raise RuntimeError("start is already in progress")
+            self._start_in_progress = True
+        try:
+            self._start_impl()
+        finally:
+            with self._lock:
+                self._start_in_progress = False
+
+    def _start_impl(self) -> None:
         with self._lock:
             if self._state not in {SystemState.INITIALIZED, SystemState.PAUSED, SystemState.STOPPED}:
                 raise RuntimeError(f"闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤濠€閬嶅焵椤掑倹鍤€閻庢凹鍙冨畷宕囧鐎ｃ劋姹楅梺鍦劋閸ㄥ綊宕愰悙鐑樺仭婵犲﹤鍟扮粻鑽も偓娈垮枟婵炲﹪寮崘顔肩＜婵炴垶鑹鹃獮妤呮⒒娓氣偓濞佳呮崲閸儱鏄ラ柛鏇ㄥ灡閸婂潡鏌涢幘妤€鎳愰敍婊堟⒑瑜版帒浜伴柛娆忛閳绘挸顭ㄩ崼鐔哄幐閻庡厜鍋撻柍褜鍓熷畷浼村冀椤撶偠鎽曢梺鎼炲労閸撴岸寮插┑瀣厓鐟滄粓宕滈悢濂夊殨缂佸绨卞Σ鍫ユ煏韫囥儳纾块柛姗€浜跺娲濞戣京鍙氭繝纰樷偓铏窛缂侇喖顭烽幃娆撳箹椤撶噥鍟嶉梻浣虹帛閸旀洟顢氶鐔告珷妞ゅ繐鐗婇崵鏇㈡煙闁箑骞戝ù婊勭矒閺岀喖宕崟顒夋婵炲瓨绮撶粻鏍ь潖閾忚瀚氶柛娆忣槺椤╃増绻涚€涙鐭嬬紒璇插楠炴垿濮€閻橆偅顫嶉梺闈涚箳婵绮ｅ☉姗嗘富闁靛牆妫涙晶顒併亜閺囩喐灏﹂柡浣瑰姍瀹曘儵宕橀弻銉ュ及閻庤娲橀崕濂嘎ㄩ崒鐐搭棅妞ゆ帒顦晶顕€鏌嶇憴鍕伌闁搞劍鍎抽悾鐑藉炊瑜忛崢浠嬫煟鎼淬値娼愭繛鎻掔箻瀹曟繈骞嬮敂琛″亾娴ｇ硶鏋庨柟鎯х－椤ρ呯磼閻愵剚绶茬憸鏉款樀瀹曨偄螖閸愵亞锛濋梺绋挎湰閼归箖鍩€椤掍焦鍊愮€规洘鍔欓幃婊堟嚍閵夈儲鐣遍梻浣藉亹椤牓鎮樺璺虹煑闊洦绋掗悡娆撴煙椤栨粌顣兼い銉ヮ槺閻ヮ亪顢樺☉妯瑰闂傚倸鍊峰ù鍥綖婢舵劕纾块柣鎾冲濞戙垹绀嬫い鏍ㄧ☉閻濇棃姊虹紒妯荤叆闁硅姤绮庣划缁樸偅閸愨晝鍘甸柣搴ｆ暩椤牓鍩€椤掍礁鐏ユい顐ｇ箞椤㈡牠鍩＄€ｎ剛袦閻庤娲栭妶鎼佸箖閵忋垻鐭欓柛顭戝枙缁辩喎鈹戦悩鑼闁哄绨遍崑鎾诲箛閺夎法锛涢梺鐟板⒔缁垶鎮￠悢闀愮箚闁靛牆鍊告禍楣冩⒑閹稿孩澶勫ù婊勭矒椤㈡岸鏁愭径妯绘櫇闂佹寧娲嶉崑鎾剁磼閻樿櫕鐨戦柟鎻掓啞瀵板嫰骞囬鍌氭憢濠电偛顕慨鎾敄閸℃稒鍋傞柣鏂垮悑閻撴瑩姊洪銊х暠濠⒀屽枤缁辨帡鎮▎蹇斿闁绘挻娲熼弻銊モ攽閸℃瑥顤€濡炪們鍎遍ˇ鐢稿蓟瀹ュ洦鍠嗛柛鏇ㄥ亞娴煎矂姊虹拠鈥虫灍闁荤啿鏅犲畷娲焺閸愨晛顎撻悗鐟板閸嬪﹤螞濠婂牊鈷掗柛灞捐壘閳ь剚鎮傚畷鎰槹鎼达絿鐒兼繛鎾村焹閸嬫挻顨ラ悙瀵稿⒌妞ゃ垺娲熼弫鍌炴寠婢跺﹤顥楁繝鐢靛О閸ㄧ厧鈻斿☉銏″殣妞ゆ牗绮嶉浠嬫煏閸繍妲归柣鎾存礀閳规垿鎮╅幓鎺濅患闂佸搫顑嗛弻銊╂箒濠电姴艌閸嬫挾绱掗鐣屾噧妞ゎ偄绻掔槐鎺懳熺拠宸偓鎾剁磽娴ｅ壊鍎愰悗绗涘洤纾规い鏍ㄧ矌绾捐棄霉閿濆妫戦柛鏂跨Ч閺岀喓绮欓崹顔芥瘣濡炪倖娲╃紞渚€鐛幘璇茬闁糕剝锕╁鏃€绻濆▓鍨灍妞ゎ厼鐗婄粋宥夘敆閸曨剙浠奸梺鍓插亝濞叉﹢鍩涢幋锔藉仯闁诡厽甯掓俊濂告煛鐎ｎ偅鐓ラ柍瑙勫灴椤㈡瑩鎮欓浣圭槗闂備胶纭堕弲婊堟儎椤栫偟宓侀悗锝庡枟閸嬫劙鏌ｉ姀銏╂殰缂佽鲸鐓″铏规嫚閹绘帒姣愮紓鍌氱Т濡繂鐣烽幋锕€绠虫俊銈傚亾缁炬儳娼￠弻鏇熷緞閸℃ɑ鐝曢梺缁樻尰濞茬喖鐛弽顬ュ酣顢楅埀顒勬倶閳轰讲鏀芥い鏃囧亹鏁堥梺鍝勭焿缁辨洘绂掗敃鍌氱鐟滃酣宕氬☉銏″€垫繛鍫濈仢濞呮﹢鏌涢敐蹇曠М鐎规洘妞介崺鈧い鎺嶉檷娴滄粓鏌熼悜妯虹仴妞ゅ浚浜弻娑氣偓锝呭缁♀偓闂佸搫鑻粔闈涱焽椤忓牆绠ユい鏃囨硶閻涖儵姊绘担瑙勫仩闁稿﹥鐗曠叅闁哄稁鍘奸悡姗€鏌熸潏楣冩闁稿鍔欓幃妤呭捶椤撶倫銏°亜閵夛妇绠為柡灞剧洴婵＄兘濡疯閹茶偐绱撴担铏瑰笡缂佽鐗婇幈銊╁焵椤掑嫭鐓ユ繝闈涙椤ョ娀鏌曢崱妯哄婵﹥妞介獮鎰償閵忊懇鏁嶇紓鍌欑劍瑜板啴鎮樺┑鍡楃カ闂備礁婀辨晶妤€顭垮鈧弻瀣炊椤掍胶鍘搁梺鎼炲劗閺呮盯寮抽柆宥嗙厵闂佸灝顑嗛妵婵囨叏婵犲偆鐓肩€规洘甯掗～婵嬪础閻戝棙婢戞繝鐢靛仦閹歌崵鍠婂澶堚偓鍐川閹殿喕鑸梻鍌欑婢瑰﹪宕戞笟鈧畷鏇㈠蓟閵夛箑浜楅梺鍝勬储閸ㄦ椽鎮￠悢闀愮箚妞ゆ牗绻嶉崵娆忣熆瑜滈崹杈╂崲濞戙垹閱囬柣鏃傜《閹峰姊虹拠鈥虫珮闁哥姵鐗犻崺銏℃償閵娿儳顓洪梺鍝勫€搁妵妯荤珶閺囥垺鈷戠紒瀣硶缁犵増銇勯敂璇茬仭缂佸倸绉甸妶锝夊礃閳圭偓瀚奸梻浣告啞缁嬫垿鏁冮妷锕€绶為柛鏇ㄥ灡閻撴洟鐓崶銊︻棖闁肩増瀵ч〃銉╂倷閼碱剛顔掗梺鍦帶缂嶅﹤鐣烽悜绛嬫晣闁绘瑥鎳愰梻顖涚節閻㈤潧浠╅柟娲讳簽瀵板﹪鎳為妷褏褰炬繝鐢靛Т濞层倗澹曢崸妤佺厵闂侇叏绠戦獮鎴澝瑰鍕煉闁哄瞼鍠撻埀顒傛暩椤牊绂掕閺岀喖宕橀崣澶婄獩闂侀€炲苯澧叉い顐㈩槸鐓ゆ俊顖氥偨濞差亝鍋勯柤娴嬫櫅缁侊箓姊洪幖鐐插姶闁告挻宀稿畷鎴犫偓锝庡枟閻撴洘銇勯幇顔夹㈤柣蹇婃櫆椤ㄣ儵鎮欓懠顑倗绱掓潏銊﹀磳鐎规洘甯掗埢搴ㄥ箣椤撶啘婊勪繆閻愵亜鈧牠宕归棃娴虫稑鈹戠€ｃ劉鍋撴笟鈧鍊燁槷闁哄閰ｉ弻鐔兼倷椤掍胶绋囨繛瀛樼矋椤ㄥ﹤顫忛搹鍦煓閻犳亽鍔庨濠囨⒑閸愭彃妲婚柣妤€妫濋崺銏ゅ箻鐎靛壊娴勯柣搴秵閸嬪棝宕㈡禒瀣拺鐟滅増甯掓禍浼存煕閵娿倕宓嗛柟顖氬暣閹煎綊宕烽鐙呯床闂備胶绮敋闁圭⒈鍋婂畷銉ㄣ亹閹烘挾鍘撻悷婊勭矒瀹曟粌鈹戠€ｅ墎绋忔繝銏ｆ硾閳洘銈︾捄銊ф澑濠电偞鍨堕…鍥囬鈧铏规兜閸涱喖娑ч柣鐘冲姉閸犳牠宕洪埀顒併亜閹达絾纭舵い锔奸檮閵囧嫰顢曢敐鍥╃暭闂佸湱鎳撶€氭澘鐣烽锕€绀嬫い鎾跺Т閺勩儲绻濈喊澶岀？闁稿鍨垮畷鎰板冀椤撶偛鍤戝銈嗗笒鐎氼剛鐥閺岀喓绮欓崸妤娾偓妤併亜閿旇娅婃慨濠呮缁辨帒螣鐠囨煡鐎洪梻浣藉吹閸熷潡寮查悩宸殨濠电姵鑹惧洿婵犮垼娉涢敃銉ョ暤瀹ュ拋娓婚柕鍫濇鐏忕敻鏌涙惔銏犲鐎殿喗濞婇、姗€濮€閳ュ厖鐢绘繝鐢靛Т閿曘倗鈧凹鍓氶崕顐︽⒒娴ｅ憡鍟炲〒姘殜瀹曞綊骞庨懞銉︽珫濠电姴锕ら悧濠囧煕閹达附鐓曟繝闈涙椤忣剚銇勯顒傜暤闁哄本绋掗幆鏃堝閻橆偅鐏嗛梻浣筋嚃閸ｏ絿绮婚弽顓炵鐟滅増甯掔粈鍌氼熆鐠虹尨姊楀瑙勬礋閺岋綁鎮㈤崫銉﹀櫑闁诲孩鍑归崢鐐珶閺囩喓绡€婵﹩鍘鹃崢鍗炩攽鎺抽崐鎾剁矆娓氣偓閸┿垽寮撮姀锛勫幗濠电偞鍨靛畷顒€鈻嶅鍡╂闁绘劖娼欏ù顔筋殽閻愯韬柟鐓庣秺椤㈡洟鏁愰崒娑橆伕闂傚倷鑳堕幊鎾诲床閺屻儱绠犳俊顖濇閺嗭箓鏌ㄥ┑鍡橆棞缂佸墎鍋涢埞鎴︽偐閼碱剙鍤紓浣稿船瀵墎鎹㈠┑瀣仺闂傚牊鍒€閵夆晜鐓涘ù锝堫潐閸婃劗鈧娲橀崹鍧楀箖閳哄啯瀚氶柤纰卞墻閸炶姤淇婇悙顏勨偓鏇犳崲閹邦儵娑樜旈崘鈺婂仺闂侀潧鐗嗛ˇ浼存偂閻樺磭绠鹃柡澶嬪焾閸庢劖绻涢崨顓燁棞闁宠鍨块、娑樷枎韫囨挾銈梻浣告惈鐞氼偊宕濋幋婵愬殨闁圭虎鍠楅崐閿嬬箾閺夋埈鍎忓ù婊冨⒔閹叉悂鎮ч崼婵堢懆缂佺偓鍎崇紞濠囧蓟濞戞粠妲煎銈冨妼濡繈骞冮敓鐘插嵆闁靛骏绱曢崢鐢告⒑缂佹ê濮﹂柛鎿勭畱閳绘捇寮崼鐔哄幍闂佹儳娴氶崑鍕叏瀹ュ鐓涘ù锝呮憸瀛濆銈庡幑閸旀垵鐣锋總鍛婂亜闁告繂瀚粻娲⒒閸屾瑨鍏岀紒顕呭灦閺佸鎮楀▓鍨灈闁绘牕銈搁悰顕€寮介鐐电杸濡炪倖鎸荤换鍕不濮橆剦娓婚柕鍫濇婢ь剟鏌ｉ弮鎴濆⒋闁绘搩鍓熼、妤呭磼濡も偓娴滈箖鎮峰▎蹇擃仾缂佲偓閸愨晝绠鹃柛娆忣槺缁犳绱掗娆惧殭闁宠棄顦灒闂佸灝顑愬鏃€绻濋悽闈涗粶婵☆偅鐟ㄩ幗顐︽⒑閹惰姤鏁遍柣妤佹礋閸╃偤骞嬮敂钘変汗濡炪倖妫侀崑鎰閸ヮ剚鈷戠紒顖涙礃濞呭棝鏌ｅΔ鍐ㄐ㈤柣锝呭槻閳规垹鈧綆浜滈崬銊ヮ渻閵堝棙灏甸柛鐘插缁傚秴螖閸涱喒鎷洪梺鍛婄箓鐎氼參宕掗妸鈺傜厱闁靛闄勯妵婵嬫煙椤旀瑣鍊楅悿鈧梺鐟扮仢閸熶即宕悽鍛娾拺闁兼祴鏅╅悞鍓х磼閸洑鎲炬い銏℃瀹曠厧鈹戦崱妤侇吇濠电姷鏁搁崑鐐哄垂閸洘鏅濋柍鍝勬噺閸嬪嫰鏌涢埄鍐噭闁哥姵鍔楅埀顒€绠嶉崕閬嵥囬锕€鐒垫い鎺戯功閻ｇ敻鏌熼鐣岀煉闁圭锕ュ鍕償閵忊€虫毇闂傚倸鍊烽悞锕傚几婵傜鐤炬繛鎴欏灩閻ゎ喗銇勯弽銊р槈闁搞劍妫冮弻鐔虹磼閵忕姵鐏嶉梺鎶芥敱鐢繝寮诲☉銏╂晝闁挎繂娴傞弳鈥斥攽閻愬弶鍣归柣妤佹崌瀵鈽夊鍡樺兊闂佺粯鎸哥花濂稿窗婵犲倵鏀芥い鏃傘€嬫Λ姘箾閸滃啰鎮兼俊鍙夊姍楠炴帡骞婂畷鍥ф灁缂佽鲸甯掕灒闁告繂瀚ˉ瀣⒒閸屾艾鈧兘鎳楅崼鏇椻偓锕傚醇閵夘喗鏅為梺鍛婄☉閻°劑寮插┑瀣厪闁割偅绻嶅Σ褰掓煕鐎Ｑ勬珚闁哄矉缍侀獮瀣晲閸♀晜顥夐梻鍌欑瀹曨剙煤椤撱垹钃熼柨鐔哄Т閻愬﹪鏌嶆潪鎷岊唹闁稿鎹囬弫鎰緞婵犲嫬骞愰梻浣告啞閸斿繘寮插☉銏犲嚑闁瑰鍋熺弧鈧梺闈涢獜缁插墽娑甸崜褎瀚柍鍝勬噺閻撱儲绻濋棃娑欙紞婵″弶鎮傚娲础閻愭潙鏋犻梺鍝勬湰濞叉ê顕ラ崟顐熸婵妫欓崰姗€姊绘担鍛婂暈閻绱掗鐣屾噧妞ゎ偄绻橀幖褰掑捶椤撶媴绱叉繝纰樻閸ㄩ潧鐣烽悽绋跨煑闁糕剝绋掗埛鎴犵棯椤撶偞鍣圭悮姘辩磽娓氬洤鏋熼柟鐟版喘閹即顢欓悾宀€鐦堥梺鎼炲劀閸愩劎銈梻鍌欑窔濞佳呮崲閸℃鐎剁憸鏃堢嵁韫囨梻绡€婵﹩鍘搁幏娲⒑閸涘﹦鈽夐柨鏇樺劜瀵板嫰宕熼娑氬幈闁诲函缍嗘禍婊堫敂椤撶喆浜滈柕蹇婂墲椤ュ牊銇勯姀鈽呰€块柟顔界懇閸╋繝宕掑☉娆愮帆闂傚倸鍊烽悞锔锯偓绗涘懐鐭欓柟瀵稿Л閸嬫挸顫濋悡搴＄睄閻庢鍠楁繛濠囥€佸Δ鍛＜婵°倐鍋撳ù婊堢畺閹嘲鈻庤箛鎿冧痪缂備讲鍋撻柛顐犲劜閻撴洟鏌ｅΟ铏癸紞濠⒀呮暬閺屾洟宕遍弴鐙€妲梺瀹犳椤︻垶锝炲鍫濆耿婵☆垰鎼崢鐐测攽閿涘嫬浜奸柛濠冪墪椤斿繑绻濆顒傦紱闂佺懓澧界划顖炴偂濞戞◤褰掓晲婢跺閿梺閫炲苯澧紒璇插€块敐鐐剁疀閺囩姷锛滃┑鈽嗗灥閸嬫劙骞婂┑瀣拺闂侇偆鍋涢懟顖涙櫠椤斿浜滄い鎾跺仦缁屾寧銇勯敃鈧紞濠囧蓟瀹ュ唯妞ゆ牗绮庨弳銈夋倵鐟欏嫭绀€闁靛牆鎲℃穱濠囨倻閽樺）銊ф喐濠婂吘锝夋倻閼恒儳鍘介柟鑲╄ˉ閳ь剙鍟挎潏鍛存⒑缁嬫鍎愰柟鐟版喘瀵鈽夐姀鐘插祮闂佺粯鍨靛ú銈嗗閹邦剦娓婚柕鍫濈箰閻︽粓鏌涢妸銉у煟鐎规洘妞介幃娆撳传閸曨収鍚呴梻浣虹帛閿曗晠宕戦崟顒傤洸濡わ絽鍟悡銉︾節闂堟稒顥㈡い搴㈩殔闇夋繝濠傚閻﹪妫? {self._state.value}")
@@ -658,7 +856,10 @@ class OrchestratorService:
                 raise RuntimeError(f"state does not allow start: {self._state.value}")
             adapter = self.vision_adapter
             starting_state = self._state
+            generation = self._lifecycle_generation
 
+        recorder_started = False
+        adapter_started = False
         if starting_state != SystemState.PAUSED:
             self._pid_data_recorder.begin_session(
                 {
@@ -666,27 +867,107 @@ class OrchestratorService:
                     "pid_config": asdict(self.pid_config),
                 }
             )
+            recorder_started = True
 
+        self._rollback_start_if_stale(
+            generation,
+            adapter_started=adapter_started,
+            recorder_started=recorder_started,
+        )
         if adapter is not None:
-            adapter.start()
+            adapter_started = True
+            try:
+                adapter.start()
+            except Exception:
+                self._rollback_start(adapter_started=True, recorder_started=recorder_started, stop_pump=False)
+                raise
 
+        self._rollback_start_if_stale(
+            generation,
+            adapter_started=adapter_started,
+            recorder_started=recorder_started,
+        )
         if self._is_realtime_mode():
             if not self._pump_control_enabled:
+                self._rollback_start(adapter_started=adapter_started, recorder_started=recorder_started, stop_pump=False)
                 raise RuntimeError("control loop is already running")
             if not self._pump_state.connected or not self._pump_state.comm_established:
+                self._rollback_start(adapter_started=adapter_started, recorder_started=recorder_started, stop_pump=False)
                 raise RuntimeError("pump parameters are not initialized; PID cannot start")
-            start_res = self.pump_service.start_infusion_and_verify([1, 2])
+            self._rollback_start_if_stale(
+                generation,
+                adapter_started=adapter_started,
+                recorder_started=recorder_started,
+            )
+            try:
+                start_res = self.pump_service.start_infusion_and_verify([1, 2])
+            except Exception:
+                self._rollback_start(
+                    adapter_started=adapter_started,
+                    recorder_started=recorder_started,
+                    stop_pump=True,
+                )
+                raise
             if not start_res.ok:
                 reason = start_res.reason or start_res.error or "pump start infusion failed"
                 self._pump_state.last_error = str(reason)
-                self._set_state(SystemState.INITIALIZED, message="start failed", error=str(reason))
+                stop_ok = self._rollback_start(
+                    adapter_started=adapter_started,
+                    recorder_started=recorder_started,
+                    stop_pump=True,
+                )
+                with self._lock:
+                    start_still_current = (
+                        generation == self._lifecycle_generation
+                        and self._state in {
+                            SystemState.INITIALIZED,
+                            SystemState.PAUSED,
+                            SystemState.STOPPED,
+                        }
+                    )
+                    if start_still_current:
+                        if stop_ok:
+                            self._state = SystemState.INITIALIZED
+                            self._message = "start failed"
+                            self._error = str(reason)
+                        else:
+                            self._state = SystemState.ERROR
+                            self._error = f"{reason}; rollback stop failed"
                 raise RuntimeError(f"闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤缂嶅﹪寮婚悢鍏尖拻閻庨潧澹婂Σ顔剧磼閻愵剙鍔ょ紓宥咃躬瀵鎮㈤崗灏栨嫽闁诲酣娼ф竟濠偽ｉ鍓х＜闁诡垎鍐ｆ寖闂佺娅曢幑鍥灳閺冨牆绀冩い蹇庣娴滈箖鏌ㄥ┑鍡欏嚬缂併劌銈搁弻鐔兼儌閸濄儳袦闂佸搫鐭夌紞渚€銆佸鈧幃娆撳箹椤撶噥妫ч梻鍌欑窔濞佳兾涘▎鎴炴殰闁圭儤顨愮紞鏍ㄧ節闂堟侗鍎愰柡鍛叀閺屾稑鈽夐崡鐐差潻濡炪們鍎查懝楣冨煘閹寸偛绠犻梺绋匡攻椤ㄥ棝骞堥妸鈺傚€婚柦妯侯槺閿涙稑鈹戦悙鏉戠亶闁瑰磭鍋ゅ畷鍫曨敆娴ｉ晲缂撶紓鍌欑椤戝棛鈧瑳鍥ㄥ€垫い鎺戝閳锋垿鏌ｉ悢鍛婄凡闁抽攱姊荤槐鎺楊敋閸涱厾浠搁悗瑙勬礃閸ㄥ潡鐛崶顒佸亱闁割偁鍨归獮妯肩磽娴ｅ搫浜炬繝銏∶悾鐑筋敆娴ｈ鐝风紓鍌欑劍鐪夌紒璇叉閺岋紕浠︾拠鎻掑闂佽鐓＄粻鏍蓟閳ュ磭鏆嗛悗锝庡墰琚﹂梻浣筋嚃閸犳捇宕归挊澶屾殾妞ゆ劧绠戝敮閻熸粌绻樺畷銏ゅ箳閹存梹鏂€闂佺粯锕╅崑鍛垔娴煎瓨鐓曢柡鍥╁仧娴犳盯鏌ｉ敐鍛仮婵﹦鍎ゅ顏堝箥椤旇法鐛ラ梻渚€娼荤紞鍥╃礊娓氣偓閹即顢氶埀顒勭嵁閹烘绠犻柧蹇ｅ亝椤ュ牓鏌涢埞鎯т壕婵＄偑鍊栫敮鎺斺偓姘煎墴瀹曞綊宕掗悙瀵稿幈閻庡厜鍋撻柍褜鍓熷畷鎴︽倷閻戞ê浜楅梺鍝勬川婵參宕戦幘璇茬濠㈣泛锕ｆ竟鏇㈡⒒娓氣偓閳ь剛鍋涢懟顖涙櫠鐎电硶鍋撶憴鍕闁搞劌娼￠獮鍐ㄢ枎閹炬潙鈧粯淇婇婵囥€冪紒銊ф暬濮婄粯鎷呴搹鐟扮濠碘槅鍋勯崯鏉戭嚕閺屻儲鍤戞い鎺嶇鎼村﹪姊虹化鏇炲⒉缂佸甯￠幃陇绠涘☉娆戝幈濡炪倖鍔х徊璺ㄧ不閹剧粯鐓冪憸婊堝礈濞嗘挸绠熼柨娑樺閻鈧箍鍎卞Λ搴ㄥ磻閸涘瓨鐓曢柟鑸妽閺夊綊鏌熼悿顖涱仩缂佽鲸鎹囧畷鎺戔枎閹存繂顬夐梻浣瑰濞插秹寮插☉銏犵厺闁规崘顕х猾宥夋煕椤愩倕鏋旈柛娆忔濮婃椽宕崟顒€鍋嶉梺鍛婃煥椤戝洭鎳炴潏銊х瘈婵﹩鍘鹃崢浠嬫⒑閹稿海绠撴繛灞傚€濆畷銏ゅ箻椤旂晫鍘告繛杈剧悼閹虫挻鎱ㄥ鍥ｅ亾鐟欏嫭绀€闁靛牆鎲￠幈銊╁焵椤掑嫭鐓忛煫鍥э工婢ц尙绱掓０婵嗕簻闁宠鍨块幃鈺呭垂椤愶絾鐦庨梻浣侯焾椤戝洭宕戦妶鍛殾鐟滅増甯掗柋鍥煛閸モ晛鏋庡ù鐙€鍙冮幃宄邦煥閸曨剛鍙嗛梺浼欑悼閸忔ɑ鎱ㄩ埀顒勬煏閸繃鍣芥い鏃€甯炵槐鎾诲磼濞嗘垵濡介柤瑁ゅ€濋弻鐔兼煥鐎ｎ偁浠㈠┑顔硷攻濡炶棄鐣烽妸锔剧瘈闁告洏鍔嶉～宥夋⒒娴ｇ懓顕滄繛娴嬫櫆娣囧﹪宕堕埡浣哥亰婵犵數濮甸懝鍓х不閼姐倗纾藉ù锝咁潠椤忓牆鐒垫い鎺嗗亾闁诲繑宀搁獮鍫ュΩ閵夊海鍠栭幃鈩冩償閳ヨ尙甯涙繝鐢靛Л閹峰啴宕熼鈧崬澶愭⒑閸濆嫭婀伴柣鈺婂灦瀹曟椽鎮欓崫鍕暰閻熸粌鏈粩鐔煎即閻愨晜鏂€闂佹寧绋戠€氼剚绂嶆總鍛婄厱濠电姴鍟版晶顏呫亜閺傝法绠茬紒缁樼箓椤繈顢楅崒锔惧耿闂傚倷鑳堕幊鎾存櫠閻ｅ苯鍨濇い鏍仦閸嬪倹绻涢崱妯诲鞍闁绘挾濞€閺岀喖顢橀悢椋庣懆闂佸憡鏌ｉ崐婵嬪蓟閿濆鏁囬柣鎴濇穿閸氼偊姊洪崫鍕缂佸鐖奸獮蹇涙偐鐠囪尪鎽曢梺闈涱槶閸庨亶宕ｆ繝鍌楁斀闁绘ɑ鍓氶崯蹇涙煕閻樺啿娴€规洘鍨块獮妯肩磼濡攱瀚奸梻鍌氬€搁悧濠勭矙閹惧瓨娅犻柡鍥╁枍缁诲棙銇勯幇鍓佺У婵炲牊绮撻弻娑㈠煘閹傚濠碉紕鍋戦崐鏍暜閹烘纾归柟闂寸閸屻劑鏌熺紒銏犳灍闁绘挻鐩幃姗€鎮欓幓鎺嗘寖闂佸疇妫勯ˇ鐢稿蓟瀹ュ洦鍠嗛柛鏇ㄥ亞娴煎矂鎮楃憴鍕鐎规洦鍓濋悘鍐╃節閻㈤潧小闁煎啿澧庢竟鏇犵磼濡偐鐦堥悗鍏稿嵆閺€鍗烆熆濮椻偓閸┾偓妞ゆ帊绶″▓鏇㈡煙娓氬灝濮傜€殿喖鐖奸獮濠囧Ω閿斿浠㈠銈冨灪閿曘垽骞冨鍫濆耿婵☆垵鍋愰埢澶娾攽閻樺灚鏆╅柛瀣☉铻ｅ┑鐘插暟椤╁弶绻濇繝鍌涘櫧闁活厼妫濋弻娑㈩敃閻樻彃濮曢梺缁樻尰閻熝呮閹惧瓨濯村┑顔藉焾娴滅偟鍒掗銏犵＜闁绘劕顕崢楣冩⒑閸涘﹥宕勭€殿喗鎹囬弻鍥敍濞戞瑥寮挎繝鐢靛Т閹冲繘顢旈悩鐢电＜妞ゆ梻鏅幊鍐煃鐠囨煡鍙勬鐐叉椤︽彃顭块悷鎵ⅵ婵﹨娅ｉ幏鐘诲箵閹烘繂濡烽梻浣告啞閸ㄧ數绱炴繝鍌滄殾闁靛繈鍊曠粈鍫㈡喐瀹ュ鍨傛繝闈涱儐閸婄敻鏌ㄥ┑鍡欏嚬闁规煡绠栭弻娑橆潩椤掑鍓板銈庡幖濞硷繝骞婂鍫熷剶妞ゅ繐鎳庨悘瀵糕偓娈垮枟閻擄繝銆佸Δ鍛劦妞ゆ帒瀚悡姗€鏌熸潏楣冩闁稿鍔欓幃褰掑炊閸パ冩殨缂佹唻缍佸铏规嫚閹绘帩鍔夐梺鍛婂灥缂嶅﹤鐣峰鍐炬僵閺夊牃鏅濋悞? {reason}")
             self._pump_state.running = True
             self._refresh_pump_channels(communication_ok=True, error="")
-            self._sync_pump_flow_readback("start")
+            self._rollback_start_if_stale(
+                generation,
+                adapter_started=adapter_started,
+                recorder_started=recorder_started,
+            )
+            if not self._sync_pump_flow_readback("start"):
+                reason = self._pump_state.last_error or "start flow readback failed"
+                stop_ok = self._rollback_start(
+                    adapter_started=adapter_started,
+                    recorder_started=recorder_started,
+                    stop_pump=True,
+                )
+                if not stop_ok:
+                    reason = f"{reason}; rollback stop failed"
+                with self._lock:
+                    if (
+                        generation == self._lifecycle_generation
+                        and self._state in {
+                            SystemState.INITIALIZED,
+                            SystemState.PAUSED,
+                            SystemState.STOPPED,
+                        }
+                    ):
+                        self._state = SystemState.ERROR
+                        self._error = reason
+                raise RuntimeError(reason)
 
-        self._stop_event.clear()
-        self._pause_event.clear()
+        self._rollback_start_if_stale(
+            generation,
+            adapter_started=adapter_started,
+            recorder_started=recorder_started,
+        )
         # Do not apply the snapshot that happened to be cached while the pump
         # was being initialized. Start feedback from the next completed vision
         # period so the first displayed state is not an avoidable stale freeze.
@@ -696,8 +977,30 @@ class OrchestratorService:
                 self._last_seen_vision_period_id = int(baseline_recognition.control_period_id)
         except Exception as exc:
             self._log(f"[PID][START][WARN] unable to baseline vision period: {exc}")
-        self._loop_thread = threading.Thread(target=self._control_loop, name="orchestrator-control-loop", daemon=True)
-        self._loop_thread.start()
+        with self._lock:
+            if (
+                generation != self._lifecycle_generation
+                or self._state not in {SystemState.INITIALIZED, SystemState.PAUSED, SystemState.STOPPED}
+            ):
+                stale = True
+            else:
+                stale = False
+                self._stop_event.clear()
+                self._pause_event.clear()
+                self._loop_thread = threading.Thread(
+                    target=self._control_loop,
+                    name="orchestrator-control-loop",
+                    daemon=True,
+                )
+                self._loop_thread.start()
+                self._state = SystemState.RUNNING
+        if stale:
+            self._rollback_start(
+                adapter_started=adapter_started,
+                recorder_started=recorder_started,
+                stop_pump=True,
+            )
+            raise RuntimeError("start superseded by a lifecycle transition")
         self._log("[PID][START] PID feedback started")
         self._set_state(SystemState.RUNNING, message="running")
 
@@ -705,50 +1008,138 @@ class OrchestratorService:
         with self._lock:
             if self._state != SystemState.RUNNING:
                 return
+            # Publish PAUSED before stopping hardware so in-flight recovery
+            # cannot start infusion after a pause request. Invalidate any
+            # recovery start that is waiting on serial I/O.
+            self._pause_event.set()
+            self._lifecycle_generation += 1
+            self._state = SystemState.PAUSED
         if self._is_realtime_mode():
-            stop_res = self.pump_service.stop_system_and_verify()
-            if not stop_res.ok:
-                reason = stop_res.reason or stop_res.error or "pause stop pump failed"
+            stop_ok, stop_reason = self._stop_pump_verified("user pause")
+            if not stop_ok:
+                with self._lock:
+                    self._pump_control_enabled = False
+                    self._stop_event.set()
+                reason = stop_reason or "pause stop pump failed"
+                self._pump_control_enabled = False
+                self._stop_event.set()
                 self._pump_state.last_error = str(reason)
+                self._set_state(SystemState.ERROR, error=str(reason))
                 raise RuntimeError(f"闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤缂嶅﹪寮婚悢鍏尖拻閻庨潧澹婂Σ顔剧磼閻愵剙鍔ょ紓宥咃躬瀵鎮㈤崗灏栨嫽闁诲酣娼ф竟濠偽ｉ鍓х＜闁诡垎鍐ｆ寖闂佺娅曢幑鍥灳閺冨牆绀冩い蹇庣娴滈箖鏌ㄥ┑鍡欏嚬缂併劌銈搁弻鐔兼儌閸濄儳袦闂佸搫鐭夌紞渚€銆佸鈧幃娆撳箹椤撶噥妫ч梻鍌欑窔濞佳兾涘▎鎴炴殰闁圭儤顨愮紞鏍ㄧ節闂堟侗鍎愰柡鍛叀閺屾稑鈽夐崡鐐差潻濡炪們鍎查懝楣冨煘閹寸偛绠犻梺绋匡攻椤ㄥ棝骞堥妸鈺傚€婚柦妯侯槺閿涙盯姊虹紒妯哄闁稿簺鍊濆畷鎴犫偓锝庡枟閻撶喐淇婇婵嗗惞婵犫偓娴犲鐓冪憸婊堝礂濞戞碍顐芥慨姗嗗墻閸ゆ洟鏌熺紒銏犳灈妞ゎ偄鎳橀弻锝咁潨閳ь剙顭囪閻涱噣鍩€椤掑嫭鈷掗柛灞剧懅椤︼箓鏌涘顒夊剱缂佸倸绉电粋鎺斺偓锝庝簽閿涚喖姊虹憴鍕姸婵☆偄瀚伴幃锟犲灳閹颁胶鍞甸梺鍏兼倐濞佳勬叏閸儲鐓欓柧蹇ｅ亜閸濇椽鏌＄仦绯曞亾閹颁礁鎮戦柟鑲╄ˉ閳ь剙纾鎴︽⒒娴ｈ櫣甯涢柟姝岊嚙鐓ゆ俊顖氬悑瀹曞弶绻涢幋娆忕仼缂佺媴绲剧换婵嬫濞戞瑯妫ラ梺绯曟櫇閸嬫稖鐏冮梺缁橈耿濞佳勭閿曞倹鐓ラ柡鍥悘鑼偓娈垮枛椤攱淇婇幖浣肝ㄩ柕蹇婃濞兼梹绻濋悽闈涗粶婵☆偅鐟╁畷褰掑醇閺囩偤妫烽梺鍝勵槸缁ㄩ亶寮ㄩ懞銉ｄ簻闁哄啫鍊堕埀顒€顑夊銊х磼濡湱绠氶梺缁樺姌閸╂牠藟婢舵劖鐓熼柨婵嗘搐閸樻潙鈹戦埄鍐╁€愰柡浣稿€垮畷婊嗩槾婵℃彃娲缁樻媴閸涘﹤鏆堝┑鐐村絻缁绘ê鐣峰┑鍡╁悑濠㈣埖绋撶粙蹇涙倵楠炲灝鍔氭い锔垮嵆閸╂盯骞掗幊銊ョ秺閺佹劙宕堕妸銉︾暚婵＄偑鍊栧ú妯煎垝瀹ュ洦宕叉繛鎴炩棨閸︻厸鍋撻敐搴′簼闁绘繃鐗滅槐鎾寸瑹閸パ勭亪濡炪値鍘鹃崗姗€鎮伴鍢夌喖宕楅悡搴ｅ酱闂備礁鎲￠悷銉╁磹閸洖纾块柣銏㈩焾閽冪喐绻涢幋鐐冩艾危閸喍绻嗘い鏍ㄨ壘閹垿鏌熼幓鎺嬪仮婵﹨娅ｇ划娆撳礌閳ュ厖绱ｆ俊鐐€ら崢楣冨礂濡警鍤曞┑鐘宠壘鍥存繝銏ｆ硾閿曪箓鎮鹃幎鑺モ拺闁革富鍘奸崝瀣煕閵娿儳浠涢柟渚垮姂婵偓闁靛牆妫岄幏娲⒑閸涘﹦鈽夋い顓у墴閹偤鎮欓璺ㄧ畾濡炪倖鍔戦崹褰掝敂椤撱垺鐓曢柍鍝勫暙娴犺鲸顨ラ悙宸剶闁轰礁鍟撮崺鈧い鎺戝閸嬪倿鏌ㄩ悢鍝勑ｉ柣鎾存礋閺屽秹鍩℃担鍛婄亾濠电偛鐗婇敋闂囧鏌ｅ鍡椾簼婵炲懎锕ラ幈銊︾節閸愨斂浠㈤悗瑙勬礈閸忔﹢銆佸Ο琛℃婵炲棗绻掕ぐ鐢告⒒閸屾瑨鍏屾い顓炵墦椤㈡牠宕ㄧ€涙ɑ娅囬梺闈涚墕椤︿粙寮€ｎ喗鐓ユ繝闈涙－濡插綊鏌熼婊冧沪闁靛洤瀚伴獮鍥礈娴ｇ懓浠圭紓鍌欑椤︻垶鎮ラ悡搴綎婵炲樊浜滅粈鍐煕濞嗗浚妲归柛搴㈡崌濮婃椽宕妷銉︾€洪梺鍛婎殕婵炲﹤顕ｉ銏╁悑闁告粈鑳堕崣鍡涙⒑閸撴彃浜為柛鐔锋健楠炲繐煤椤忓應鎷洪梺鍛婄☉閿曪箓鍩ユ径鎰叆闁哄洦锚閸斻倕霉濠婂嫭鍊愭い銏℃礋婵″爼宕堕埡瀣簥闂傚倷绶氶埀顒傚仜閼活垱鏅堕鐐寸厵鐎瑰嫮澧楅崵鍥┾偓瑙勬礈閸忔﹢銆佸Ο娆炬Ъ缂備椒绶￠崑濠傤潖濞差亜浼犻柛鏇炵仛绗戦梻浣虹帛椤ㄥ懘宕弶鎴殨妞ゆ帊鑳堕悷褰掓煃瑜滈崜娆撴偩閻戣棄绠ｉ柨鏇楀亾缂佺姴顭烽弻锟犲磼濡搫濮曢梺璇茬箣缁舵艾顫忓ú顏勭闁肩⒈鍓欑敮銉╂⒑閸濄儱校妞ゃ劌锕獮鍐潨閳ь剙鐣锋總绋课ㄩ柨鏃囶潐鐎氳偐绱撻崒姘偓鐑芥倿閿曞倵鈧箓宕堕妸锔界彿闂備緡鍓欑粔鐢告偂閺囩喍绻嗘い鏍ㄧ矊瀛濆┑鐐额嚋缁犳挸鐣烽幋锕€鐓涢柛娑卞枓閹锋椽姊洪崜鑼帥闁革綆鍣ｅ畷鏇㈠箣閿旇В鎷婚梺鍛婃处閸嬪嫰顢旈銏＄厸閻忕偛澧藉ú瀛橆殽閻愯揪鑰跨€规洘锕㈤幊鐘活敆閸曨厼绀堥梻鍌氬€风粈渚€骞栭锕€绠犻煫鍥ㄦ礃瀹曟煡鏌涘畝鈧崑鎰板焵椤掍焦顥堢€规洘锕㈤、娆撳床婢诡垰娲ょ粻鍦磼椤旂厧甯ㄩ柛瀣崌閹崇姷鎹勯搹鐟板Х闂傚倸鍊搁崐椋庣矆娓氣偓楠炲鏁撻悩铏珨闂傚倷绶氬褔鎮ц箛娑掆偓锕傚醇閵夛箑浠奸梺缁樺灱婵倝宕戦妸鈺傜厱婵炴垶锕崝鐔兼煕閺傝法鍩ｉ柟顔筋殜閻涱噣宕归鐓庮潛婵犵妲呴崑鍛存儎椤栨氨鏆? {reason}")
             self._pump_state.running = False
             self._refresh_pump_channels(communication_ok=True, error="")
-        self._pause_event.set()
-        self._set_state(SystemState.PAUSED, message="paused")
+        with self._lock:
+            if self._state == SystemState.PAUSED:
+                self._set_state(SystemState.PAUSED, message="paused")
 
     def resume(self) -> None:
-        with self._lock:
-            if self._state != SystemState.PAUSED:
-                return
-        if self._is_realtime_mode():
-            start_res = self.pump_service.start_infusion_and_verify([1, 2])
-            if not start_res.ok:
-                reason = start_res.reason or start_res.error or "resume start pump failed"
-                self._pump_state.last_error = str(reason)
-                raise RuntimeError(f"缂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤缂嶅﹪寮婚悢鍏尖拻閻庨潧澹婂Σ顔剧磼閻愵剙鍔ょ紓宥咃躬瀵鎮㈤崗灏栨嫽闁诲酣娼ф竟濠偽ｉ鍓х＜闁绘劦鍓欓崝銈囩磽瀹ュ拑韬€殿喖顭烽幃銏ゅ礂鐏忔牗瀚介梺璇查叄濞佳勭珶婵犲伣锝夘敊閸撗咃紲闂佺粯鍔﹂崜娆撳礉閵堝洨纾界€广儱鎷戦煬顒傗偓娈垮枛椤兘骞冮姀銈呯閻忓繑鐗楃€氫粙姊虹拠鏌ュ弰婵炰匠鍕彾濠电姴浼ｉ敐澶樻晩闁告挆鍜冪床闂備浇顕栭崹搴ㄥ礃閿濆棗鐦遍梻鍌欒兌椤㈠﹤鈻嶉弴銏犵闁搞儺鍓欓悘鎶芥煛閸愩劎澧曠紒鈧崘鈹夸簻闊洤娴烽ˇ锕€霉濠婂牏鐣洪柡灞诲妼閳规垿宕卞▎蹇撴瘓缂傚倷闄嶉崝宀勫Χ閹间礁钃熼柣鏂垮悑閸庡矂鏌涘┑鍕姕闁稿瑪鍛＝濞达絼绮欓崫娲偨椤栥倗绡€鐎规洘妞介崺鈧い鎺嶉檷娴滄粓鏌熼崫鍕ラ柛蹇撶灱缁辨帡鍩﹂埀顒勫磻閹剧粯鈷掑ù锝堫潐閸嬬娀鏌涙惔顔肩仸鐎规洘绻冮幆鏃堝Ω閵夈儱浜堕梻浣烘嚀婢х晫鍒掗鐐茬；闁斥晛鍟扮弧鈧繝鐢靛Т閸婃悂顢旈锔界厽妞ゆ挾鍠庣粭褔鏌嶈閸撴繈锝炴径濞掑搫螣閻撳骸鐏婇梺瑙勫礃椤曆呯不閺嶎厽鐓忛煫鍥ь儏閳ь剚鐗犲畷鎴﹀磼閻愯尙顔愬┑鐑囩秵閸撴瑩鍩€椤掍胶澧垫鐐差樀閹囧醇閵忋垻妲囬梻浣圭湽閸ㄨ棄顭囪缁傛帡鏁冮崒娑氬幈闂侀潧顭粻鎴﹀礉閸撲焦鍠愰柣妤€鐗忛惌濠囨煃鐟欏嫬鐏撮柛鈺佸瀹曟﹢濡歌閵堢兘姊绘担铏瑰笡妞ゃ劌妫濋獮鎴﹀炊瑜滈崵鏇㈡偣閸ャ劎銈存俊鎻掔墛娣囧﹪顢涘☉姘辩厑濠碘槅鍋勯崯顐︽偩瀹勯偊娼ㄩ柍褜鍓氭穱濠囧箹娴ｈ倽褔鏌涢埄鍐炬畼闁告ê宕埞鎴︽偐閸偅姣勯梺绋款儐閻╊垶銆佸棰濇晣闁绘柨鍢查悘浣割渻閵堝棙灏柛銊ョ秺閹苯螖閸涱喚鍘遍梺瑙勫閺佹悂宕㈠☉娆戠闁稿繗鍋愭晶顒傜磼缂佹鈽夋い鏂跨箻椤㈡瑩鎳￠妶鍥ㄦ櫒婵犵數鍋熼ˉ鎰板磻閹邦厾绠鹃柍褜鍓熼弻锛勪沪閸撗勫垱閻庢鍠楅幐铏繆閹间礁唯闁靛鍨虹€氳棄鈹戦悩娈挎毌婵℃彃鎳樺畷鎴炵瑹閳ь剙鐣烽幇鏉垮唨妞ゆ劧绲芥惔濠傗攽閻樼粯娑фい鎴濇嚇閹繝寮撮姀锛勫帗閻熸粍绮撳畷婊堟偄妞嬪孩娈鹃梺缁樻⒒閸樠囧垂閸屾稏浜滈柟鎵虫櫅閳ь剚鐗曡濠㈣埖鍔栭埛鎺楁煕鐏炲墽鎳嗛柛蹇撶焸閺岀喖鎼归锝呮殫缂備緡鍠涢褔顢橀崗鐓庣窞濠电姴鍊婚埀顒夊弮閹嘲顭ㄩ崨顓ф毉闁汇埄鍨辩敮锟犲箖閳ユ剚娼ㄩ柍褜鍓熷濠氭偄鐞涒€充壕闁汇垺顔栭悞鍓ф偖閵夆晜鈷戠紒瀣儥閸庢劙鏌熼悷鐗堝枠鐎殿噮鍋婇獮鍥敇閻斿嘲濡虫繝鐢靛█濞佳兠洪妶澶婂嚑闁靛牆妫涚弧鈧梺姹囧灲濞佳勭瑜旈弻娑樜熼悩鍙夊闁哄懏绻冮妵鍕疀閹炬剚浼屽┑鐐插悑閻楁鎹㈠☉姗嗗晠妞ゆ棁宕甸崙褰掓⒑缁嬪尅鍔熼柛蹇旓耿瀵鏁冮埀顒冪亽婵炴挻鍑归崹杈╃懅婵犵數濮甸鏍窗閺嶎厽鐓€闁挎繂鎷嬪鏍ㄧ箾瀹割喕绨诲ù鑲╁█閺屾洘寰勯崼婵嗗闂佽閰ｇ粻鏍蓟閿濆棙鍎熼柨婵嗘处閸ゅ嫰姊洪幖鐐插妧闁告侗鍨卞鏍⒒閸屾瑧绐旀繛浣冲棗顤傞梻浣告惈閹冲繒绮欓幒鏂哄亾闂堟稏鍋㈤柟顔规櫇缁辨帒螣閻撳骸濡囨繝鐢靛О閸ㄥジ顢氶弽顓炲瀭濞村吋娼欑粻顖炴煙鐎电校妞ゎ偅娲熼弻娑㈠箛椤撶姰鍋為梺琛″亾濞寸姴顑嗛悡鐔兼煙闁箑澧伴柟鐣屽█閹绠涙惔鈥崇ギ闂佸搫琚崐妤呭箟閹绢喖绀嬫い鎰╁灩琚橀梻浣虹帛閹稿爼宕愬┑瀣摕闁哄洢鍨归柋鍥ㄧ節閸偄濮堢粭鎴︽⒒娴ｅ憡鍟為柛銊潐閹便劑鎮介崹顐㈠簥濠电偞鍨崹鍦不閿濆鐓熼柟瀛樼箖閻绱掗崜浣规毈婵﹨娅ｇ槐鎺懳熼懡銈呭汲婵犵妲呴崑鍛存儎椤栫偟宓佸璺虹灱閻瑩鎮归幁鎺戝婵炲牊娲熷娲焻閻愯尪瀚板褍顕埀顒冾潐濞叉ê鐣濋幖浣哄祦闁圭儤顨呯粻锝夋煛閸愶絽浜鹃梺璇查椤嘲顫忛搹瑙勫枂闁告洦鍋嗛ˇ銊モ攽閻愬樊妲圭紒瀣尵閸? {reason}")
-            self._pump_state.running = True
-            self._refresh_pump_channels(communication_ok=True, error="")
-            self._sync_pump_flow_readback("resume")
-        self._pause_event.clear()
-        self._set_state(SystemState.RUNNING, message="running")
+        # Serialize resume attempts, but never hold the orchestration lock over
+        # serial I/O. stop()/pause() can therefore invalidate this attempt.
+        with self._pump_lifecycle_lock:
+            with self._lock:
+                if self._state != SystemState.PAUSED:
+                    return
+                generation = self._lifecycle_generation
+            if self._is_realtime_mode():
+                try:
+                    start_res = self.pump_service.start_infusion_and_verify([1, 2])
+                except Exception as exc:
+                    reason = str(exc) or "resume start pump failed"
+                    stop_ok, stop_reason = self._stop_pump_verified("resume exception rollback")
+                    if not stop_ok:
+                        reason = f"{reason}; rollback stop failed: {stop_reason}"
+                    with self._lock:
+                        self._pump_control_enabled = False
+                        self._stop_event.set()
+                        self._pump_state.running = False
+                        self._pump_state.last_error = reason
+                        self._refresh_pump_channels(communication_ok=False, error=reason)
+                        self._state = SystemState.ERROR
+                    raise RuntimeError(reason) from exc
+                with self._lock:
+                    lifecycle_valid = (
+                        generation == self._lifecycle_generation
+                        and self._state == SystemState.PAUSED
+                        and self._pause_event.is_set()
+                        and not self._stop_event.is_set()
+                    )
+                if not lifecycle_valid:
+                    self._stop_pump_verified("resume superseded rollback")
+                    return
+                if not start_res.ok:
+                    reason = start_res.reason or start_res.error or "resume start pump failed"
+                    stop_ok, stop_reason = self._stop_pump_verified("resume start rollback")
+                    if not stop_ok:
+                        reason = f"{reason}; rollback stop failed: {stop_reason}"
+                    self._pump_state.last_error = str(reason)
+                    self._pump_control_enabled = False
+                    self._stop_event.set()
+                    self._pump_state.running = False
+                    self._refresh_pump_channels(communication_ok=False, error=str(reason))
+                    self._state = SystemState.ERROR
+                    raise RuntimeError(f"缂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤缂嶅﹪寮婚悢鍏尖拻閻庨潧澹婂Σ顔剧磼閻愵剙鍔ょ紓宥咃躬瀵鎮㈤崗灏栨嫽闁诲酣娼ф竟濠偽ｉ鍓х＜闁绘劦鍓欓崝銈囩磽瀹ュ拑韬€殿喖顭烽幃銏ゅ礂鐏忔牗瀚介梺璇查叄濞佳勭珶婵犲伣锝夘敊閸撗咃紲闂佺粯鍔﹂崜娆撳礉閵堝洨纾界€广儱鎷戦煬顒傗偓娈垮枛椤兘骞冮姀銈呯閻忓繑鐗楃€氫粙姊虹拠鏌ュ弰婵炰匠鍕彾濠电姴浼ｉ敐澶樻晩闁告挆鍜冪床闂備浇顕栭崹搴ㄥ礃閿濆棗鐦遍梻鍌欒兌椤㈠﹤鈻嶉弴銏犵闁搞儺鍓欓悘鎶芥煛閸愩劎澧曠紒鈧崘鈹夸簻闊洤娴烽ˇ锕€霉濠婂牏鐣洪柡灞诲妼閳规垿宕卞▎蹇撴瘓缂傚倷闄嶉崝宀勫Χ閹间礁钃熼柣鏂垮悑閸庡矂鏌涘┑鍕姕闁稿瑪鍛＝濞达絼绮欓崫娲偨椤栥倗绡€鐎规洘妞介崺鈧い鎺嶉檷娴滄粓鏌熼崫鍕ラ柛蹇撶灱缁辨帡鍩﹂埀顒勫磻閹剧粯鈷掑ù锝堫潐閸嬬娀鏌涙惔顔肩仸鐎规洘绻冮幆鏃堝Ω閵夈儱浜堕梻浣烘嚀婢х晫鍒掗鐐茬；闁斥晛鍟扮弧鈧繝鐢靛Т閸婃悂顢旈锔界厽妞ゆ挾鍠庣粭褔鏌嶈閸撴繈锝炴径濞掑搫螣閻撳骸鐏婇梺瑙勫礃椤曆呯不閺嶎厽鐓忛煫鍥ь儏閳ь剚鐗犲畷鎴﹀磼閻愯尙顔愬┑鐑囩秵閸撴瑩鍩€椤掍胶澧垫鐐差樀閹囧醇閵忋垻妲囬梻浣圭湽閸ㄨ棄顭囪缁傛帡鏁冮崒娑氬幈闂侀潧顭粻鎴﹀礉閸撲焦鍠愰柣妤€鐗忛惌濠囨煃鐟欏嫬鐏撮柛鈺佸瀹曟﹢濡歌閵堢兘姊绘担铏瑰笡妞ゃ劌妫濋獮鎴﹀炊瑜滈崵鏇㈡偣閸ャ劎銈存俊鎻掔墛娣囧﹪顢涘☉姘辩厑濠碘槅鍋勯崯顐︽偩瀹勯偊娼ㄩ柍褜鍓氭穱濠囧箹娴ｈ倽褔鏌涢埄鍐炬畼闁告ê宕埞鎴︽偐閸偅姣勯梺绋款儐閻╊垶銆佸棰濇晣闁绘柨鍢查悘浣割渻閵堝棙灏柛銊ョ秺閹苯螖閸涱喚鍘遍梺瑙勫閺佹悂宕㈠☉娆戠闁稿繗鍋愭晶顒傜磼缂佹鈽夋い鏂跨箻椤㈡瑩鎳￠妶鍥ㄦ櫒婵犵數鍋熼ˉ鎰板磻閹邦厾绠鹃柍褜鍓熼弻锛勪沪閸撗勫垱閻庢鍠楅幐铏繆閹间礁唯闁靛鍨虹€氳棄鈹戦悩娈挎毌婵℃彃鎳樺畷鎴炵瑹閳ь剙鐣烽幇鏉垮唨妞ゆ劧绲芥惔濠傗攽閻樼粯娑фい鎴濇嚇閹繝寮撮姀锛勫帗閻熸粍绮撳畷婊堟偄妞嬪孩娈鹃梺缁樻⒒閸樠囧垂閸屾稏浜滈柟鎵虫櫅閳ь剚鐗曡濠㈣埖鍔栭埛鎺楁煕鐏炲墽鎳嗛柛蹇撶焸閺岀喖鎼归锝呮殫缂備緡鍠涢褔顢橀崗鐓庣窞濠电姴鍊婚埀顒夊弮閹嘲顭ㄩ崨顓ф毉闁汇埄鍨辩敮锟犲箖閳ユ剚娼ㄩ柍褜鍓熷濠氭偄鐞涒€充壕闁汇垺顔栭悞鍓ф偖閵夆晜鈷戠紒瀣儥閸庢劙鏌熼悷鐗堝枠鐎殿噮鍋婇獮鍥敇閻斿嘲濡虫繝鐢靛█濞佳兠洪妶澶婂嚑闁靛牆妫涚弧鈧梺姹囧灲濞佳勭瑜旈弻娑樜熼悩鍙夊闁哄懏绻冮妵鍕疀閹炬剚浼屽┑鐐插悑閻楁鎹㈠☉姗嗗晠妞ゆ棁宕甸崙褰掓⒑缁嬪尅鍔熼柛蹇旓耿瀵鏁冮埀顒冪亽婵炴挻鍑归崹杈╃懅婵犵數濮甸鏍窗閺嶎厽鐓€闁挎繂鎷嬪鏍ㄧ箾瀹割喕绨诲ù鑲╁█閺屾洘寰勯崼婵嗗闂佽閰ｇ粻鏍蓟閿濆棙鍎熼柨婵嗘处閸ゅ嫰姊洪幖鐐插妧闁告侗鍨卞鏍⒒閸屾瑧绐旀繛浣冲棗顤傞梻浣告惈閹冲繒绮欓幒鏂哄亾闂堟稏鍋㈤柟顔规櫇缁辨帒螣閻撳骸濡囨繝鐢靛О閸ㄥジ顢氶弽顓炲瀭濞村吋娼欑粻顖炴煙鐎电校妞ゎ偅娲熼弻娑㈠箛椤撶姰鍋為梺琛″亾濞寸姴顑嗛悡鐔兼煙闁箑澧伴柟鐣屽█閹绠涙惔鈥崇ギ闂佸搫琚崐妤呭箟閹绢喖绀嬫い鎰╁灩琚橀梻浣虹帛閹稿爼宕愬┑瀣摕闁哄洢鍨归柋鍥ㄧ節閸偄濮堢粭鎴︽⒒娴ｅ憡鍟為柛銊潐閹便劑鎮介崹顐㈠簥濠电偞鍨崹鍦不閿濆鐓熼柟瀛樼箖閻绱掗崜浣规毈婵﹨娅ｇ槐鎺懳熼懡銈呭汲婵犵妲呴崑鍛存儎椤栫偟宓佸璺虹灱閻瑩鎮归幁鎺戝婵炲牊娲熷娲焻閻愯尪瀚板褍顕埀顒冾潐濞叉ê鐣濋幖浣哄祦闁圭儤顨呯粻锝夋煛閸愶絽浜鹃梺璇查椤嘲顫忛搹瑙勫枂闁告洦鍋嗛ˇ銊モ攽閻愬樊妲圭紒瀣尵閸? {reason}")
+                with self._lock:
+                    if (
+                        generation != self._lifecycle_generation
+                        or self._state != SystemState.PAUSED
+                        or not self._pause_event.is_set()
+                        or self._stop_event.is_set()
+                    ):
+                        continue_resume = False
+                    else:
+                        continue_resume = True
+                        self._pump_state.running = True
+                        self._refresh_pump_channels(communication_ok=True, error="")
+                if not continue_resume:
+                    self._stop_pump_verified("resume post-start transition")
+                    return
+                if not self._sync_pump_flow_readback("resume"):
+                    reason = self._pump_state.last_error or "resume flow readback failed"
+                    stop_ok, stop_reason = self._stop_pump_verified("resume readback rollback")
+                    if not stop_ok:
+                        reason = f"{reason}; rollback stop failed: {stop_reason}"
+                    with self._lock:
+                        self._pump_control_enabled = False
+                        self._stop_event.set()
+                        self._pump_state.running = False
+                        self._pump_state.last_error = reason
+                        self._refresh_pump_channels(communication_ok=False, error=reason)
+                        self._state = SystemState.ERROR
+                    raise RuntimeError(reason)
+            with self._lock:
+                if generation != self._lifecycle_generation or self._state != SystemState.PAUSED:
+                    return
+                self._pause_event.clear()
+                self._set_state(SystemState.RUNNING, message="running")
 
     def stop(self) -> None:
-        self._set_state(SystemState.STOPPING, message="stopping")
-        self._stop_event.set()
+        with self._lock:
+            self._lifecycle_generation += 1
+            self._state = SystemState.STOPPING
+            self._stop_event.set()
+            self._pause_event.set()
+            self._pump_control_enabled = False
+        self._log("[ORCH][STOPPING] stopping")
         t = self._loop_thread
         if t and t.is_alive():
             t.join(timeout=float(self.runtime.stop_timeout_s))
 
+        stop_ok = True
+        stop_reason = ""
         if self._is_realtime_mode():
+            stop_ok, stop_reason = self._stop_pump_verified("user stop")
+            if not stop_ok:
+                self._pump_control_enabled = False
+                self._set_state(SystemState.ERROR, error=stop_reason)
+        if not stop_ok:
             try:
-                self.pump_service.stop_system_and_verify()
-                self._pump_state.running = False
-                self._refresh_pump_channels(communication_ok=True, error="")
+                adapter = self.vision_adapter
+                if adapter is not None:
+                    adapter.stop()
             except Exception as e:
-                self._pump_state.last_error = str(e)
-                self._refresh_pump_channels(communication_ok=False, error=str(e))
-                self._log(f"[ORCH][WARN] 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤缂嶅﹪寮婚悢鍏尖拻閻庨潧澹婂Σ顔剧磼閻愵剙鍔ょ紓宥咃躬瀵鎮㈤崗灏栨嫽闁诲酣娼ф竟濠偽ｉ鍓х＜闁绘劦鍓欓崝銈囩磽瀹ュ拑韬€殿喖顭烽弫鎰緞婵犲嫷鍚呴梻浣瑰缁诲倿骞夊☉銏犵缂備焦顭囬崢閬嶆⒑闂堟稓澧曢柟鍐查叄椤㈡棃顢橀姀锛勫幐闁诲繒鍋涙晶钘壝虹€涙ǜ浜滈柕蹇婂墲缁€瀣煛娴ｇ懓濮嶇€规洖宕埢搴♀枎閹寸姭鏁嶉梻鍌氬€搁崐椋庢濮樿泛鐒垫い鎺戝€告禒婊堟煠濞茶鐏￠柡鍛埣瀹曟粏顦寸痪鎯с偢閺岋絽螣閹稿海褰ч柣蹇撴禋閸欏啴寮婚敐澶嬫櫜濠㈣泛顑嗛弳鐘电磽娴ｈ姤顏犻柡鍜佸亞閸掓帒鈻庨幋鐐茬彴婵烇絽娲ゅ畷顒佷繆娴犲鐓忛柛銉戝喚浼冮悗娈垮櫘閸ｏ絽鐣烽崼鏇椻偓鏍敊閼恒儱闉嶇紓浣虹帛閻╊垰鐣烽妸鈺婃晣闁绘ɑ绁撮崣鐑樼節濞堝灝鏋涢柨鏇閸掓帡顢涢悙鑼唵闂佸憡绋戦悺銊╁箚閻愭惌娈介柣鎰皺濮樸劑鏌涚€ｎ偅灏扮紒缁樼箞瀹曞爼濡歌楠炲牓姊绘担绛嬫綈闁稿孩濞婇、姘额敇閻樺吀绗夐梺缁樺姉閸庛倝鎮″▎鎰╀簻闁哄啠鍋撻柛搴㈠▕瀹曘垽寮堕幋鏃€鏂€闂佹寧绋戠€氼剟宕㈤幘顔界厱闁宠鍎虫晶鏌ユ煙瀹勭増鍤囩€规洦鍋婃俊鐑藉閻樺崬顥氭俊鐐€栭幐楣冨磻閹版澘缁╁ù鐘差儐閻撶喐淇婇婵嗕汗閻㈩垱绋掔换娑㈠箠瀹勭増澶勯柣鎾跺枑娣囧﹪濡堕崒姘闂備礁鎽滈崰鎰焽濞嗘挻鍋╅柣鎴ｆ缁狅綁鏌ㄩ弴妤€浜剧紓浣哄Т椤兘寮婚妶鍡樺弿闁归偊鍏橀崑鎾诲即閻樼數鐒鹃梺鎸庢礀閸婂綊鍩涢幋锔界厱闁瑰墽鎳撻惃娲煕濡崵娲撮柡灞剧洴閹晛鐣烽崶褜娼烽梻渚€鈧稓鈹掗柛鏂跨Ч楠炲棝寮崼婵堝弮闂侀€炲苯澧寸€殿喓鍔嶇粋鎺斺偓锝庡亞閸樻捇姊洪懞銉冾亪藝娴兼澶婎煥閸忕姷鎳撻…銊╁礋椤撶姷鏉介梻浣告惈閻绱炴笟鈧獮鍐Χ婢跺﹦锛滃┑鐘诧工閹冲繐鈻撻崗闂寸箚闁靛牆娲ゅ暩闂佺顑嗛惄顖炲箖瑜旈獮妯肩礄閻樼數鐣鹃梻浣哥秺濡法绮堟担鍛婃殰濠碉紕鍋戦崐鏍ь潖瑜版帒纾块柛鎰▕閸ゆ洟鏌熼幆鏉啃撻柍閿嬪笒闇夐柨婵嗘祩閻掔偓銇勯妷銉х闁哄本绋撻埀顒婄秵娴滄繈藟閵忊懇鍋撶憴鍕；闁告濞婇悰顔嘉熼崗鐓庣彴闂佽偐鈷堥崜娑㈠储椤掑嫭鈷掑ù锝堟閵嗗﹪鏌涢幘瀵哥畼缂侇喗鐟╅獮鎺懳旈埀顒勬偂閺囥垺鐓欓弶鍫ョ畺濡绢噣鏌ｉ幘瀛樼缂佺粯绻堝Λ鍐ㄢ槈濞嗘ɑ顥ｆ俊鐐€曞ù姘閻愬搫鐒垫い鎺戝€归崵鈧梺纭咁嚋缁辨洟骞戦姀銈呴唶闁靛鍎撮幗鏇炩攽閻愭潙鐏﹂柛鈺佸暣瀹曟垿骞樼紒妯绘珳闁硅偐琛ラ埀顒冨皺閺佹牗绻濋悽闈涗粶鐎殿喖鐖奸獮鎰板箮閽樺鎽曞┑鐐村灟閸ㄥ綊鎮″鈧弻鐔碱敍閸℃鈧悂藟濮橆厾绡€缁炬澘顦辩壕鍧楁煕鐎ｎ偄鐏寸€规洘鍔欏浠嬵敃閿濆棙顔囧┑鐘垫暩婵潙煤閿曞倸纾归柛褎顨嗛悡銉╂煛閸モ晛浠滈柍褜鍓欓幗婊勭珶閺嚶颁汗闁圭儤鎸鹃崢鐢告⒒娓氬洤寮跨紒鐘冲灴瀵悂骞樼紒妯煎幈闁诲函缍嗛崑鍛焊閻㈠憡鐓欓柛娆忣槹鐏忥妇鈧娲滈崰鏍€佸Δ鍛＜闁靛牆鏌婇悙鐑樷拻闁稿本鐟ч崝宥夋倵缁楁稑鍘炬ウ璺ㄧ杸婵炴垶锚閻庮參姊洪懞銉冾亪藝闁秴姹查柨鏃傛櫕缁犲墽鈧懓澹婇崰鏇犺姳婵犳碍鐓熼柟鐑樺灩娴犳盯鏌曢崶褍顏鐐村笒椤撳吋寰勭€ｇ鍋撻弽銊х閻庢稒顭囬惌瀣磼椤旇姤宕岀€殿喖顭烽幃銏ゅ礂閻撳簶鍋撶紒妯圭箚妞ゆ牗绻冮鐘裁归悩铏稇妞ゎ亜鍟存俊鍫曞川椤旂虎娲跺┑鐐茬摠缁姵绂嶉鍕靛殨閻犲洤妯婇崥瀣熆鐠轰警鍎戦柛娆忔閺岋絾鎯旈婊呅ｆ繛瀛樼矌閸嬬偟鈧數鍘ч悾婵嬪礋椤戣姤瀚奸梺鑽ゅТ濞茬娀鍩€椤掑啯鐝柣蹇撶墢缁辨捇宕掑姣欍垽鏌ㄩ弴銊ら偗闁诡喕鍗抽、娆撴偩瀹€鈧幊婵嬫⒑闁偛鑻晶鎾煟濞戝崬娅嶆鐐村笒铻栭柍褜鍓涚划濠氭晲閸℃瑧鐦堥梺鍓茬厛閸嬪嫭鎱ㄦ径鎰厓鐟滄粓宕滃顓犵濠电姴鍋嗗鏍磽娴ｈ偂鎴炲垔閹绢喗鐓曟繛鎴烇公閺€濠氭煕鎼淬垺灏い顏勫暣婵″爼宕卞Δ鍐ф樊婵犵妲呴崑鍛崲閸岀儐鏁嬮柨婵嗘缁♀偓濠殿喗锕╅崕鐢稿煛閸涱喚鍘撻柡澶屽仦婵粙宕楀畝鍕厱婵☆垳绮亸锔芥叏婵犲懏顏犳繛鎴犳暬瀹曘劑顢欓崗濂告暘闂備浇顕ч柊锝咁焽瑜旈幆宀勫磼濮樼厧娈ㄥ銈嗗姧缁茶法寮ч埀顒勬⒑閹肩偛鍔橀柛鏂块叄瀹曘垺绂掔€ｎ偀鎷洪柣鐔哥懃鐎氼剟宕濋妶澶嬬厱闁绘棃鏀遍崑銉︺亜閵忊槅娈滃┑顔瑰亾闂佹寧绋戠€氬嘲煤缁嬪簱鏀介柣鎰綑閻忕喖鏌涢妸锔姐仢闁糕晜鐩獮鎺楀箠閵娿儳绉洪柡浣瑰姈瀵板嫬螣濞茬粯顥涙繝鐢靛仦閸ㄥ爼骞戞担杞扮剨婵炲棙鍨堕～鏇㈡煙閻戞﹩娈旂紒鐘垫暬閺岀喖鎮滃Ο璇茬婵炲濮甸幐鎶藉箖濡ゅ啯鍠嗛柛鏇ㄥ墰椤︺劌顪冮妶鍐ㄥ闁硅櫕锕㈤弫鎰版倷瀹割喚鍙嗛梺鍓插亝缁诲嫰宕濋敃鈧—鍐Χ閸℃娼戦梺绋款儐閹稿濡甸崟顖氬嵆妞ゅ繐妫涜ⅵ婵＄偑鍊戦崹鍝劽洪悢鐓庢瀬闁告劦鍠栭悞鍨亜閹烘垵鈧粯绋夊鍡欑闁瑰瓨鐟ラ悘顏堟煟閹惧鈽夋い顓℃硶閹瑰嫭绗熼姘婵＄偑鍊栧ú妯煎垝閹捐钃熼柡鍥ュ灩閻愬﹪鏌曟繛褍鎳愰弳顐ょ磽閸屾瑨鍏岀紒顕呭灣缁瑩骞掗幋顓犲姺闂婎偄娲︾粙鎴犵矆閸垺鍠愮€广儱顦弰銉р偓鍏夊亾闁告洦鍏橀幏娲⒑闂堚晛鐦滈柛妯绘倐楠炲繘鏁撻悩宕囧幈闁诲函缍嗘禍宄邦啅閵夛负浜滈柡鍥朵簽缁夘喗銇勯姀鈩冪闁轰礁鍟撮崺鈧い鎺戝€绘稉宥夋煟閻旂娅炵憸鐗堝笚閺呮煡鏌涘☉鍗炲箹閺夊牆鎳樺楦裤亹閹烘繃顥栫紓渚囧櫘閸ㄦ娊骞戦姀鐘婵炲棙鍔楃粔鍫曟⒑閸涘﹥瀵欓柛鏇ㄥ亗鏉╂﹢姊婚崒娆掑厡闁稿海鏁诲畷婊冣攽閸狀喗鐩畷姗€濡歌濞堥箖姊哄Ч鍥х伄妞ゎ厼鐗忕划鍫ュ礃閳瑰じ绨婚梺鍝勫暙閸婄懓鈻嶉弴銏＄厱婵せ鍋撳ù婊嗘硾椤繐煤椤忓拋妫冨┑鐐村灱娴滎剟宕濋幖浣光拺闁告稑锕ラ埛鎰版煕閵娿儳浠㈤柣锝囧厴椤㈡洟鏁傞懞銉ュ姃闂備線娼荤€靛矂宕㈡ィ鍐╂櫖婵犲﹤鐗婇埛鎴︽煕濠靛棗顏╅柡鍡樼懇閺屾稒绻濋崘鈺佲偓鎰偓娈垮枤椤牓鍩ユ径濠庢僵闁挎繂鎳嶆竟鏇㈡煟閻斿摜鎳冮悗姘煎幘缁牓鍩€椤掑嫭鍊甸悷娆忓婢跺嫰鏌涢幘璺烘灈鐎规洘妞芥慨鈧柍鈺佸暙閸斿懘姊洪棃娑辩劸闁稿孩濞婇、娆愮節閸ャ劉鎷洪梺鑽ゅ枑婢瑰棝寮搁崘鈹夸簻闁哄啠鍋撻柛鏃€顨婇獮鎴﹀閻橆偅鏂€闂佺硶妾ч弲婊呯礊鎼淬劍鈷戦柟顖嗗懐顔囧┑鐘亾闂侇剙绉甸崕妤呮煙閸撗呭笡闁绘挻娲熼弻宥夊煛娴ｅ憡鐏撳┑鐐茬墛濮婂綊濡甸崟顔剧杸闁规崘鍩栭幉鑲╃磽娴ｈ櫣甯涢柣鈺婂灠閻ｉ攱绺介崨濠備簻闂佸憡绺块崕鍝勎ｈぐ鎺撯拻? {e}")
-
+                self._log(f"[ORCH][WARN] adapter stop after pump stop failure: {e}")
+            self._pid_data_recorder.finish_session()
+            return
         try:
             adapter = self.vision_adapter
             if adapter is not None:
@@ -1026,18 +1417,36 @@ class OrchestratorService:
                         break
             elif self._stop_event.wait(interval_s):
                 break
-            if self._pause_event.is_set():
-                continue
+            with self._lock:
+                if (
+                    self._pause_event.is_set()
+                    or self._state != SystemState.RUNNING
+                    or not self._pump_control_enabled
+                ):
+                    continue
 
             try:
                 self.run_control_step()
             except Exception as e:
+                self._pump_control_enabled = False
+                self._stop_event.set()
                 self._pump_state.last_error = str(e)
+                if self._is_realtime_mode():
+                    self._stop_pump_verified("control loop error")
                 self._set_state(SystemState.ERROR, error=f"闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤缂嶅﹪寮婚悢鍏尖拻閻庨潧澹婂Σ顔剧磼閻愵剙鍔ょ紓宥咃躬瀵鎮㈤崗灏栨嫽闁诲酣娼ф竟濠偽ｉ鍓х＜闁绘劦鍓欓崝銈囩磽瀹ュ拑韬€殿喖顭烽弫鎰緞婵犲嫷鍚呴梻浣瑰缁诲倿骞夊☉銏犵缂備焦顭囬崢閬嶆⒑闂堟稓澧曢柟鍐查叄椤㈡棃顢橀姀锛勫幐闁诲繒鍋涙晶钘壝虹€涙ǜ浜滈柕蹇婂墲缁€瀣煛娴ｇ懓濮嶇€规洖宕埢搴♀枎閹存繃鐏庨梻鍌氬€搁崐椋庢濮樿泛鐒垫い鎺戝€告禒婊堟煠濞茶鐏︾€规洏鍨介獮鏍ㄦ媴閸︻厼骞楅梻浣侯攰濞咃綁宕戝☉顫偓鍛搭敆閸曨剛鍘靛Δ鐘靛仜閻忔繈鎮橀埡鍛厓閻熸瑥瀚悘鈺呮煃瑜滈崜銊х礊閸℃顩查柣鎰惈绾惧綊鏌ｉ幇顔煎妺闁抽攱鍨垮濠氬醇閻斿墎绻侀梺缁樺浮缁犳牠寮诲☉娆愬劅闁靛牆顦幗鐢电磽娴ｈ鈷掗柛鐘崇墵閻涱噣骞掗幊铏⒐閹峰懘宕ｆ径濠庝紲濠电姷鏁搁崑鐘诲箵椤忓棛绀婇柍褜鍓氶妵鍕敃閵忊晜鈻堥悗瑙勬礃閸ㄥ潡骞冮埡鍐＜婵☆垳鍘ч獮鍫ユ⒑閻熸澘鎮戦柣锝庝邯瀹曠懓煤椤忓嫀锔界節闂堟稓澧愰柛瀣尵閹叉挳宕熼鍌ゆО缂傚倷绶￠崰鏍儗閸岀偛鏄ラ柕蹇婂墲閸庣喖鏌曟繛鍨姢妞ゆ挻妞藉铏圭磼濮楀棛鍔烽梺杞扮劍閹倸鐣峰┑瀣唶闁哄洨鍟块幏缁樼箾鏉堝墽鍒伴柟璇х節瀹曨垶鎮欓悜妯煎幈闂佸搫鍟幐楣冩偩閻㈢鍋撶憴鍕婵犮垺顭堥悘鍐⒑閸涘﹣绶遍柛鐘崇墬缁傚秴螖閸涱噮妫呭銈嗗姂閸ㄧ儤寰勯崟顖涚厵闁告稑锕ョ亸锔锯偓娈垮枔閸斿秶绮嬮幒鏂哄亾閿濆骸浜為柛妯圭矙濮婇缚銇愰幒鎴滃枈闂佸憡锚閵堟悂骞冨鈧俊鐑藉煛閸屾粌骞堥梻浣虹帛濞叉垹绮堟担鍦洸闁规鍠掗崑鎾斥枔閸喗鐏堥梺鍝ュ枎濞硷繝宕洪姀鈩冨劅闁靛鍎抽娲⒑缂佹﹩鐒芥い锝庡枤濡叉劙寮婚妷锔规嫽婵炶揪缍€濞咃絿鏁☉銏＄叆婵鍩栭悡鏇㈡煟閺冨牊鏁遍柛瀣ㄥ劦閺岀喖顢欑粵瀣姺闂侀€炲苯澧紒瀣笩閹筋偊姊洪崨濠勬噧缂佺粯鍔欓崺鐐哄箣閿旇棄浜归梺鍛婄懃椤︻垰鈻嶉妶鍜佹富闁靛牆鎳愮粻鍐测攽閻愨晛浜鹃梻浣告惈閻ジ宕伴幇鍏洭鎮ч崼鐔峰妳闂佹娊鏁崑鎾绘煛鐎ｎ亝鍤囬柟顔筋殘閹叉挳宕熼鍌楁晬缂傚倷绀佸鍫曞磿閹剁瓔鏁嬮柕澶嗘櫅缁€瀣亜閹惧鈽夊ù婊堢畺閺屻劌鈹戦崱娆忓毈闂備緡鍙庨崹杈ㄧ┍婵犲浂鏁冮柕鍫濇噹楠炲鈹戦纭峰伐妞ゎ厼鍢查悾鐑藉箳閹存梹鐎婚梺褰掑亰閸犳捇宕戝Ο鑽ょ瘈缁剧増锚婢ф煡鏌曢崶銊х煉鐎规洘绻冮幆鏃堟晲閸涱厾浜伴梻浣稿閸嬪棝宕伴幘缁樺仭鐟滅増甯楅悡鍐喐濠婂牆绀堥柣鏃傚帶閸ㄥ倸螖閿濆懎鏆為柡鍛箞閺屽秷顧侀柛鎾跺枛楠炲啯銈ｉ崘鈺傛闂佺粯顭堢亸娆擃敇閻撳寒娓婚柕鍫濇椤ュ棗鈹戦鍝勨偓婵嬨€佸▎鎾冲嵆闁靛繆妾ч幏缁樼箾鏉堝墽鎮奸柛搴涘€濆畷鐢稿焵椤掆偓椤啴濡堕崱妯侯槱闂佸憡鐟ラ崯顐︽偩閻戣棄绠ｉ柨鏃囨娴滄粓姊洪崨濠勭畵閻庢凹鍓濋埅鏌ユ⒒閸屾瑧绐旈柍褜鍓涢崑娑㈡嚐椤栨稒娅犻悗娑櫳戦崣蹇撯攽閻樻彃鏆為柕鍥ㄧ箘閳ь剝顫夊ú蹇涘礉瀹ュ洦宕叉繝闈涱儏绾惧吋鎱ㄩ敐鍡楊嚋婵炲弶顭囬幑銏犫槈濮橈絽浜炬繛鎴炵懐閻掍粙鏌ｉ鐐差劉缂佺粯绋掑鍕偓锝庡厵閳ь剚甯￠弻娑樷枎韫囨柨娈楀┑顔硷躬缂傛岸濡甸幇鏉跨闁瑰灝瀚崥褰掓⒒娴ｈ櫣甯涢悽顖ｄ簽缁骞樼拠鍙夋К濠电偞鍨崹鍦不閿濆鐓熸俊顖氬悑閺嗏晠鏌ㄥ☉娆戠畺缂佺粯绋掑蹇涘礈瑜嶉崺灞筋渻閵堝骸浜濋柣妤冨█閵嗕線寮崼婵嗙獩濡炪倖姊婚崢褎瀵兼惔銊︹拺閻犲洩灏欑粻鎶芥煕鐎ｎ偆鈯曢柡鍛埣閹儳鐣濋埀顒佺▔瀹ュ憘鏃堟晲閸涱厽娈查梺缁樻尰濞叉鎹㈠┑鍥╃瘈闁稿本纰嶅▓顓㈡⒑閸濆嫭顥犻柛鐘崇墵瀵鈽夐姀鐘殿唺閻庡箍鍎遍幊搴ｇ矈椤曗偓濮婃椽宕崟顓犲姽缂傚倸绉崇欢姘嚕椤愶箑绠涢柡澶婄仢缁愭稑顪冮妶鍡欏闁荤啙鍕╀粴鐎规洖娲ㄧ壕浠嬫煕鐏炲墽鎳呴柛鏂跨У閵囧嫰濡搁妷褍鈪甸悗瑙勬磻閸楀啿顕ｆ禒瀣垫晣闁绘劕鐡ㄨⅲ闂傚倷绶氶埀顒傚仜閼活垱鏅堕鐐寸厪闁搞儜鍐句純濡ょ姷鍋炵敮锟犵嵁鐎ｎ亖鏀介柟閭︿簼閸嬪懘姊婚崒娆愮グ婵☆偄瀚板畷顖涘閺夋垹鐛ラ梺褰掑亰閸犳鐣烽崣澶岀闁瑰瓨鐟ラ悘鈺冪磼閻欏懐绋荤紒缁樼洴瀹曞崬螖閸愵亶鍞哄┑鐐差嚟婵挳濡剁粙娆炬綎闁惧繐婀辩壕鍏间繆椤栨繃顏犻柣鐔稿絻閳规垿鏁嶉崟顐＄钵缂備緡鍠楅悷銉╊敋閿濆洦瀚氭繛鏉戭儐椤秹姊洪棃娑氱濠殿喚鍏橀幃鍧楀焵椤掍椒绻嗛柣鎰典簻閳ь剚鐗曡灋闁告劑鍓☉銏犵閹艰揪绲胯ぐ楣冩⒑閸濆嫭宸濋柛搴㈠姇閵嗘帗绻濆顓犲帾闂佸壊鍋呯换鍐夐悙鐑樺€堕煫鍥风到楠炴绱掓潏銊﹀碍妞ゆ挸銈稿畷顏堝礃閵娿倗鐭楀┑锛勫亼閸娿倝宕戦崟顓熷床闁归偊鍠栧鍙変繆閻愵亜鈧洜鎹㈤幇顔瑰亾濮樼厧娅嶆い銏＄懇楠炲洭鎮ч崼姘缂傚倸鍊烽悞锕傛晪婵犳鍠栭悧蹇曟閹烘挻濯撮悷娆忓閸炲鎮楃憴鍕闁搞劌娼￠悰顔嘉熼崗鐓庣彴闂佸湱绮敮鎺楀极閵堝棔绻嗛柣鎰典簻閳ь兙鍊濆畷妤€顫滈埀顒€鐣峰鍐ｆ斀闁糕檧鏅滅€靛本绻涚€电孝妞ゆ垵鎳愮划濠氬冀椤撶喓鍘棅顐㈡搐椤戝懘鍩€椤掍胶澧电€规洘鍨垮畷鎺楁倷閼碱剦鍟囨繝鐢靛剳缂嶅棝宕滃▎鎾崇劦妞ゆ帊鑳舵晶鍨殽閻愬樊妯€闁诡啫鍥ч唶闁靛繈鍨诲Σ鍥⒒娴ｅ湱婀介柛銊ㄦ椤洩顦崇紒鍌涘浮閺佸啴宕掑☉姘箞闂備線娼ч…鍫ュ磿閹惰棄鏄ラ柨婵嗩槹閻撴瑦銇勯弽銊︾殤闁绘帒鎲￠妵鍕閿涘嫭鍣繛瀛樼矋閹倸顕ｆ禒瀣╃憸宥咁嚕椤斿皷鏀介柨娑樺娴滃ジ鏌涙繝鍐╃闁瑰箍鍨介獮鍥偋閸繀缃曞┑鐘垫暩婵潙煤閿曞倸纾婚柛宀€鍋為悡鐔兼煛閸屾氨浠㈤柟顔藉灴閺岋綁骞樼€靛憡鍣ч梻鍥ь樀閺岋綁骞橀搹顐ｅ闯闂佸湱鏅慨鐢垫崲濞戙垹绠犵€瑰嫭婢橀弸銈夋煟閺傛寧顥犻柟鍙夌摃缁犳盯寮埀顒€鈻嶉悩鍏呯箚闁靛牆鎳庨弳鐐碘偓瑙勬礀瀵墎鎹㈠☉銏犵婵炲棗绻掓禒濂告⒒娴ｇ鑸规繛璇у閹广垹鈽夐姀鐘殿吅闂佺粯鍔曢崯顖氱暆缁嬭法鏆﹂柟杈剧畱缁犲鏌￠崒妯哄姕闁哄倵鍋撻梻鍌欒兌绾泛顬婅瀵彃顭ㄩ崨顖滎槸? {e}")
                 self._stop_event.set()
                 break
 
     def run_control_step(self) -> None:
+        lock = getattr(self, "_lock", None)
+        if lock is not None:
+            with lock:
+                if (
+                    self._state != SystemState.RUNNING
+                    or self._stop_event.is_set()
+                    or self._pause_event.is_set()
+                ):
+                    return
         rec = self._read_recognition()
         if int(rec.control_period_id) > 0:
             # Record the period before any early return. Otherwise a stale or
@@ -1204,7 +1613,33 @@ class OrchestratorService:
             self._pump_state.q2_actual = float(q2_now)
             self._refresh_pump_channels(communication_ok=True, error="")
         except Exception as e:
+            # A flow readback failure invalidates communication. Never pass
+            # stale q1/q2 values to PID or issue a command from them.
+            self._pump_state.comm_established = False
+            self._pump_state.q1_actual = None
+            self._pump_state.q2_actual = None
+            self._pump_state.last_error = str(e)
+            self._pump_control_enabled = False
+            self._stop_event.set()
+            self._stop_pump_verified("flow readback failure")
+            self._refresh_pump_channels(communication_ok=False, error=str(e))
             self._log(f"[ORCH][WARN] 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤缂嶅﹪寮婚悢鍏尖拻閻庨潧澹婂Σ顔剧磼閻愵剙鍔ゆ繝鈧柆宥呯劦妞ゆ帒鍊归崵鈧柣搴㈠嚬閸欏啫鐣峰畷鍥ь棜閻庯絻鍔嬪Ч妤呮⒑閸︻厼鍔嬮柛銊ョ秺瀹曟劙鎮欓悜妯轰画濠电姴锕ら崯鎵不閼姐倐鍋撳▓鍨灍濠电偛锕顐﹀礃椤旇偐锛滃┑鐐村灦閼归箖鐛崼鐔剁箚闁绘劦浜滈埀顑惧€濆畷銏＄鐎ｎ亜鐎梺鍓茬厛閸嬪棝銆呴崣澶岀瘈闂傚牊渚楅崕鎰版煟閹惧瓨绀冪紒缁樼洴瀹曞崬螖閸愵亶鍞虹紓鍌欒兌婵挳鈥﹂悜钘夎摕闁挎稑瀚▽顏嗙磼鐎ｎ亞浠㈤柍宄邦樀閹宕归锝囧嚒闁诲孩鍑归崳锝夊春閳ь剚銇勯幒鎴姛缂佸娼ч湁婵犲﹤瀚粻鐐淬亜閵忥紕鎳囩€规洏鍔戦、妯衡槈濞嗘劖婢戦梻鍌欒兌缁垶宕濋弴鐑嗗殨闁割偅娲栭悡婵嬫煛閸モ晙绱抽柣鐔煎亰閻撱儵鏌涢弴銊ュ箻闁绘挸顦靛铏规嫚閳ヨ櫕鐏€闂侀€炲苯澧柡瀣帶鍗遍柛顐犲劜閻撳繘鐓崶銉ュ姢缁炬儳娼￠弻娑樜熼崫鍕煘闂佸疇顫夐崹鍧楀箖閳哄懎绠ョ€广儱鎳愭晶锔锯偓瑙勬礃閸ㄥ潡鐛Ο鑲╃＜婵☆垳鍘ч獮妤呮⒒娴ｄ警鏀版繛鍜冪秮瀹曟垿鎮㈤崗鐓庝患闂佹眹鍨婚。浠嬪磻閹炬枼鏋旈柛顭戝枟閻忓秹姊虹紒妯绘儓缂佺粯绻堟俊瀛樼瑹閳ь剙顕ｉ鈧畷鐓庘攽鐎ｎ亝鏆梻鍌欒兌缁垰螞娴ｆ悶鈧帟銇愰幒鎾充缓缂傚倷鐒﹂…鍥╁姬閳ь剟姊哄Ч鍥х伈婵炰匠鍐懃闂傚倷鐒︾€笛兠鸿箛娑樼９婵°倕鎳庨悞鍨亜閹哄秶顦﹂柛銈庡墴閺屾盯骞樼捄鐑樼亪濡ょ姷鍋涢崯顐︼綖濠婂牆鐒垫い鎺嗗亾妞ゆ洩缍佸畷濂稿即閻愭鍚呴梻浣告惈閸熺娀宕戦幘缁樼厸闁稿本顨呮禍楣冩⒒閸屾艾鈧兘鎮為敂閿亾缁楁稑鎳愰惌娆撴煙鐎电袥闁稿鎸搁～婵嬫偂鎼达紕鐫勯柣搴㈩問閸犳绻涙繝鍥モ偓浣肝旀担铏规嚌闂佹悶鍎洪悡鍫ュ疮瀹ュ鈷掑ù锝堟鐢盯鏌涢弮鈧ú鏍敋閿濆閱囬柡鍥╁仧閻涖儱鈹戦埥鍡楃仩闁汇劎鍏樺畷鎴﹀箻閺傘儲鐏侀梺鍓茬厛閸犳鎮橀崼鐔虹瘈闁冲皝鍋撻柛鎰靛枛瀵澘螖閻橀潧浠﹂柛銊ョ仢閻ｇ兘鎮㈢喊杈ㄦ櫖濠殿噯绲介惃鐑藉疾閻樿钃熼柡鍥╁枎缁剁偤鏌涢锝囩畼濞寸姴鍚嬬换娑氣偓娑欘焽閻帞绱掗悩宕囧⒌鐎殿喖顭烽弫鎰緞婵犲嫮鏉告俊鐐€栫敮濠勬媼閺屻儱鍑犳繛鍡楃箚閺€浠嬫煟閹邦剛鎽犻悘蹇ｅ幗閵囧嫰顢橀悩鎻掑箣閻庢鍠栭…宄邦嚕閹绢喖顫呴柣妯款嚙閺佽绻濋悽闈涒枅婵炰匠鍏犳椽濡堕崨顏呯€洪悷婊冪箳濡叉劙骞樼€涙ê顎撻梺鍛婄箓鐎氬懘鏁撻悩宕囧幈濠德板€撶粈渚€鍩㈤弴鐘亾濞堝灝鏋︽い鏇嗗洤鐓″璺号堥弸搴ㄦ煙鐎电啸婵℃彃娲缁樻媴娓氼垳鍔搁梺鍝勭墱閸撴盯宕版繝鍌ゅ悑闁告洦鍘藉Σ鈧梻鍌氬€搁崐宄懊归崶褜娴栭柕濞у懐鐒兼繛鎾村焹閸嬫捇鏌熼銊ュ缁♀偓闂佸憡鍔︽禍鏍绩閾忣偆绡€闁汇垽娼у瓭濠电偛鐪伴崐鏇灻洪崸妤佲拻濞达絽鎲￠崯鐐层€掑顓ф疁鐎规洑鍗冲鍊燁槷闁哄绉归弻鏇㈠醇濠垫劖效闂佹娊鏀遍崹鍧楀蓟閻旂厧绠氶柡澶婃櫇閹剧粯鐓涘〒姘ｅ亾濞存粌鐖煎璇测槈閵忕姈鈺呮煏婢舵稓鐣卞ù鐘虫綑铻栭柣姗€娼ф禒婊堟煕閻曚礁浜伴柟顕€绠栭弫鎾绘偐閼碱剦鍚嬮梻浣瑰劤濞存岸宕戦崱娑樼劦妞ゆ巻鍋撴い顓炲槻铻為柛娑欐儗閺佸啴鏌曡箛濞惧亾閹颁焦袩闂傚倷鑳堕幊鎾绘儍閻戣棄鐤炬繝濠傛噽閻鏌熼悜妯诲暗闂傚嫬瀚伴弻娑樷槈濡垵鐗撻獮蹇撁洪鍛嫼闂佸憡绋戦敃锕傚煡婢舵劖鐓ラ柡鍥崝锕傛煙椤曞棛绡€闁诡喓鍨藉畷妤呮嚃閳轰礁绠炴繝鐢靛Х閺佸憡鎱ㄩ幘顔肩柈闁规鍠氭稉宥夋煟閹邦噮鏆柛瀣尭閳绘捇宕归鐣屼粚婵＄偑鍊栧▔锕傚炊瑜忛崣鈧┑鐘灱閸╂牠宕濋弴顫稏闁告稑鐡ㄩ悡鍐煏婢跺牆鍔氶悽顖滃Х缁辨帡濡搁妷顔惧悑濠殿喖锕ら…宄扮暦閹烘垟鏋庨柟鎼幗琚﹂梻鍌欐祰椤曆呮崲閹寸姵宕查柛顐犲劘閳ь兛绶氬浠嬵敇閻愯尙鐛╂俊鐐€栧濠氭惞鎼粹埗褰掑礋椤栨稈鎷洪梺闈╁瘜閸欌偓婵＄偓鎮傞弻娑㈡偐閹颁焦鐤侀悗瑙勬礃閸ㄥ潡寮幇鏉垮窛妞ゆ劗鍠庢禍楣冩煙閻戞ê鐒炬繛灏栨櫊閺岋綁骞橀搹顐ｅ闯婵炲濮弲鐘差潖閾忚瀚氶柡灞诲劤瀹曨亞绱撴担鍝勑ｉ柟鐟版搐椤曪絾绻濆顓熸珫闂佸憡娲︽禍婵嬪礋閸愵喗鈷戦柛娑橈攻鐎垫瑩鏌涢弴銊ヤ簻闁诲骏绻濆铏规嫚閹绘帩鍔夊銈嗘⒐閻楃姴鐣锋导鏉戝嵆闁绘ɑ褰冮悘濠傗攽閻愬弶顥滄繛瀛樺哺瀹曠敻寮撮姀锛勫幈濡炪倖鍔х徊鍓х矆閳ь剛绱撴担鍝勵€撶紒鎻掑⒔閹广垹鈹戠€ｎ偒妫冨┑鐐村灦閼归箖鍩呴崡鐐╂斀闁绘劙娼х敮鑸点亜閿旇鐏﹂柛鈺冨仱楠炲鏁傞挊澶夋睏闂備礁缍婇。锔剧矆娓氣偓瀵煡鏌嗗鍡忔嫼闂佸憡绺块崕杈ㄧ墡闂備胶绮〃鍫熺箾閳ь剛鈧鍣崑濠傜暦濮椻偓椤㈡瑩宕叉径鍡樻珚闁哄本娲樺鍕醇濠靛牅鐥梻浣筋嚙鐎涒晛顪冮挊澶樻綎婵炲樊浜滅粻浼村箹鏉堝墽鎮奸柣锝夋涧閳规垿鎮欐０婵嗘疂缂備胶濮甸幑鍥极閹扮増鍊烽柛婵嗗瀹撳棝姊洪棃娑㈢崪缂佽鲸娲熷畷銏ゆ偨閸涘ň鎷虹紓鍌欑劍閿氶柣蹇ョ畵閺屻劌顫濋懜鐢靛幗闂佸湱鍎ら弻銊︾閸撗呯＜缂備焦顭囬妴鎺旂磼椤曞懎寮€规洦鍋婂畷鐔碱敃椤愶絿绉甸梻鍌氬€风粈渚€骞栭锕€瀚夋い鎺戝閸庡孩銇勯弽顐粶闁哄嫨鍎甸弻娑㈠即閵娿儳浠╃紓浣插亾闁告劏鏂傛禍婊堢叓閸ャ劍灏伴柛锝堫潐缁绘盯宕ㄩ鑲╀淮闂佸疇顫夐崹鍧楀箖閳哄懎绠涘ù锝呮啞濞呮盯姊绘担鍛婃喐濠殿喚鏁婚幃褔鎮╅崗鍛畾闂佸憡鎸烽懗鍫曟儗濞嗘劗绠鹃柛鈩冪懃娴滃墽绱撳鍛崳缂佽鲸鎹囧畷鎺戔枎閹存繂顬夐梺钘夊暙瀹曨剟鍩為幋锔绘晬婵炴垶鐟ラ崬澶愭⒑閸濆嫮娼ら柛鈩冪懅閺夋悂姊虹憴鍕姢濠⒀冮叄瀵啿鈽夐姀鈾€鎷洪梻渚囧亞閸嬫盯鎳熼娑欐珷妞ゆ洍鍋撻柡灞诲姂瀵挳濡搁妶澶婁粣闁诲孩顔栭崰鏍€﹂悜钘夋瀬闁瑰墽绮崑鎰版煙缂佹ê绗ч柣娑掓櫆娣囧﹪鎮欓鍕ㄥ亾閺嶎厼钃熼柕濠忛檮濞呯姴霉閻樺樊鍎愰柛瀣€搁…鍧楁嚋闂堟稑顫嶉梺鎶芥敱閸ㄥ潡骞冭ぐ鎺戠倞闁挎繂鍊告禍楣冩煣韫囷絽浜濇い鏂垮濮婄粯鎷呯憴鍕哗闂佺瀵掗崹璺虹暦濠靛牅娌柛鎾楀本閿ら柣鐔哥矌婢ф鏁Δ鍛亗闁绘柨鍚嬮悡鐔镐繆椤栨碍鎯堢紒鐙欏洦鐓欓柛蹇曞帶婵鏌嶈閸撴岸顢欓弽顓炵獥婵炴垶菤閺嬫牗绻涢幋鐏活亞绮婇锝勭箚闁绘劦浜滈埀顒佺墱閺侇噣骞掗弬鍝勪壕婵鍘у顕€鏌涢埡鍌滄创妤犵偛顑夐弫鍌滄喆閿濆棗顏瑰┑锛勫亼閸婃牠宕濋幋锕€纾归柡鍥╁枔椤╅攱绻濇繝鍌滃闁绘挾濮电换娑㈡嚑妫版繂娈梺璇查獜缁绘繈寮婚敓鐘插窛妞ゆ挾濮撮悡鐔奉渻閵堝啫鐏柣鈺婂灦楠炲啫鈻庨幋鏂夸壕闁汇垺顔栭悞楣冩偨椤栫偟鐣烘慨濠勭帛閹峰懐鎲撮崟顐″摋闂備胶顭堢€涒晝鍒掗幘宕囨殾婵せ鍋撶€规洩缍佹俊鐤槾闁挎稓鍋炵换婵嗩嚗闁垮绶查柍褜鍓氶〃鍡涘箞閵娾晜鍊婚柦妯侯槺閿涙稑鈹戦悙鏉戠仧闁糕晛瀚板顐﹀礋椤愵偆鍞甸梺鍏兼倐濞佳勬叏閸ヮ剚鐓涢悗锝傛櫇缁愭棃鏌″畝鈧崰鏍箖瑜斿畷濂告偄閸濆嫬娈ュ┑掳鍊楁慨鐑藉磻閹达箑鍨傞柧蹇氼潐瀹曞弶绻涢幋娆忕仼妤犵偑鍨烘穱濠囧Χ閸涱厽鏆樺┑鐘诧工閻楀﹪鎮￠弴銏″€甸柨婵嗛娴滄繈鎮樿箛鏂款棆缂佽鲸甯炵槐鎺懳熼懖鈺冩澖闁诲氦顫夊ú妯兼暜閳╁啩绻嗛柛顐ｆ礀楠炪垺淇婇妶鍛殲鐞氭瑩姊婚崒姘偓鎼佸磹妞嬪孩顐芥慨姗嗗墻閻掔晫鎲搁弮鍫濈畺鐟滄柨鐣烽崡鐐╂瀻闁归偊鍓欑花銉︾節瀵伴攱婢橀埀顒佹礋楠炲繒鈧綆鍠栭弸渚€鏌涢妷顔煎闁绘搫缍侀悡顐﹀炊閵婏箑闉嶉柣鐘冲姧缁辨洟鎯€椤忓牆绠氱憸瀣磻閵忋倖鐓涚€光偓鐎ｎ剙鍩岄柧浼欑秮閺岀喓绮欓幐搴㈠闯閻熸粍濡搁崶銊モ偓鐢告偡濞嗗繐顏紒鈧埀顒勬⒑濞茶澧柕鍫熸倐瀹曟椽鍩€椤掍降浜滈柟鍝勭Ф鐠愪即鏌涢悢椋庣闁哄本鐩幃鈺佺暦閸パ€鎷伴梻浣哄仺閸庤崵绮婚幋锔藉仼闁跨喓濮甸悞浠嬫煥閺囨浜惧┑鐐茬墑閸旀垵顫忓ú顏勬嵍妞ゆ挴鍓濋妤呮⒑閸濄儱校闁绘濞€閺佹劙鎮欓崫鍕獩闁诲孩绋掗…鍥储閽樺鏀芥い鏂款潟娴犳粓鏌涚€ｎ偅灏扮紒缁樼⊕閹峰懘宕橀崣澶嬫倷闂佺粯甯掗悘姘跺Φ閸曨垰绠抽柟瀛樼妇閸嬫捇宕ㄦ繝鍕垫祫闁哄鐗勯崝宥夊矗韫囨挴鏀介柣妯诲絻閺嗙偤鏌曢崶銊х畺濞ｅ洤锕、鏇㈠閻樿櫕顔勯梻浣哥枃濡嫰藝閺夋鐒介煫鍥ㄧ☉閻撴稑霉閿濆棗濡虫い蹇撶墛閳锋帡鏌涚仦鍓ф噯闁稿繐鏈妵鍕敇閻愰潧顣哄銈庡亝缁诲牓寮崘顔肩劦妞ゆ帒瀚悡婵堚偓骞垮劚椤︻垶宕￠幎鑺ョ厽婵☆垰鍚嬮弳鈺呮煟閹烘垶鍋ユ慨濠冩そ瀹曠兘顢橀悙鎻掝瀱闂備浇顫夐幃鍌滅不閺嵮屾綎濞寸姴顑呯粈瀣亜閺嶃劎銆掗柛妯哄船閳规垿鎮欓弶鎴犱桓闂佸疇妫勯ˇ闈涚暦婵傜唯闁靛／灞芥暩濠电姷鏁搁崑娑樜熸繝鍐洸婵犻潧顑呴悡鏇㈡煙鏉堥箖妾柣鎾跺Т閳规垿顢欓挊澶婎潓闂侀€炲苯澧繛鑼枎椤曪綁骞栨担鍝ヮ吅闂佺粯鍔楅弫鎼佹儊閸儲鈷戦梻鍫熺〒缁犳岸鏌涢埡鍌ゆ疁妞ゃ垺妫冨畷鐔碱敃閵堝啫浜介梻鍌氬€搁崐鐑芥嚄閸洖鍌ㄧ憸鏃堟晲閻愬搫鍗抽柕蹇曞Х閿涙瑥鈹戞幊閸婃洟宕位澶婎潩閼哥數鍘介梺鎸庣箓閹冲酣藝椤掑嫭鐓曢悗锝庡亝瀹曞矂鏌ｅ☉鍗炴珝鐎规洖缍婇、娆撴偂鎼搭喗缍撻梻鍌氬€风粈浣虹礊婵犲洤缁╅梺顒€绉撮崹鍌炴煕椤垵娅橀柛銈嗘礋閺屾洘绻涜鐎氼剟鎮垫导瀛樷拺婵炶尪顕ф禍浠嬫煕閹惧鎳囬柡灞斤躬閺佹劙宕ㄩ娑欘啎闂備浇顕栭崹鍫曞磻婵犲偆鐎舵い蹇撶墛閳锋帒鈹戦悩鏌ヮ€楀褍顭烽弻娑㈠箻鐠虹儤鐏堥悗娈垮枛椤兘骞冮姀銏犳瀳閺夊牄鍔嶅▍鎾绘⒒娴ｉ涓茬紒韫矙閹绺介崨濠備簵闂佺鏈划搴ｅ閽樺鈧帒顫濋浣规倷闂佸搫顑冮崐婵嬪蓟閳╁啯濯撮悷娆忓閳ь剚鍔欓弻娑㈠煘閹傚濠碉紕鍋戦崐鏍暜閹烘鏅濋柨鏂垮⒔閻捇鏌ｉ姀鐘冲暈闁绘挻娲熼幃妤呮晲鎼存繄鍑归梺闈╃到缂嶅﹪寮诲鍥ㄥ珰闁肩⒈鍎疯閳ь剚顔栭崰鏇犲垝濞嗘劒绻嗘慨婵嗙焾濡查箖姊烘导娆戠暠闁绘鎸搁～蹇涘传閸曟嚪鍥х倞鐟滃繑瀵奸崼婵冩斀闁绘劖婢樼亸鍐煕閹板吀绨奸柟鍐插暣濮婂宕掑顑藉亾閻戣姤鍊块柨鏃堟暜閸嬫挾绮☉妯哄箻濡わ箒娉曢悿鈧┑鐐村灦椤洭鏁嶅▎蹇婃斀闁绘绮☉褎銇勯幋婵囨悙闁伙絽鐏氱粭鐔煎焵椤掑嫭鍋傛い鎰剁畱閻愬﹪鏌曟繝蹇擃洭闁挎稒娲熷铏圭矙濞嗘儳鍓遍梺鍦嚀濞差厼顕ｉ锕€绠涙い鎾跺枎閸斿懎鈹戦埥鍡楃仴婵℃ぜ鍔嶇粩鐔煎即閻戝棙瀵岄梺闈涚墕濡瑧浜搁鍫熺厱闁哄倸娼￠崣鍕偓瑙勬礃绾板秶鈧絻鍋愰埀顒佺⊕椤洭宕㈡禒瀣拺闁圭娴风粻鎾剁磼缂佹ê绗х€殿啫鍥х劦妞ゆ巻鍋撻摶鏍煟濮椻偓濞佳勭濠婂懐纾煎璺猴功缁夌儤顨ラ悙瀵稿⒊闁靛洦鍔欓獮鎺戔攽閸ャ劍鐝栭梻鍌欑劍鐎笛呮崲閸屾娑樷枎閹寸儐鍋ㄥ銈嗗姧闂勫嫰鍩涢幒妤佺厱閻忕偞宕樻竟姗€鏌嶈閸撴盯宕楀鈧獮濠偽旈崨顓狀槶婵炶揪绲块…鍫ユ倶婵犲偆娓婚柕鍫濇婢ч亶鏌涚€ｎ偆銆掔紒顔肩墛瀵板嫮鈧綆鍋勫鍨攽閿涘嫬浠╂い鏇嗗嫮顩插Δ锝呭暞閸婄敻鎮峰▎蹇擃仾缂佲偓閸愨晙绻嗛柣鎰煐椤ュ銇勯弴顏嗙ɑ缂佸倹甯為埀顒婄到閻忔岸寮查悙鐑樷拺闁告稑锕﹂幊鈧梺绋垮閻擄繝骞嗛崼锝囩杸婵炴垶鐟ч崢浠嬫⒑缂佹ɑ鐓ラ柟鑺ョ矒閹本绻濋崟顓狅紲缂傚倷鐒﹂敋缂佹甯″畷锟犳焼瀹ュ棛鍘甸梺缁橆殔閻楀﹦娆㈤懠顒傜＜闁绘ê妯婇悡濂告煛瀹€鈧崰鎰版晬閹邦厽濯村〒姘煎灡琚﹂梻鍌欐祰椤曟牠宕板Δ鍛瀭闁告挷鐒﹀畷鍙夌箾閹寸偟鎳勭紓宥呮喘閺屾盯骞樺Δ鈧幉娑橆煥閸啿鎷洪梺鍛婄箓鐎氼參宕抽崷顓涘亾濞堝灝鏋涘褍娴烽崚鎺楀煛閸涱喖浜滈梺缁樻尭妤犵鐣甸崱娑欌拺缂備焦锚婵偓闂佸搫鎳忕划鎾愁嚕椤掑嫬鐒垫い鎺戝閳锋帒霉閿濆牊顏犻悽顖涚洴閺屻劌顫濋懜鐢靛幗闂婎偄娲﹂弻銊╁传閾忓厜鍋撳▓鍨灍濠电偛锕畷娲晸閻樻彃绐涘銈嗘⒐閸庢娊鐛崼銉︹拺閻犲洦褰冮崵杈╃磽瀹ュ懏顥㈢€规洘鍨垮畷鍗烆渻閺囩喐銇濇鐐达耿椤㈡瑩鎸婃径灞绢€嶅┑鐘垫暩婵炩偓婵炰匠鍥舵晞闁糕剝绋掗崑鍌涚箾閹寸儑渚涢柣鏂挎閹娼幏宀婂妳闂佺瀛╃划搴ｆ閹烘绠ュù锝堫潐閻濇洜绱撴担铏瑰笡缂佸鍨块、娆掔疀濞戣鲸鏅╅梺鐓庮潟閸婃洟宕甸鍕拻濞达絼璀﹂悞鐐亜閹存繃鍣介柍褜鍓氶崙褰掑礈閻旂厧鏄ラ柣鎰惈缁狅綁鏌ㄩ弴妤€浜剧紒鐐劤閸氬骞堥妸銉庣喖宕崟顒€鈧垳绱掑Δ浣哥仸缂佺粯绻堥幃浠嬫濞戞鎹曢梻浣虹帛椤ㄥ懐鈧碍婢橀悾宄扳攽閸℃瑦娈曢梺鍛婃磸閸斿宕戦幘璇茬睄闁割偅绻勯ˇ銊ヮ渻閵堝棙鐓ユ俊鎻掔墣椤﹀綊鏌＄仦鍓ф创闁糕晛瀚板畷姗€鎮欓鍌涙闂佽崵鍋炵粙鏍磻閹邦喗顫曢柟鎹愵嚙绾惧吋绻涢崱妯虹瑨闁告ǚ鍓濈换婵嗏枔閸喗鐏撻梺杞版祰椤曆囨偩閻ゎ垬浜归柟鐑樻惄濡啫鈹戦悙瀵告殬闁搞劌鎼—鍐寠婢跺本娈剧紓浣割儓椤曟娊寮埀顒勫箯閸涙潙鐭楀璺侯煬娴兼粌鈹戦悩鍨毄闁稿濞€楠炴捇顢旈崱娆戭槸闂侀€炲苯澧柕鍥у椤㈡洟濮€閳哄倵鏋呴柣搴ゎ潐濞叉﹢宕归崸妤€绠栭柍鍝勫暟绾惧吋淇婇婊冨付妤犵偛鐗撳娲偡閺夋寧鍊梺璇″灠閻倸鐣锋导鏉戝唨鐟滃寮稿鍥ｅ亾楠炲灝鍔氭繛鑼█瀹曟垿骞橀弬銉︾亖闂佸壊鐓堥崰妤呮倶瀹ュ鍋℃繝濠傚缁舵煡鏌涢悢鍛婂唉鐎规洘妞介幃娆撳传閸曨収鍚呴梻浣虹帛閿曗晠宕戦崟顒傤洸濡わ絽鍟悡銉︾節闂堟稒顥㈡い搴㈩殔闇夋繝濠傚缁犳牜绱掔紒妯兼创鐎规洏鍔戦、娆撳箚瑜夐崥鍌炴⒒娴ｅ摜鏋冩い顐㈩樀瀹曞綊宕稿Δ鈧粻鏍煃閸濆嫬鏆熺痪鎯у悑娣囧﹪顢涘鑲╁悑闂佽桨绶℃禍婵囩┍婵犲洦鍊锋い蹇撳閸嬫捇寮介鐐茬€梻鍌氱墛閸忔艾鈽夊Ο閿嬫杸闁诲函缍嗘禍婵單ｉ鈧埞鎴︽倷閺夋垹浠ч梺鎼炲妼濠€杈╁垝婵犳碍鏅插璺侯儑閸欏棝姊洪崫鍕殭婵炶绠撹棢濠㈣泛鈯曡ぐ鎺撳亼闁逞屽墴瀹曘垺绺界粙璺ㄥ幋闂佺鎻梽鍕磹閻戣姤鐓曟繛鍡楁禋濡牊淇婇銈呬户缂佽鲸鎸婚幏鍛存惞閻熸壆顐奸梻浣告啞濮婂綊鎮烽埡鍛ュ〒姘ｅ亾鐎殿噮鍣ｅ畷鐓庘攽閸繂绠伴梻鍌欑閹测剝绗熷Δ鍛獥婵娉涢崒銊╂⒑椤掆偓缁夌敻鍩涢幋锔界厱婵犻潧妫楅鈺呮煃瑜滈崗娑氬垝濞嗘挶鈧礁顫濋幇浣光枌闂備胶纭堕弬渚€宕戦幘鎰佹富闁靛牆妫楃粭鍌滅磼閸ㄦ稈鍋撻弬銉︾亖濠电姴锕ら悧濠囨偂濞嗘劑浜滈柡宥庣厛濞堟柨霉濠婂懎浜惧ǎ鍥э躬閹瑩顢旈崟銊ヤ壕闁哄洨濮靛畷鏌ユ煙闁箑鍔︽繛鎴炃氬Σ鍫熸叏濮楀棗澧绘俊顐ｇ矋缁绘繈妫冨☉妯峰亾閹间礁绠熼柨鐔哄У閸嬪倿鐓崶銊с€掗柛娆愭崌閺屾盯濡烽敐鍛瀴缂備讲鍋撻柍褜鍓熼幃妤€鈽夊▎鎴犵暭缂備浇椴搁幐鑽ょ箔閻旂厧鐐婄憸宀€鑺遍懡銈囩＝濞达絽澹婂Σ鐑樸亜閵夛箑濮嶉柟顔斤耿瀹曟﹢顢欑憴锝嗗缂傚倸鍊烽悞锕傛晝椤愶附鍤€闁圭娴风粻鎯归敐鍛毐閻庢凹鍣ｉ妴鍛存倻閼恒儳鍙嗛梺鍝勫€归娆忣焽閻旇鐟邦煥閸曨厾鐓夐梺鍝勬湰濞叉鎹㈠☉銏犲瀭妞ゆ梻鍘у暩闂傚倸鍊搁…顒勫礈閿曞倸绀堟慨妯跨堪閳ь剙鍟存俊鐑藉煛閸屾埃鍋撻悜鑺ョ厵缂備焦锚缁楁碍绻涢崼婵愮吋婵﹨娅ｉ崠鏍即閻斿摜褰ｇ紓鍌欒兌缁垳鎹㈤崒鐐村仼鐎瑰嫰鍋婂銊╂煃瑜滈崜鐔煎Υ娓氣偓瀵噣宕煎┑鍡氣偓鍨渻閵堝棙灏靛┑顔碱嚟閼洪亶濡烽敂鍓х槇闂佹眹鍨藉褍鏆╂俊鐐€х紞鈧俊顐㈠瀹撳嫰姊洪崨濠勨姇婵炲吋鐟╁畷褰掑磼閻愬鍘甸梺璇″灣婢ф藟婢舵劖鐓曢悘鐐额嚙婵″潡鏌熼崣澶嬪€愮€殿噮鍣ｅ畷濂告偄閾氬倻閽? {e}")
+
+        if not self._pump_state.comm_established:
+            reason = f"pump flow readback failed: {self._pump_state.last_error or 'communication invalid'}"
+            ctrl = ControlSnapshot(
+                diameter_error=0.0,
+                adjustment=0.0,
+                q1_command=self._pump_state.q1,
+                q2_command=self._pump_state.q2,
+                freeze_feedback=True,
+                suggested_stop=True,
+                reason=reason,
+                timestamp=now,
+            )
+            self._update_control_snapshot(ctrl)
+            self._set_state(SystemState.ERROR, error=reason)
+            return
 
         vm = VisionMetrics(
             avg_diameter=float(current_avg_diameter),
@@ -1249,7 +1684,7 @@ class OrchestratorService:
             control_jitter_ms=jitter_ms,
             pump_response_delay_ms=float(getattr(disturbance_sample, "pump_response_delay_ms", 0.0) or 0.0),
         )
-        cmd = run_feedback_step(pid_input)
+        cmd = self._pid_controller.update_input(pid_input)
         if int(rec.frame_id) > 0:
             self._last_control_frame_id = int(rec.frame_id)
             self._last_control_period_id = int(rec.control_period_id)
@@ -1292,9 +1727,11 @@ class OrchestratorService:
             return
 
         if cmd.suggested_stop:
-            self.pump_service.stop_system_and_verify()
-            self._pump_state.running = False
-            self._refresh_pump_channels(communication_ok=True, error="")
+            self._pump_control_enabled = False
+            self._stop_event.set()
+            stop_ok, stop_reason = self._stop_pump_verified("PID suggested stop")
+            if not stop_ok:
+                ctrl.reason = f"{ctrl.reason}; pump stop verification failed: {stop_reason}"
             self._update_control_snapshot(ctrl)
             self._set_state(SystemState.ERROR, error=ctrl.reason or "PID suggested stop")
             return
@@ -1317,17 +1754,13 @@ class OrchestratorService:
             f"q1={cmd.q1:.6f}, q2={cmd.q2:.6f}, adj={cmd.adjustment:.6f} "
             f"adaptive_reason={cmd.adaptive_reason}"
         )
-        update_res = self.pump_service.update_flow_while_running(float(cmd.q1), float(cmd.q2))
-        if (
-            (not update_res.ok)
-            and bool(update_res.still_running)
-            and not bool(update_res.q1_ok)
-            and not bool(update_res.q2_ok)
-        ):
-            # A channel that already passed readback must not be rewritten.
-            # CH2-only loss is recovered inside PumpHardwareService; repeat the
-            # whole transaction only when neither channel was accepted.
-            update_res = self.pump_service.update_flow_while_running(float(cmd.q1), float(cmd.q2))
+        with self._lock:
+            if self._state != SystemState.RUNNING or self._stop_event.is_set() or self._pause_event.is_set():
+                return
+            generation = self._lifecycle_generation
+        update_res = self._update_flow_with_lifecycle_guard(cmd.q1, cmd.q2, generation)
+        if update_res is None:
+            return
 
         if not update_res.ok:
             self._pump_state.last_update_ok = False
@@ -1336,13 +1769,35 @@ class OrchestratorService:
             self._refresh_pump_channels(communication_ok=False, error=self._pump_state.last_update_reason)
             ctrl.reason = self._pump_state.last_update_reason
             if not update_res.still_running:
+                # A pump known stopped may be recovered only through the
+                # verified start path; failed recovery enters ERROR.
                 resumed, resume_reason = self._try_resume_infusion("flow update left pump not running")
                 if resumed:
                     ctrl.freeze_feedback = True
                     ctrl.reason = f"{ctrl.reason}; infusion resumed, no new command this cycle"
                     self._log(f"[PID][FREEZE] {ctrl.reason}")
                 else:
+                    stop_ok, stop_reason = self._stop_pump_verified("flow update failure")
+                    failure_reason = self._pump_state.last_update_reason
+                    if not stop_ok:
+                        failure_reason = f"{failure_reason}; pump stop verification failed: {stop_reason}"
+                    self._pump_state.last_error = failure_reason
+                    self._refresh_pump_channels(communication_ok=False, error=failure_reason)
+                    self._pump_control_enabled = False
+                    self._stop_event.set()
                     self._set_state(SystemState.ERROR, error=f"闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤缂嶅﹪寮婚悢鍏尖拻閻庨潧澹婂Σ顔剧磼閻愵剙鍔ょ紓宥咃躬瀵鎮㈤崗灏栨嫽闁诲酣娼ф竟濠偽ｉ鍓х＜闁诡垎鍐ｆ寖闂佺娅曢幑鍥灳閺冨牆绀冩い蹇庣娴滈箖鏌ㄥ┑鍡欏嚬缂併劌銈搁弻鐔兼儌閸濄儳袦闂佸搫鐭夌紞渚€銆佸鈧幃娆撳箹椤撶噥妫ч梻鍌欑窔濞佳兾涘▎鎴炴殰闁圭儤顨愮紞鏍ㄧ節闂堟侗鍎愰柡鍛叀閺屾稑鈽夐崡鐐差潻濡炪們鍎查懝楣冨煘閹寸偛绠犻梺绋匡攻椤ㄥ棝骞堥妸鈺傚€婚柦妯侯槺閿涙稑鈹戦悙鏉戠亶闁瑰磭鍋ゅ畷鍫曨敆娴ｉ晲缂撶紓鍌欑椤戝棛鈧瑳鍥ㄥ€垫い鎺戝閳锋垿鏌ｉ悢鍛婄凡闁抽攱姊荤槐鎺楊敋閸涱厾浠搁悗瑙勬礃閸ㄥ潡鐛崶顒佸亱闁割偁鍨归獮鍫ユ⒒娴ｅ摜绉洪柛瀣躬瀹曞綊骞嶉绛嬫綗闂佹寧娲栭崐褰掓偂閻斿吋鐓忛煫鍥ㄦ礀椤庡矂鏌ｉ幘鍐叉倯闁逛究鍔嶇换婵嬪礋椤撶偟顐肩紓鍌欑劍椤ㄥ牓宕伴弽顓炴槬闁逞屽墯閵囧嫰骞掗崱妞惧婵＄偑鍊ら崢鐓幟洪埡鍚藉洩銇愰幒鎾崇檮濠电娀娼уú銏＄濠婂牊鐓欓柡澶婄仢椤ｆ娊鏌ｉ敐澶夋喚闁哄矉缍佹俊鍫曞炊瑜屾竟鏇犵磽娴ｈ櫣甯涢柣鈺婂灦閻涱喚鈧綆鍠楅崐鐑芥偣鏉炴媽顒熸俊顐ゅ枑娣囧﹪鎮欓鍕ㄥ亾閹达箑纾块柟缁樺笧閺嗗棝鏌熼梻瀵割槮闁藉啰鍠愮换娑㈠箣濞嗗繒浠鹃梺鍝勬噺缁捇骞冭ぐ鎺戠倞闁靛鍎崇粊椋庣磽娴ｅ搫校婵＄偠妫勯～蹇撁洪鍕炊闂侀潧顦崕娑㈡晲婢跺鍘遍梺鍝勫暊閸嬫捇鏌ｉ悢鍙夋珔妞ゆ洩绲剧换婵嗩潩椤撶喐鐝抽梻浣告啞缁嬫垿宕愰悷鎷旀盯宕橀鍏兼К闂侀€炲苯澧柕鍥у楠炴帡骞嬪┑鎰棯闂備胶顭堥鍛搭敄婢舵劕钃熸繛鎴欏灩閻掓椽鏌涢幇鍏哥凹闁革綆鍠氱槐鎾存媴閸濆嫅锝嗕繆椤愩垹鏆ｇ€殿喖顭烽幃銏ゅ礂閻撳簶鍋撶紒妯圭箚妞ゆ牗绻嶉崵娆撴⒒婢跺﹦效婵﹥妞藉畷銊︾節閸曨剙娅戠紓鍌欒兌缁垶鏁冮姀銈囧祦闁告劑鍔庨弳瀣煙娴ｅ啯鐝柣搴☆煼濡懘顢曢姀鈥愁槱闂佺懓鐨烽弲婊呪偓闈涖偢閸┾偓妞ゆ帒瀚埛鎺懨归敐鍛暈闁哥喓鍋ら弻锝夋偄閺夋垹浼堥悗瑙勬礃閸ㄥ潡鐛Ο鑲╃＜婵☆垶鏀辩€氳棄鈹戦悙鑸靛涧缂佽弓绮欓獮澶愭晸閻樿尙鐣鹃梺鍓插亖閸庢煡鎮￠悢鎼炰簻闁规崘娉涢崜杈ㄤ繆閼艰埖顏犵紒杈ㄥ笚濞煎繘鍩℃担閿嬪媰闂備胶鎳撻崲鏌ュ箠濡櫣鏆︽繝濠傜墕缁犵敻鏌熼悜妯绘儎闁告碍鐟ラ埞鎴︽晬閸曨偂鏉梺绋匡攻閻楁洜鍙呴悗骞垮劚椤︻垳澹曟繝姘厵闁诡垎鍛偗闂佺顑嗛幐楣冨箟閹绢喖绀嬫い鎺戝亞濡蹭即姊哄Ч鍥х労闁搞劏浜弫顕€鏁撻悩铏珳闂佺粯鍔栫粊鎾绩娴犲鍊甸柨婵嗘噽娴犳盯鏌￠崨顖氫槐闁哄矉缍侀幃鈺呭礂閸涙澘鐒婚梻浣告啞閺屻劑鎯夐懖鈺佸灊妞ゆ挶鍨洪弲鎼佹煟濡粯鐏遍柟宄邦煼濮婅櫣绮欓幐搴㈡嫳闂佺厧缍婄粻鏍春閳ь剚銇勯幒鎴濐伌婵☆偅鍨圭槐鎺楊敊閼测晛顤€缂備焦顨堥崰鏍春閳ь剚銇勯幒鎴濐伀鐎规挷绀侀…鍧楁嚋闂堟稑顫嶉梺鍝勬噺閹倿寮婚敐鍜佹建闁糕剝顨嗛悘鈧梻浣侯焾椤戝棝骞戦崶褏鏆︽慨妞诲亾妞ゃ垺鐟╅幃鈩冩償閵堝倸浜鹃柛顭戝枓閺€浠嬫煃閽樺顥滈柣蹇嬪劦閺屾稓鈧綆鍋勬慨宥嗐亜閵忥紕鎳囩€殿喗鎸抽幃銏ゆ惞閸︻厽顫岄梻鍌欑劍閻綊宕归挊澶樼劷鐟滃秹鎮洪鐔虹瘈闁汇垽娼ф禒婊堟煟椤忓啫宓嗙€规洘鍔曡灃闁告劑鍔岄悘濠冪節閻㈤潧校闁煎綊绠栧畷姗€鍩€椤掑嫭鈷戦梻鍫熶緱閻掗箖鏌涙繝鍐炬畼缂侇喛顕ч～婵嬫嚋绾版ɑ瀚奸梻鍌氬€搁悧濠勭矙閹惧瓨娅犻柡鍥ュ灪閻撴洖鈹戦悩鎻掆偓褰掑疮閻愮數纾奸柛灞炬皑鏍￠梺闈涚墳缂嶄礁鐣峰鈧崺鐐烘倷椤掆偓椤忓綊姊绘担绛嬪殭濡ょ姷顭堥敃銏℃綇閵婏箑寮块梺姹囧灪濞煎本寰勭€ｎ亞绐為柣搴祷閸斿鑺辨繝姘拺闁圭瀛╅ˉ鍡樸亜閺囧棗娲﹂崐鍫曟煥閺囩偛鈧綊鎮￠弴銏＄厓闁荤喐澹嗘禒銏ゆ煟韫囧﹥娅嗛柕鍥у楠炴﹢宕橀崣澶娾偓顖炴倵閸偅绶查悗姘煎櫍閸┾偓妞ゆ帒锕︾粔鐢告煕鐎ｎ亜顏€规洘绻堥獮鎺楀箻閼碱剛鐣鹃梻浣虹帛閸旓附绂嶅鍫濈劦妞ゆ帊鑳舵晶鐢碘偓瑙勬礃缁诲牓鐛€ｎ喗鏅濋柍褜鍓熷畷褰掑磼濠婂懐锛濇繛杈剧到椤牠顢旈崼顐ｆ櫔闁哄鐗冮弬渚€宕戦幘璇茬濠㈣泛锕ｆ竟鏇㈡⒒娴ｅ憡鍟炴繛璇х畵瀹曟顫滈埀顒勭嵁韫囨拋娲敂閸涱垰骞楅梻浣虹帛閿氱€殿喖澧庣划鍫濈暆閸曨剛鍘撻悷婊勭矒瀹曟粌鈹戦崱蹇旂€洪梺鍝勬储閸ㄦ椽宕戦悢鎼炰簻闁哄秲鍔庨惌宀€鐥幑鎰棄闂囧鏌ㄥ┑鍡欏妞ゅ繒濞€閹粙顢涘☉姘モ偓鎺旂磼鏉堛劌绗ч柟椋庡█閹崇娀顢楅埀顒勩€傚ú顏呪拺濞村吋鐟ч崚浼存煕閵忥絽鐨洪柛娆忔噹椤啴濡堕崨顖滎唶闁诲孩鍑归崳锝呯暦濠靛鏅濋柍褜鍓熼垾鏃堝礃椤斿槈褔鏌涢埄鍐炬畼闁荤喐鍔欏濠氬磼濮橆剦浠肩紓浣割槺閺佸摜鍒掔€ｎ亶鍚嬮柛婊€鑳堕崣鍡涙⒑閸撴彃浜為柛鐘虫崌瀹曘垽鎮介崨濞炬嫼缂傚倷鐒﹂敋闁诲骏绠撻弻銊ヮ潩閼哥數鍘介棅顐㈡搐椤戝懘宕濆鍫熺厪闁搞儜鍐句紓缂備胶濮甸惄顖炲极閹版澘绀嬫い鏍ㄧ煯缁綁姊婚崒娆戭槮闁圭⒈鍋婇幊鐔碱敍濠婂懐鐓嬮悷婊呭鐢帡鎷戦悢鍏肩厪濠电倯鈧崑鎾绘煕鐎ｎ偅宕岄柡浣瑰姈閹柨鈹戦崼鐔告婵犵數鍋涢顓㈠储瑜旈幆宀勫磼濮樺吋缍庡┑鐐叉▕娴滄粍瀵奸悩缁樼厱闁哄洢鍔屾晶顖炴煙閻ゎ垯鍚紒杈ㄦ尰閹峰懘宕滈幓鎺戝闂備焦鎮堕崝灞筋焽閳ュ磭鏆︽繛宸簻鍞梺鎸庢磵閸嬫挾绱掗崜浣镐粶闁宠鍨块幃鈺呭箵閹烘繂濡烽柣搴ｅ仯閸婃牕顪冮挊澶樻綎婵炲樊浜滅粈鍫ユ煙缂佹ê绗傜紒銊︽尦濮婅櫣绮欓崹顕呭妷婵犵數鍋涢敃銈夋偩閻戣姤鏅查柛婊€绀侀幃鎴︽⒑閸涘﹣绶卞ù婊勭箞瀵剟鍩€椤掑嫭鈷掑ù锝堟鐢盯鏌ㄩ弴妤佹珚鐎规洑鍗冲浠嬵敇閻斿皝鍋撻崼鏇炵骇闁割偅绋戞俊绋棵瑰鍕煁闁靛洤瀚伴獮鍥煛娴ｅ搫濮舵繝纰樺墲瑜板啴濡堕幖浣歌摕闁绘棁娅ｆす鎶芥倵閿濆簼绨风紒銊ф櫕缁辨挻鎷呮禒瀣懙闂佸湱顭堥…鐑界嵁韫囨稑宸濋悗娑櫳戦崕顏堟⒑閼姐倕鏋戝鐟版椤㈡洘绺介崨濞炬嫽婵炶揪绲介幖顐﹀礉閿曞倹鐓涢柛娑变簼濞呭﹦鈧娲栫紞濠傜暦婵傜鍗抽柣鏃囨腹缁勪繆閻愵亜鈧牕顫忔繝姘厱闁割偅绻嶉悞浠嬫煏婵炵偓娅嗛柣鎾冲暟閹茬顭ㄩ崼婵堫槶闂佺粯姊婚崢褑绻氬┑鐐舵彧缁茶法娑甸崼鏇炲嚑閹兼番鍔嶉悡娆撴煟閹伴潧澧紓宥嗗灦缁绘盯宕奸姀鐘崇亪濠殿喖锕ュ钘壩涢崘銊㈡閺夊牜鐓堥埀顒€妫濆濠氬磼濮橆剦浠奸柣搴㈢煯閸楁娊濡存担绯曟瀻闁圭儤姊婚弶鎼佹⒑閸濆嫭宸濆┑顔惧厴閺佸秴鈹戠€ｎ偀鎷虹紓浣割儐鐎笛冿耿娴煎瓨鐓犵憸鐗堝笧閻ｆ椽鏌涢埞鎯т壕婵＄偑鍊栫敮鎺斺偓姘槻铻為柟瀵稿Х绾惧吋銇勯弮鍥т汗濠⒀勭〒缁辨帒螖閸愩劍鐏堥梺绯曟杹閸嬫挸顪冮妶鍡楀潑闁稿鎹囬弻锝夋晲閸パ冨箣濡ょ姷鍋涘ú顓烆嚕閼搁潧绶為柛婵勫劤閸婄偤姊婚崒娆戠獢婵炰匠鍥ㄦ櫖闊洦绋戝婵囥亜閺嶃劏澹橀柤鎼灦濮婂宕掑顑藉亾瀹勬噴褰掑炊瑜忛弳锕傛煟閵忋埄鐒剧紒鎰殜閺屸€愁吋鎼粹€崇缂佺偓宕橀褔鍩為幋锔藉亹闁告瑥顦伴幃娆撴⒑閸涘﹨澹樼紓宥咃躬瀵鏁撻悩鑼€為梺闈涱槶閸庤櫕绂掓ィ鍐┾拺缂備焦蓱鐏忕増绻涢崣澶涜€垮┑锛勬暬瀹曠喖顢涘杈╂澑闂備礁鎲￠幐鐑芥嚄閹増鎳岀紓鍌氬€搁崐椋庢媼閺屻儱纾婚柟鍓х帛閻撳啰鎲稿鍫濈婵炴垶纰嶉～鏇㈡煙閹呮憼濠殿垱鎸抽弻娑樷攽閸℃浼岄梺閫炲苯澧柟绋垮⒔濡叉劙骞橀幇浣告倯闂佸憡娲﹂崢楣冩偘閵忋倖鍊垫繛鍫濈仢閺嬫稒銇勯鐘插幋鐎殿噮鍋婇獮妯肩磼濡桨姹楅梻浣藉亹閳峰牓宕滈敃鈧嵄濞寸厧鐡ㄩ埛鎺懨归敐鍥ㄥ殌妞ゆ洘绮庣槐鎺旀嫚閹绘巻鍋撻崸妤冨祦濠电姴鍋嗛崥瀣煕閳╁啰鎳呯憸浼寸畺濮婃椽宕崟顒€鍋嶉梺鎼炲妽濡炰粙宕哄☉銏犵闁圭偨鍔岀紞濠囧极閹版澘鐐婇柍鍝勫€归崯鎺楁⒒娴ｈ鍋犻柛濠冪墵閹柉顦存俊鍙夊姍楠炴帡寮崒婊愮床婵犵妲呴崹浼村箹椤愶讣缍栭柟鐑橆殕閸婄敻鎮峰▎蹇擃仾濠㈣泛瀚伴弻娑㈠Ω閵婏妇銆愬銈嗘穿缂嶄礁鐣锋總绋垮嵆闁绘劖顔栭崥鍛繆閻愵亜鈧牠骞愭ィ鍐ㄧ獥闁规儳澧庨惌娆徝归敐鍛础缂佲檧鍋撻梻浣圭湽閸ㄨ棄顭囪缁傛帒顭ㄩ崟顏嗙畾濡炪倖鐗楅悢顒勫绩閼姐倗纾奸柛灞炬皑瀛濋梺瀹狀潐閸ㄥ綊鍩€椤掑﹦鍒板Δ鐘虫倐钘濋梻鍫熺〒閺嗭箑鈹戦崒姘暈闁稿瀚伴弻褑绠涘鐓庢異闂佸摜鍠庣€涒晝鎹㈠┑瀣仺闂傚牊绋戞竟瀣磽閸屾氨孝婵☆偅绻傞悾宄邦煥閸愶絾鐎婚梺瑙勫劤绾绢參宕濋敃鈧—鍐Χ閸℃鐟愰梺鐓庣枃閸╂牠寮查崼鏇熷仺闁告稑锕﹂崢闈涱渻閵堝棛澧柤褰掔畺椤㈡棃顢橀悢缈犵盎闂侀潧楠忕槐鏇㈠煡婢跺浜滄い鎰剁悼缁犳牗绻涢悡搴ｇ濠碘剝鎮傞弫鍌滄嫚閸欏鐝繝鐢靛Х閺佸憡鎱ㄩ悽鍓叉晩闁哄稁鍘肩粣妤佷繆閵堝懏鍣瑰鍛攽閻愭潙鐏熼柛銊ユ贡婢规洘绻濆顓犲幍闂佽鍨庨崨顒勫仐闂備胶顭堥鍡涘箰妤ｅ啫绠熼柟缁㈠枛缁€瀣亜閹烘垵浜炴俊鑼娣囧﹪鎮欓鍕ㄥ亾閵堝鍌ㄩ柣鎾崇瘍濞差亶鏁囬柕蹇嬪灩缁侊箓姊虹涵鍛涧缂佺姵鍨圭划鍫⑩偓锝庡亖娴滄粓鏌″搴ｅ帥闁搞們鍊濋弻宥夊传閸曨偅娈查梺鍝ュУ閸旀瑩鐛弽顐㈠灊閻熸瑥瀚烽埀顒€妫濋弻锛勨偓锝庡亝閻撱儵鏌嶇憴鍕伌鐎规洘甯掗～婵嬵敇閻愬瓨鐣奸梻鍌欑劍婵炲﹪寮ㄦ潏鈺傛殰闁圭儤顨嗙粻鎺楁⒒娴ｇ懓顕滅紒璇插€块獮濠呯疀濞戞鏌堥梺缁樺姉閸庛倝鎮″▎鎰╀簻闁哄秲鍔嶉惃鎴濐熆瑜濈粻鎾诲蓟閳ュ磭鏆嗛悗锝庡墰琚︽俊鐐€戦崹娲€冩繝鍥ф槬闁逞屽墯閵囧嫰骞掗幋婵愪患闁搞儱顕槐鎾存媴閸撴彃鍓靛┑鐐差槹濞茬喎顕ｉ幎鑺ユ櫇闁逞屽墴濠€渚€姊虹粙璺ㄧ闁告艾顑囩槐鐐哄箣閿旂晫鍘遍梺纭呭焽閸斿本绂嶉幆褉鏀介柨娑樺娴滃ジ鏌涙繝鍐⒌妤犵偞鍔楃槐鎺懳熼懖鈺侀獎闂備礁鎼ú銏ゅ垂閸︻厼顥氬┑鐘崇閻撴瑩鏌熼鍡楄嫰濞堝爼姊洪懡銈呮瀻缂傚秴锕璇差吋閸偅顎囬梻浣告啞閹稿鎮烽埡鍛偓浣割潩閼稿灚娅滈梺绯曞墲閻燁垰霉閸曨垱鐓熼幖鎼灣閸掍即鏌ｈ箛鏂垮摵鐎殿喗褰冮埞鎴犫偓锝庡亐閹锋椽姊洪崷顓х劸婵炴挳顥撶划濠氬箻缂佹鍘甸梺鎯ф禋閸嬪嫭鎱ㄥ澶嬬厸濞达絽鎽滃暩缂備胶濮甸惄顖氼嚕椤掑嫬绀堢憸蹇涙偩妤ｅ啯鈷掑ù锝堟鐢盯鏌涢弮鎾绘缂佸倸绉撮…銊╁醇濠靛牆濮︽俊鐐€栭崹鍫曞磿閹惰棄鐒垫い鎺嶈兌缁犳捇鏌ｉ敐鍥у幋濠殿喒鍋撻梺鎸庣☉鐎氬嘲霉閸曨垱鐓熼幖鎼灣缁夐潧霉濠婂嫮鐭掗柟顔筋殜椤㈡﹢濮€閳锯偓閹锋椽鏌ｉ悩鍙夌闁逞屽墮绾绢厽绂掗鐔虹瘈闁靛繈鍨洪崵鈧銈嗗灥椤︻垶鎮鹃悜鑺ユ櫜濠㈣泛顑嗛崕顏堟⒑闂堚晛鐦滈柛姗€绠栭弫宥呪攽鐎ｎ偀鎷虹紓浣割儐鐎笛冿耿娴煎瓨鐓犵憸鐗堝笧閻ｆ椽鏌涢埞鎯т壕婵＄偑鍊栫敮濠囨倿閿曞倸纾归柟閭﹀枓閸嬫挾鎲撮崟顒傤槰闂佸憡姊归悷鈺呮偘椤曗偓瀵粙濡搁敃鈧鎾绘⒑閸涘﹦缂氶柛搴ゅ吹濡叉劙顢氶埀顒勫蓟閿濆棙鍎熼柨婵嗘濞堝矂鏌ｆ惔銏犲毈闁告瑥鍟悾宄扮暦閸パ屾闁诲函绲婚崝瀣уΔ鍛拺闁革富鍘奸崝瀣煕閵娿儳绉虹€规洘鍔欓幃娆撴倻濡攱瀚奸梻鍌氬€搁悧濠冪瑹濡ゅ懏鍋傛い鎾跺Х绾惧ジ鏌ら懝鐗堢【濞存粌缍婇弻娑㈠箳閹捐櫕璇炲Δ鐘靛仦椤洨妲愰幒鎳崇喖鏌ㄧ€ｎ亶浼栭梻浣藉吹閸犳劗鍒掓惔銏℃珷婵°倕鍟弳婊勪繆閵堝懏鍣洪柡鍜佸墴閺岋綁寮崶顭戜哗缂佺偓鍎抽妶鎼佸蓟瀹ュ牜妾ㄩ梺鍛婃尰瀹€鎼佺嵁韫囨稑宸濋悗娑櫳戦崕顏堟⒒娓氬洤浜濈紒瀣崌閹嘲鈹戠€ｎ偀鎷绘繛杈剧到閹诧繝骞嗛崼鐔翠簻闁挎棁妫勯埢鏇熴亜閵忊€冲摵妤犵偛閰ｉ幐濠冨緞瀹€鈧澶愭⒒娴ｇ顥忛柛瀣瀹曚即骞囬鑺ョ€哄┑鐘诧工閻楀﹪鍩涢幋锔界厱婵炴垶锕妤冪磼閸洑鎲鹃柡灞剧☉铻ｉ柟绋垮瘨濡嫰姊哄畷鍥╁笡闁圭懓娲妴浣割潨閳ь剚鎱ㄩ埀顒勬煃闁款垰浜鹃梺? {ctrl.reason}闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤缂嶅﹪寮婚悢鍏尖拻閻庨潧澹婂Σ顔剧磼閻愵剙鍔ょ紓宥咃躬瀵鎮㈤崗灏栨嫽闁诲酣娼ф竟濠偽ｉ鍓х＜闁绘劦鍓欓崝銈囩磽瀹ュ拑韬€殿喖顭烽弫鎰緞婵犲嫷鍚呴梻浣瑰缁诲倿骞夊☉銏犵缂備焦顭囬崢杈ㄧ節閻㈤潧孝闁稿﹤缍婂畷鎴﹀Ψ閳哄倻鍘搁柣蹇曞仩椤曆勬叏閸屾壕鍋撳▓鍨珮闁革綇绲介悾閿嬬附閸涘﹤浜滈梺鍛婄☉椤剟宕崼鏇熲拻闁稿本鐟ㄩ崗灞俱亜椤撶偟澧︽い銏＄墵瀹曞崬鈽夊Ο纰卞敹闂備礁鎲￠幐鍡涘礃閵娧傚枈濠碉紕鍋戦崐鏍箰妤ｅ啫纾婚柟閭﹀劦閿濆閱囬柣鏂垮缁犳艾顪冮妶鍡欏缂佽绉瑰畷闈涒枎閹邦喚顔曢梺鍛婄☉濞层倕煤閿曞倸鐓曢柟瀵稿仧缁犻箖鏌ゆ總鍓叉澓闁搞倖鐟﹂〃銉╂倷閹碱厽鐤侀梺鍝勭焿缂嶄線骞冮姀銈呯煑濠㈣泛顑囪ぐ瀣煟鎼淬埄鍟忛柛鐘崇墵閳ワ箓鎮滈挊澶岀暫闂侀潧绻堥崐鏇犵矆閸岀偞鐓熼柟鎯х－瀹€鎼佹煕鐎ｎ偅灏电紒杈ㄥ笒铻ｉ柛锔诲幘閻ｇ偓淇婇悙顏勨偓鏍偋濡ゅ啫鍨濈€光偓閸曨偆顦梺鎸庢礀閸婂綊鎮″▎鎴斿亾閻熸澘顏柛瀣躬閹繝宕楅崗鐓庡伎婵犵數濮撮崐褰掑箚閸儲鍋傞柕鍫濐槹閸嬶綁鏌涢妷锝呭缂佽尪宕电槐鎺楁偐閾忣偁浠㈠┑顔硷攻濡炰粙骞婇敓鐘参ч柛娑卞枟閻︼綁姊绘担鍛婃儓闁硅櫕鍔栭幈銊╁箻椤曞懏鏅梺鎸庣箓濡稓寮ч埀顒€鈹戦鏂や緵闁告ê鍚嬬粋宥咁煥閸啿鎷虹紓浣割儓濞夋洜绮婚幎鑺ョ厱婵☆垳濮村ú銈夋倿閸偁浜滈柟鐑樺灥閳ь剝宕甸弫顔尖槈濡挸閰ｅ畷鎯邦檪闂婎剦鍓氶妵鍕閿涘嫧妲堥梺瀹狀潐閸ㄥ潡鐛崶顒夋晢濞撴艾娲ら弫鎶芥⒒閸屾艾鈧绮堟笟鈧獮鏍敃閳惰姤绋戦埢搴ㄥ箻閹典礁浜鹃柛鎰靛枛瀹告繄绱掗鐓庡辅闁稿鎹囧顕€宕煎┑鍫О婵＄偑鍊栭弻銊ノｉ崼锝庢▌闂佸搫鏈粙鎾寸閿曞倸绀堢憸澶嬫叏閸ヮ剚鈷戠紓浣诡焽缁犳牜鈧厜鍋撶紒瀣儥濞兼牠鏌ц箛姘兼綈闁稿锕㈤弻宥夊Ψ閵夈儱绗繝銏ｎ潐濞茬喎顫忔繝姘＜婵炲棙鍨肩粣妤呮⒑閸涘﹥灏伴柣鐔濆懎鍨濋柡鍐ㄥ€甸崑鎾斥槈濞嗘瑤绶甸梺琛″亾濞寸厧鐡ㄩ埛鎺楁煕鐏炲墽鎳呮い锔肩畵閺岀喎霉鐎Ｑ冧壕閻℃帊鐒﹀浠嬪极閸愵喖纾兼慨姗嗗墰閳ь剦鍙冨铏规喆閸曢潧鏅遍梺鍝ュУ濮樸劍绂嶉幖浣瑰仺缁剧増锚娴滅偓顨ラ悙鑼虎闁告梹纰嶉妵鍕晜閸喖绁梺璇″櫙缁绘繂顕ｉ幘顔碱潊闁挎稑瀚敮鎯р攽閻橆喖鐏遍柛鈺傜墵閺佸姊洪崫鍕靛剭闁稿﹥绻堝璇测槈濡粎鍠栭幊锟犲Χ閸屾凹娼撴繝鐢靛剳缁茶棄煤閵堝鏅濇い蹇撶墑閳ь兛绶氬鎾閻欌偓濞煎﹪姊虹紒妯兼喛闁稿鎸搁湁閻忓繑鐗曟禍鍓х磽閸屾艾鈧悂宕愬畡鎳婂綊宕堕妸锝勭矒闂佸綊妫跨粈浣虹不閺夊簱鏀介柣妯虹枃婢规绱掗悪鈧崹鍫曞蓟濞戞ǚ妲堥柛妤冨仧娴狀垶姊哄ú璇插箺闁荤噦濡囬幑銏犫槈閵忕姴鑰垮┑鐐叉缁诲绔熼弴鐐╂斀闁绘劘灏欐晶娑欎繆閻愯埖顥夋い顐㈢箳缁辨帒螣鐠囧樊鈧挻绻涢幘鏉戝毈闁搞劍濞婂畷婵堢矙濞嗙偓瀵岄梺闈涚墕濡鎮橀妷锔剧鐎瑰壊鍠栭獮鏍煟閿濆鏁遍悗闈涖偢瀵爼骞嬪┑鍡樻殢濠碉紕鍋戦崐鏍箰妤ｅ啫纾婚柣鎰棘閿濆鏁嗛柛鏇ㄥ厴閹锋椽姊绘笟鍥т簽闁稿鐩幊鐔碱敍濞戞瑦鐝峰銈嗙墱閸嬬偤鎮¤箛娑欑厱闁靛鍨甸崰姘閸愩剮鏃堟偐闂堟稐娌柣銏╁灙閳ь剙纾弳锕傛煕濡ゅ啫鍓辨繛鎾愁煼閺岀喖顢涢崱妤佹拱妞ゃ儻绱曠槐鎾诲磼濮橆兘鍋撻幖浣哥９闁归棿绀佺壕褰掓煟閹达絽袚闁搞倕瀚伴弻銈囩矙鐠恒劋绮甸梺鍛婄懃缁绘﹢骞冨Δ鍛棃婵炴垶鐟﹂崰鎰版⒑濞茶骞楅柟鐟版喘瀵鏁愭径瀣簻缂備礁顑嗛娆徫涢崱娑欌拺闁告繂瀚敍鏃傜磼閻樿櫕宕岀€殿喖顭烽弫鎾绘偐閼碱剙鈧偤姊洪棃娑辨Ф闁稿氦娅曠粋鎺撱偅閸愨斁鎷虹紓鍌欑劍閿氱紒妞绘櫊閺屾稓鈧綆鍋勬慨宥夋煕閳规儳浜炬俊鐐€栧濠氬磻閹惧墎纾奸柣妯垮皺鏁堥悗瑙勬礃濞茬喖寮婚崱妤婂悑闁告侗鍨抽弸鍐⒒娴ｇ瓔娼愬鐟版閺呰泛螖閸涱厾锛涘銈呯箰閻楀﹪鎮￠弴銏＄厪濠㈣埖锚閺嬫稑顭胯閸ㄥ爼寮婚敐澶婄閻犺櫣鍎ら悘鍫ユ⒑缂佹ɑ鎯勯柛瀣工閻ｇ兘宕奸弴鐐嶁晠鏌ㄩ弮鍌濇婵″樊鍓欓埞鎴︽倷瀹割喖娈舵繝娈垮枤閺佹悂宕氶幒鎴犳殕闁告洏鍔夐崑鎾绘晝閸屾稑娈戝銈嗙壄缁茬偓顨欑紓鍌氬€搁崐椋庢閿熺姴绐楁俊銈呮噺閸嬶繝鏌嶉崫鍕偓椋庢崲閸℃稒鐓欑紓浣靛灩閺嬫稓鈧懓鎲＄换鍫ュ蓟閳╁啫绶為悗锝庝簽娴犵厧顪冮妶鍡樼叆闁活厼鍊搁～蹇撁洪鍛画闂佺粯顨呴悧濠囧磿閹炬枼鏀介柍钘夋娴滄繈鏌ｉ悢鍙夋珔妞ゆ洩缍侀、妤呭礋椤愩倕濮︽俊鐐€栫敮鎺斺偓姘煎弮閸╂盯骞掗幊銊ョ秺閺佹劙宕熼鍛Τ闂備胶绮敮锛勭不閺嶎厼钃熼柨鐔哄Т闁卞洦銇勯幇鈺佺仼妞ゎ偒鍋婂娲传閵夈儛銏ゆ煥閺囨ê鈧繈銆佸鈧畷妤呮偂鎼达絿鐛┑鐘垫暩婵鈧凹鍙冮幃鐐淬偅閸愨斁鎷绘繛杈剧秬濞咃絿鏁☉銏＄厱闁哄啠鍋撴い銊ワ工閻ｇ兘寮撮姀鐘栄冾熆鐠轰警鍎忓ù? {resume_reason}")
+            if update_res.still_running:
+                # Never continue with a partially applied pair of flows.
+                stop_ok, stop_reason = self._stop_pump_verified("partial flow update")
+                failure_reason = self._pump_state.last_update_reason
+                if not stop_ok:
+                    failure_reason = f"{failure_reason}; pump stop verification failed: {stop_reason}"
+                self._pump_state.last_error = failure_reason
+                self._pump_control_enabled = False
+                self._stop_event.set()
+                self._refresh_pump_channels(communication_ok=False, error=failure_reason)
+                self._set_state(SystemState.ERROR, error=failure_reason)
+
         else:
             self._pump_state.last_update_ok = True
             self._pump_state.last_update_reason = "flow update succeeded"

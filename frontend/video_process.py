@@ -5,13 +5,11 @@ import multiprocessing as mp
 import queue
 import threading
 import time
-import tkinter as tk
-from tkinter import ttk
 from typing import Callable
 
 
 def _jpeg_to_tk_payload(jpeg: bytes) -> bytes:
-    """Decode JPEG inside the renderer process and return a Tk-native PPM/PGM."""
+    """Decode JPEG into the PPM/PGM bytes consumed by the optional Tk renderer."""
     import cv2
     import numpy as np
 
@@ -30,7 +28,13 @@ def _jpeg_to_tk_payload(jpeg: bytes) -> bytes:
 
 
 def _video_window_main(frame_queue, stop_event) -> None:
-    """Run the video renderer in its own Python and Tcl/Tk process."""
+    """Run the optional video renderer in its own Python and Tcl/Tk process."""
+    # Tk is only needed by this explicitly retained renderer.  Keep it out of
+    # the transport/controller import path so the Qt application works on
+    # Python installations without the optional Tk bindings.
+    import tkinter as tk
+    from tkinter import ttk
+
     root = tk.Tk()
     root.title("工业相机实时画面（独立进程）")
     root.geometry("900x700")

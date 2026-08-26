@@ -1,5 +1,38 @@
+import pytest
+
+from backend.pump_hardware.client import CommandMismatchError, PumpClient
+from backend.pump_hardware.config import PumpHardwareConfig, SerialConfig
 from backend.pump_hardware.models import PumpOperationResult, RunState, SystemSetup
 from backend.pump_hardware.service import PumpHardwareService
+from backend.pump_hardware import protocol
+
+
+def test_client_rejects_reply_from_wrong_device_address():
+    class FakeSerial:
+        is_open = True
+
+        def __init__(self, frame):
+            self.frame = frame
+
+        def reset_input_buffer(self):
+            pass
+
+        def write(self, _frame):
+            pass
+
+        def flush(self):
+            pass
+
+        def read(self, _size):
+            if self.frame:
+                value, self.frame = self.frame[:1], self.frame[1:]
+                return value
+            return b""
+
+    client = PumpClient(SerialConfig(address=1), PumpHardwareConfig(reply_timeout=0.01, retry_count=1))
+    client._ser = FakeSerial(protocol.build_frame(addr=2, pdu=protocol.pdu_rss()))
+    with pytest.raises(CommandMismatchError, match="地址不匹配"):
+        client.send_pdu(protocol.pdu_rss(), expect_cmd="RSS", retries=1, timeout=0.01, addr=1)
 
 
 def test_prepare_parameter_write_does_not_repeat_rss_after_verified_wss(monkeypatch):
@@ -103,6 +136,16 @@ def test_rss_retry_recovers_after_transient_timeouts(monkeypatch):
 
     assert result.ok
     assert result.parsed_reply is setup
+
+
+@pytest.mark.parametrize("q1, q2", [(0.0, 20.0), (-1.0, 20.0), (float("nan"), 20.0), (50.0, float("inf"))])
+def test_running_update_rejects_nonfinite_or_nonpositive_flows_before_serial_io(monkeypatch, q1, q2):
+    service = PumpHardwareService()
+    monkeypatch.setattr(service, "read_run_state", lambda: pytest.fail("invalid flow reached serial I/O"))
+    result = service.update_flow_while_running(q1, q2)
+    assert not result.ok
+    assert not result.still_running
+    assert "有限正数" in result.reason
 
 
 def test_running_update_rejects_q1_not_above_q2_before_serial_io(monkeypatch):

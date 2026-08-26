@@ -1,24 +1,29 @@
 from __future__ import annotations
 
+from contextvars import ContextVar
+
 from .base import BaseDiameterController
 from .config import PIDConfig
 from .diameter_pid import DiameterPIDController
 from .models import PIDCommand, PIDInput, PumpState, TargetParams, VisionMetrics
 
-_controller: BaseDiameterController | None = None
+_controller_var: ContextVar[BaseDiameterController | None] = ContextVar(
+    "pid_controller", default=None
+)
 
 
 def build_controller(config: PIDConfig | None = None) -> BaseDiameterController:
-    global _controller
-    _controller = DiameterPIDController(config=config)
-    return _controller
+    controller = DiameterPIDController(config=config)
+    _controller_var.set(controller)
+    return controller
 
 
 def reset_controller() -> None:
-    global _controller
-    if _controller is None:
-        _controller = DiameterPIDController()
-    _controller.reset()
+    controller = _controller_var.get()
+    if controller is None:
+        controller = DiameterPIDController()
+        _controller_var.set(controller)
+    controller.reset()
 
 
 def run_feedback_step(
@@ -27,16 +32,17 @@ def run_feedback_step(
     pump_state: PumpState | None = None,
     dt: float | None = None,
 ) -> PIDCommand:
-    global _controller
-    if _controller is None:
-        _controller = DiameterPIDController()
+    controller = _controller_var.get()
+    if controller is None:
+        controller = DiameterPIDController()
+        _controller_var.set(controller)
     if isinstance(vision_metrics, PIDInput):
-        if hasattr(_controller, "update_input"):
-            return _controller.update_input(vision_metrics)  # type: ignore[attr-defined]
+        if hasattr(controller, "update_input"):
+            return controller.update_input(vision_metrics)  # type: ignore[attr-defined]
         raise TypeError("controller does not support PIDInput")
     if target_params is None or pump_state is None or dt is None:
         raise TypeError("legacy PID call requires target_params, pump_state and dt")
-    return _controller.update(
+    return controller.update(
         vision_metrics=vision_metrics,
         target_params=target_params,
         pump_state=pump_state,
