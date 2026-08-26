@@ -3,3 +3,5 @@ opencv-python>=4.8
 pyserial>=3.5
 harvesters>=1.4
 PySide6>=6.8
+# Test suite (including detector tuning regression tests)
+pytest>=8.0

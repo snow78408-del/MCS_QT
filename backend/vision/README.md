@@ -79,11 +79,23 @@ vision/
 - 启用 Kalman：`python run.py vision --video input.mp4 --tracker kalman`
 - 运行前预处理旋转：`python run.py vision --video input.mp4 --preprocess-rotate ccw90`
 
-## 10. 环境准备
+## 10. 独立液滴识别调参工作台
+
+现在可以从主软件左侧导航进入“7 液滴算法调参”，完整调参工作台会直接嵌入主页面，不进入控制流程。也可以在不启动主软件时直接运行：
+
+```bash
+python run.py tune --video path/to/sample.mp4
+```
+
+工作台只读取本地视频并调用 `DropletDetector`，支持逐帧预览、参数修改、JSON 参数保存，以及无人工标注时的启发式自动参数搜索。当前帧会用多宫格展示原图、灰度转换、对比度归一化、高斯平滑、Otsu 二值化、形态学清理、连通域/分裂、候选生成、评分抑制和辅助掩膜；每一步都显示用途、实际参数和统计结果，并可放大查看。自动搜索通过“期望液滴数/帧”、跨帧数量稳定性和半径稳定性评分，适合作为初始参数筛选；最终参数仍应在代表性视频上人工复核。搜索输入格式为 `参数=值1,值2`，当前支持的参数见 `backend/vision/tuning.py` 中的 `SEARCHABLE_FIELDS`。
+
+自动搜索不会连接相机、泵机，不运行跟踪、磁珠识别或 PID。
+
+## 11. 环境准备
 - 推荐使用项目顶层 `requirements.txt` 或 `pyproject.toml` 安装依赖。
 - 从项目根目录运行：`python run.py vision --video input.mp4`。
 
-## 11. 当前版本优点
+## 12. 当前版本优点
 - 从大脚本拆分为模块化架构，职责边界清晰。
 - 提供最近邻与 Kalman 双跟踪器，可按配置切换。
 - 输出数据结构标准化（`VisionResult`、`DropletTrack`、`TrackingResult`、`BeadResult`）。
@@ -93,13 +105,13 @@ vision/
 - 检测尺寸范围随用户目标直径与标定比例缩放，不绑定固定的 50 μm。
 - 相机测试和正式运行使用同一套参数下发路径；支持的参数写入失败时会终止测试，不静默继续。
 
-## 12. 相机适配边界
+## 13. 相机适配边界
 - `cameras/base.py` 定义厂商无关接口，`registry.py` 负责后端注册和优先级。
 - 海康机器人是当前启用和优先后端，保留现有 MVS/直接 SDK 兼容路径。
 - 新相机只需新增适配器并注册，不应把厂商 SDK 调用写入 detector、pipeline、orchestrator 或前端。
 - 海康直接 DLL 路径可确认写入调用是否成功；曝光、增益和帧率的精确回读能力取决于当前 SDK 路径，分辨率会通过实际测试帧再次校验。
 
-## 13. 待改进方向
+## 14. 待改进方向
 - 引入 Hungarian/IoU 等更稳健匹配策略。
 - ROI 自动估计与自适应阈值策略。
 - 多通道融合和光照鲁棒性增强。

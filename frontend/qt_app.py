@@ -24,6 +24,7 @@ from backend.orchestrator.models import SystemConfig
 from .config import APP_TITLE, DEFAULT_REFRESH_INTERVAL_MS
 from .runtime_logging import create_runtime_logger
 from .settings_store import FrontendSettingsStore
+from .vision_tuning import TuningWindow
 
 
 def jsonable(value):
@@ -1059,16 +1060,30 @@ class StatusPage(Page):
         except Exception as exc: self.text.setPlainText(str(exc))
 
 
+class TuningPage(Page):
+    """Detector-only workbench embedded directly in the main page."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.addWidget(app.title("液滴识别算法调参", "只处理本地视频，不连接相机、泵机、跟踪或 PID"))
+        video = str(app.frontend_config.get("video_source", ""))
+        initial_video = video if app.frontend_config.get("video_source_type") == "file" else ""
+        self.workbench = TuningWindow(initial_video, self)
+        layout.addWidget(self.workbench, 1)
+
+
 class FrontendApp(QMainWindow):
     def __init__(self, orchestrator=None, settings_store=None):
-        super().__init__(); self.setWindowTitle(APP_TITLE); self.resize(1360,860); self.setMinimumSize(QSize(1080,720))
+        super().__init__(); self.setWindowTitle(APP_TITLE); self.resize(1360,860); self.setMinimumSize(QSize(1280,760))
         self.runtime_logger=create_runtime_logger(); self.orchestrator=orchestrator or OrchestratorService(logger=self.runtime_logger); self.settings_store=settings_store or FrontendSettingsStore(); self.frontend_config=self.settings_store.load(); self.refresh_interval_ms=DEFAULT_REFRESH_INTERVAL_MS
         self.pool=QThreadPool.globalInstance(); self.workers=set(); self.current=None; self._build(); self.show_page("parameter")
 
     def _build(self):
         root=QWidget(); self.setCentralWidget(root); outer=QHBoxLayout(root); outer.setContentsMargins(0,0,0,0); self.nav=QListWidget(); self.nav.setObjectName("nav"); self.nav.setFixedWidth(205); self.stack=QStackedWidget(); outer.addWidget(self.nav); outer.addWidget(self.stack,1)
-        self.pages={"parameter":ParameterPage(self),"video":VideoPage(self),"pump":PumpPage(self),"init":InitPage(self),"monitor":MonitorPage(self),"status":StatusPage(self)}
-        for key,label in (("parameter","1  基础参数"),("video","2  相机识别与读写"),("pump","3  泵机识别与读写"),("init","4  系统初始化"),("monitor","5  运行监控"),("status","6  系统状态")):
+        self.pages={"parameter":ParameterPage(self),"video":VideoPage(self),"pump":PumpPage(self),"init":InitPage(self),"monitor":MonitorPage(self),"status":StatusPage(self),"tuning":TuningPage(self)}
+        for key,label in (("parameter","1  基础参数"),("video","2  相机识别与读写"),("pump","3  泵机识别与读写"),("init","4  系统初始化"),("monitor","5  运行监控"),("status","6  系统状态"),("tuning","7  液滴算法调参")):
             item=QListWidgetItem(label); item.setData(Qt.UserRole,key); item.setSizeHint(QSize(190,48)); self.nav.addItem(item); self.stack.addWidget(self.pages[key])
         self.nav.currentItemChanged.connect(lambda current,_: current and self.show_page(str(current.data(Qt.UserRole))))
         self.setStyleSheet("QMainWindow,QWidget{background:#f4f7fb;color:#172033;font-family:'Microsoft YaHei UI';font-size:14px}#nav{background:#152238;color:#dbe7f7;border:0;padding:18px 8px}#nav::item{border-radius:7px;padding-left:12px;margin:2px}#nav::item:selected{background:#2b6de5;color:white}QGroupBox{background:white;border:1px solid #dce3ed;border-radius:10px;margin-top:14px;padding:20px;font-weight:600}QGroupBox::title{subcontrol-origin:margin;left:16px;padding:0 6px}QLineEdit,QComboBox,QPlainTextEdit{background:white;border:1px solid #cbd5e1;border-radius:6px;padding:7px}QPushButton{background:#2b6de5;color:white;border:0;border-radius:6px;padding:8px 16px}QPushButton:disabled{background:#aab5c4}")
@@ -1100,6 +1115,9 @@ class FrontendApp(QMainWindow):
         worker.signals.finished.connect(cleanup); self.pool.start(worker)
     def error(self,title,message): QMessageBox.critical(self,title,message)
     def closeEvent(self,event:QCloseEvent):
+        tuning_page = self.pages.get("tuning")
+        if isinstance(tuning_page, TuningPage) and tuning_page.workbench is not None:
+            tuning_page.workbench.close()
         try: self.orchestrator.stop()
         except Exception: pass
         if self.orchestrator.has_unsaved_pid_session_data():

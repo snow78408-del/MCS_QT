@@ -56,6 +56,22 @@ def run_frontend() -> None:
     frontend_main()
 
 
+def run_tuning(argv: Sequence[str]) -> None:
+    ensure_project_root_on_path()
+
+    missing = missing_runtime_packages()
+    if missing:
+        print_dependency_help(missing)
+        raise SystemExit(1)
+
+    from frontend.vision_tuning import main as tuning_main
+
+    parser = argparse.ArgumentParser(description="Launch the standalone droplet detection tuning workbench.")
+    parser.add_argument("--video", default="", help="Optional local video path")
+    args = parser.parse_args(list(argv))
+    tuning_main(args.video)
+
+
 def run_vision(argv: Sequence[str]) -> None:
     ensure_project_root_on_path()
 
@@ -92,6 +108,8 @@ def build_parser() -> argparse.ArgumentParser:
         nargs=argparse.REMAINDER,
         help="传递给 backend.vision.run_vision 的参数",
     )
+    tune_parser = subparsers.add_parser("tune", help="启动液滴识别算法调参工作台")
+    tune_parser.add_argument("--video", default="", help="可选的本地视频路径")
 
     return parser
 
@@ -115,6 +133,10 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if raw_args[0] == "vision":
         run_vision(raw_args[1:])
+        return
+
+    if raw_args[0] == "tune":
+        run_tuning(raw_args[1:])
         return
 
     build_parser().parse_args(raw_args)
