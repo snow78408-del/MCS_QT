@@ -129,6 +129,7 @@ class DisturbanceStorage:
     def _init_db(self) -> None:
         database_path = Path(self.config.database_path)
         database_path.parent.mkdir(parents=True, exist_ok=True)
+        old_version: int | None = None
         if database_path.is_file():
             try:
                 with sqlite3.connect(str(database_path), timeout=1.0) as existing:
@@ -161,7 +162,8 @@ class DisturbanceStorage:
                     conn.execute(
                         f'ALTER TABLE disturbance_samples ADD COLUMN "{name}" {self._sqlite_type(name)}'
                     )
-            conn.execute(f"PRAGMA user_version={DATABASE_SCHEMA_VERSION}")
+            if old_version != DATABASE_SCHEMA_VERSION:
+                conn.execute(f"PRAGMA user_version={DATABASE_SCHEMA_VERSION}")
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.config.database_path, timeout=1.0)

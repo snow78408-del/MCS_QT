@@ -98,7 +98,10 @@ class DisturbancePrediction:
     predicted_response_delay_ms: float = 0.0
     predicted_cv: float | None = None
     disturbance_effect: str = "unknown"
-    recommended_feedforward: float = 0.0
+    # None means that the predictive model has not supplied a physically
+    # calibrated inverse-model command. PID may derive one only when an
+    # explicit plant calibration is configured.
+    recommended_feedforward: float | None = None
     feedforward_weight: float = 0.0
     control_stage: str = DisturbanceControlStage.COLLECT_ONLY.value
     shadow_error_um: float | None = None
@@ -117,6 +120,8 @@ class ModelMetrics:
     r2: float = 0.0
     direction_accuracy: float = 0.0
     response_delay_error_ms: float = 0.0
+    persistence_rmse: float = 0.0
+    persistence_improvement: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -133,6 +138,8 @@ class ModelStatus:
     control_stage: str = DisturbanceControlStage.COLLECT_ONLY.value
     feedforward_weight: float = 0.0
     shadow_mae_um: float = 0.0
+    shadow_change_mae_um: float = 0.0
+    shadow_direction_accuracy: float = 0.0
     safety_fallback: bool = False
     last_error: str = ""
     metrics: ModelMetrics = field(default_factory=ModelMetrics)

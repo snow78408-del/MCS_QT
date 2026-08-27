@@ -64,11 +64,9 @@ class AdaptivePIDManager:
             abs(float(getattr(prediction, "predicted_diameter_change_um", 0.0) or 0.0))
             if model_hint_active else 0.0
         )
-        model_delay_ms = (
-            float(getattr(prediction, "predicted_response_delay_ms", 0.0) or 0.0)
-            if model_hint_active else 0.0
-        )
-        delay_ms = float(pid_input.pump_response_delay_ms or model_delay_ms)
+        # Only an observed/identified actuator delay may tune derivative action.
+        # A model's horizon or inferred delay is not a physical delay estimate.
+        delay_ms = float(pid_input.pump_response_delay_ms or 0.0)
 
         recent = list(self._errors)[-min(12, len(self._errors)):]
         sign_changes = sum(

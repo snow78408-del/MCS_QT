@@ -55,6 +55,10 @@ class FeedforwardCompensator:
             stage = str(getattr(prediction, "control_stage", "") or "")
             return FeedforwardResult(0.0, False, f"feedforward gated by stage {stage}".strip(), confidence)
 
+        if not self.config.feedforward_calibrated:
+            self._last_u_ff = 0.0
+            return FeedforwardResult(0.0, False, "feedforward plant gain not calibrated", confidence)
+
         recommended = getattr(prediction, "recommended_feedforward", None)
         if recommended is None:
             change = float(getattr(prediction, "predicted_diameter_change_um", 0.0) or 0.0)

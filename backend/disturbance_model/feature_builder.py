@@ -103,7 +103,9 @@ def build_targets(sample: DisturbanceSample, future_sample: DisturbanceSample | 
     future_sample = future_sample or sample
     if sample.droplet_mean_diameter_um is None or future_sample.droplet_mean_diameter_um is None:
         return None
-    response_delay_ms = max(0.0, (float(future_sample.timestamp) - float(sample.timestamp)) * 1000.0)
+    # Pair spacing is only the prediction horizon, not an actuator response
+    # delay. This field must come from an independently measured pump delay.
+    response_delay_ms = max(0.0, float(sample.pump_response_delay_ms or 0.0))
     return [
         float(future_sample.droplet_mean_diameter_um),
         float(future_sample.droplet_mean_diameter_um) - float(sample.droplet_mean_diameter_um),

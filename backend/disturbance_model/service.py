@@ -29,8 +29,10 @@ class DisturbanceModelService:
         self._control_stage = self._normalize_stage(self.config.deployment_stage)
         self._safety_fallback = False
         self._consecutive_prediction_errors = 0
-        self._pending_shadow: deque[tuple[float, float]] = deque(maxlen=200)
+        self._pending_shadow: deque[tuple[float, float, float, float, float]] = deque(maxlen=200)
         self._shadow_errors: deque[float] = deque(maxlen=max(1, int(self.config.shadow_validation_window)))
+        self._shadow_change_errors: deque[float] = deque(maxlen=max(1, int(self.config.shadow_validation_window)))
+        self._shadow_direction_matches: deque[bool] = deque(maxlen=max(1, int(self.config.shadow_validation_window)))
         self.storage.start()
         self._status.control_stage = self._control_stage.value
         self._status.feedforward_weight = self._feedforward_weight_for_stage(self._control_stage)
@@ -89,6 +91,8 @@ class DisturbanceModelService:
                 control_stage=self._status.control_stage,
                 feedforward_weight=self._status.feedforward_weight,
                 shadow_mae_um=self._status.shadow_mae_um,
+                shadow_change_mae_um=self._status.shadow_change_mae_um,
+                shadow_direction_accuracy=self._status.shadow_direction_accuracy,
                 safety_fallback=self._status.safety_fallback,
                 last_error=self._status.last_error,
                 metrics=self._status.metrics,
@@ -157,9 +161,10 @@ class DisturbanceModelService:
         self._clear_prediction_error()
         weight = self._feedforward_weight_for_stage(stage)
         prediction.feedforward_weight = weight
-        prediction.recommended_feedforward = float(prediction.recommended_feedforward) * weight
+        if prediction.recommended_feedforward is not None:
+            prediction.recommended_feedforward = float(prediction.recommended_feedforward) * weight
         if weight <= 0.0:
-            prediction.reason = f"{stage.value}: prediction display only"
+            prediction.reason = self._feedforward_gate_reason(stage)
         elif stage == DisturbanceControlStage.LOW_WEIGHT_FEEDFORWARD:
             prediction.reason = "low-weight feedforward enabled"
         elif stage == DisturbanceControlStage.FULL_FEEDFORWARD:
@@ -173,8 +178,19 @@ class DisturbanceModelService:
             DisturbanceControlStage.FULL_FEEDFORWARD,
         }:
             return
-        target_ts = float(sample.timestamp) + max(0.0, float(self.config.prediction_horizon_ms) / 1000.0)
-        self._pending_shadow.append((target_ts, float(prediction.predicted_diameter_um)))
+        horizon_s, _ = self._pairing_window(sample)
+        target_ts = float(sample.timestamp) + horizon_s
+        if self._pending_shadow and self._pending_shadow[-1][4] == float(sample.timestamp):
+            return
+        self._pending_shadow.append(
+            (
+                target_ts,
+                float(prediction.predicted_diameter_um),
+                float(prediction.predicted_diameter_change_um),
+                float(sample.droplet_mean_diameter_um or 0.0),
+                float(sample.timestamp),
+            )
+        )
 
     def _update_shadow_metrics_locked(self, sample: DisturbanceSample) -> None:
         if sample.droplet_mean_diameter_um is None:
@@ -183,15 +199,37 @@ class DisturbanceModelService:
             return
         current_ts = float(sample.timestamp)
         actual = float(sample.droplet_mean_diameter_um)
-        while self._pending_shadow and current_ts >= self._pending_shadow[0][0]:
-            _, predicted = self._pending_shadow.popleft()
+        _, tolerance_s = self._pairing_window(sample)
+        while self._pending_shadow and self._pending_shadow[0][0] < current_ts - tolerance_s:
+            self._pending_shadow.popleft()
+        candidates = [item for item in self._pending_shadow if abs(item[0] - current_ts) <= tolerance_s]
+        if candidates:
+            matched = min(candidates, key=lambda item: abs(item[0] - current_ts))
+            self._pending_shadow.remove(matched)
+            _, predicted, predicted_change, origin_diameter, _ = matched
+            actual_change = actual - origin_diameter
             self._shadow_errors.append(abs(predicted - actual))
+            self._shadow_change_errors.append(abs(predicted_change - actual_change))
+            self._shadow_direction_matches.append(
+                (actual_change == 0.0 and predicted_change == 0.0) or actual_change * predicted_change > 0.0
+            )
         if not self._shadow_errors:
             return
         shadow_mae = sum(self._shadow_errors) / len(self._shadow_errors)
+        shadow_change_mae = sum(self._shadow_change_errors) / len(self._shadow_change_errors)
+        shadow_direction_accuracy = sum(self._shadow_direction_matches) / len(self._shadow_direction_matches)
         self._status.shadow_mae_um = shadow_mae
-        if len(self._shadow_errors) >= int(self.config.shadow_min_comparisons) and shadow_mae > float(self.config.shadow_max_mae_um):
-            self._trip_safety_fallback_locked(f"shadow MAE too high: {shadow_mae:.3f} um")
+        self._status.shadow_change_mae_um = shadow_change_mae
+        self._status.shadow_direction_accuracy = shadow_direction_accuracy
+        if len(self._shadow_errors) >= int(self.config.shadow_min_comparisons):
+            if shadow_mae > float(self.config.shadow_max_mae_um):
+                self._trip_safety_fallback_locked(f"shadow absolute-diameter MAE too high: {shadow_mae:.3f} um")
+            elif shadow_change_mae > float(self.config.shadow_max_change_mae_um):
+                self._trip_safety_fallback_locked(f"shadow delta-D MAE too high: {shadow_change_mae:.3f} um")
+            elif shadow_direction_accuracy < float(self.config.shadow_min_direction_accuracy):
+                self._trip_safety_fallback_locked(
+                    f"shadow delta-D direction accuracy too low: {shadow_direction_accuracy:.3f}"
+                )
 
     def _note_prediction_error(self, reason: str) -> None:
         with self._lock:
@@ -223,11 +261,47 @@ class DisturbanceModelService:
         return DisturbanceControlStage.COLLECT_ONLY
 
     def _feedforward_weight_for_stage(self, stage: DisturbanceControlStage) -> float:
+        if stage in {
+            DisturbanceControlStage.LOW_WEIGHT_FEEDFORWARD,
+            DisturbanceControlStage.FULL_FEEDFORWARD,
+        }:
+            if len(self._shadow_errors) < int(self.config.shadow_min_comparisons):
+                return 0.0
+            if self._status.shadow_change_mae_um > float(self.config.shadow_max_change_mae_um):
+                return 0.0
+            if self._status.shadow_direction_accuracy < float(self.config.shadow_min_direction_accuracy):
+                return 0.0
         if stage == DisturbanceControlStage.LOW_WEIGHT_FEEDFORWARD:
+            if not self.config.allow_low_weight_feedforward:
+                return 0.0
             return max(0.0, min(1.0, float(self.config.low_weight_feedforward_weight)))
         if stage == DisturbanceControlStage.FULL_FEEDFORWARD:
+            if not self.config.allow_full_feedforward:
+                return 0.0
             return max(0.0, min(1.0, float(self.config.full_feedforward_weight)))
         return 0.0
+
+    def _feedforward_gate_reason(self, stage: DisturbanceControlStage) -> str:
+        if stage in {
+            DisturbanceControlStage.LOW_WEIGHT_FEEDFORWARD,
+            DisturbanceControlStage.FULL_FEEDFORWARD,
+        } and len(self._shadow_errors) < int(self.config.shadow_min_comparisons):
+            return f"{stage.value}: shadow validation incomplete"
+        if stage == DisturbanceControlStage.LOW_WEIGHT_FEEDFORWARD and not self.config.allow_low_weight_feedforward:
+            return "LOW_WEIGHT_FEEDFORWARD: explicit authorization disabled"
+        if stage == DisturbanceControlStage.FULL_FEEDFORWARD and not self.config.allow_full_feedforward:
+            return "FULL_FEEDFORWARD: explicit authorization disabled"
+        return f"{stage.value}: prediction display only"
+
+    def _pairing_window(self, sample: DisturbanceSample) -> tuple[float, float]:
+        horizon_ms = max(0.0, float(self.config.prediction_horizon_ms))
+        if self.config.align_horizon_to_control_cycle:
+            horizon_ms = max(horizon_ms, float(sample.control_cycle_ms or 0.0))
+        tolerance_ms = max(
+            float(self.config.prediction_horizon_tolerance_ms),
+            horizon_ms * max(0.0, float(self.config.horizon_tolerance_fraction)),
+        )
+        return horizon_ms / 1000.0, tolerance_ms / 1000.0
 
     def _train_background(self) -> None:
         try:
@@ -242,10 +316,23 @@ class DisturbanceModelService:
                 return
             with self._lock:
                 self._status.state = ModelState.VALIDATING.value
-            valid = metrics.r2 >= float(self.config.minimum_r2) and metrics.rmse <= float(self.config.maximum_rmse)
+            valid = (
+                metrics.r2 >= float(self.config.minimum_r2)
+                and metrics.rmse <= float(self.config.maximum_rmse)
+                and metrics.direction_accuracy >= float(self.config.minimum_direction_accuracy)
+                and metrics.persistence_improvement >= float(self.config.minimum_persistence_improvement)
+            )
             if valid:
                 self.predictor.set_model(model)
-                self.storage.record_model_version(model.version, {"confidence": model.confidence})
+                self.storage.record_model_version(
+                    model.version,
+                    {
+                        "confidence": model.confidence,
+                        "training_data_hash": model.training_data_hash,
+                        "feature_version": model.feature_version,
+                        "metrics": metrics.to_dict(),
+                    },
+                )
                 self.storage.record_metrics(model.version, metrics)
                 with self._lock:
                     self._status.state = ModelState.READY.value

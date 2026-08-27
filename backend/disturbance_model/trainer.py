@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import time
 
 try:
@@ -19,7 +21,7 @@ from .feature_builder import (
     sample_is_usable,
 )
 from .model import LinearDisturbanceModel
-from .models import DisturbanceSample, ModelMetrics
+from .models import DisturbanceSample, DisturbanceStage, ModelMetrics
 
 
 class DisturbanceModelTrainer:
@@ -27,43 +29,63 @@ class DisturbanceModelTrainer:
         self.config = config
 
     def train(self, samples: list[DisturbanceSample]) -> tuple[LinearDisturbanceModel | None, ModelMetrics, str]:
-        usable: list[tuple[list[float], list[float]]] = []
+        usable: list[tuple[list[float], list[float], tuple[str, str]]] = []
         window = samples[-int(self.config.training_window_size) :]
-        horizon_s = max(0.0, float(self.config.prediction_horizon_ms) / 1000.0)
-        tolerance_s = max(0.0, float(self.config.prediction_horizon_tolerance_ms) / 1000.0)
+        disturbance_events = self._count_disturbance_events(window)
+        if disturbance_events < int(self.config.minimum_disturbance_events):
+            return None, ModelMetrics(), (
+                f"insufficient disturbance events: {disturbance_events} < {int(self.config.minimum_disturbance_events)}"
+            )
         min_droplets = max(1, int(self.config.minimum_valid_droplets))
         for index, sample in enumerate(window):
             if not sample_is_usable(sample) or int(sample.droplet_count_frame or 0) < min_droplets:
                 continue
+            if self.config.require_group_metadata and (not sample.experiment_id or not sample.chip_id):
+                continue
+            horizon_s, tolerance_s = self._pairing_window(sample)
             future_sample = self._find_future_sample(window, index, horizon_s, tolerance_s, min_droplets)
             if future_sample is None:
                 continue
             targets = build_targets(sample, future_sample)
             if targets is not None:
-                usable.append((build_features(sample), targets))
+                usable.append((build_features(sample), targets, (sample.experiment_id, sample.chip_id)))
         if len(usable) < int(self.config.minimum_training_samples):
-            return None, ModelMetrics(), "insufficient samples"
+            suffix = " with experiment_id and chip_id" if self.config.require_group_metadata else ""
+            return None, ModelMetrics(), f"insufficient paired samples{suffix}"
 
         x = [build_nonlinear_features(item[0]) for item in usable]
         y = [item[1] for item in usable]
         if np is None:
-            return self._train_mean_model(y), ModelMetrics(), "numpy unavailable; mean model"
+            return None, ModelMetrics(), "numpy unavailable; validated training disabled"
 
         x_arr = np.asarray(x, dtype=float)
         y_arr = np.asarray(y, dtype=float)
-        holdout_ratio = min(
-            0.4,
-            max(0.1, float(self.config.validation_ratio) + float(self.config.test_ratio)),
-        )
-        train_count = max(2, min(len(x_arr) - 1, int(round(len(x_arr) * (1.0 - holdout_ratio)))))
-        x_train = x_arr[:train_count]
-        y_train = y_arr[:train_count]
-        x_eval = x_arr[train_count:]
-        y_eval = y_arr[train_count:]
-        if len(x_eval) < 1:
-            return None, ModelMetrics(), "insufficient holdout samples"
+        groups = [item[2] for item in usable]
+        ordered_groups = list(dict.fromkeys(groups))
+        minimum_groups = max(3, int(self.config.minimum_evaluation_groups))
+        if len(ordered_groups) < minimum_groups:
+            return None, ModelMetrics(), f"insufficient independent experiment/chip groups: {len(ordered_groups)} < {minimum_groups}"
+        test_count = max(1, int(round(len(ordered_groups) * float(self.config.test_ratio))))
+        validation_count = max(1, int(round(len(ordered_groups) * float(self.config.validation_ratio))))
+        if test_count + validation_count >= len(ordered_groups):
+            test_count = 1
+            validation_count = 1
+        train_groups = set(ordered_groups[: -(validation_count + test_count)])
+        validation_groups = set(ordered_groups[-(validation_count + test_count) : -test_count])
+        test_groups = set(ordered_groups[-test_count:])
+        train_indices = [index for index, group in enumerate(groups) if group in train_groups]
+        validation_indices = [index for index, group in enumerate(groups) if group in validation_groups]
+        test_indices = [index for index, group in enumerate(groups) if group in test_groups]
+        if min(len(train_indices), len(validation_indices), len(test_indices)) < 1:
+            return None, ModelMetrics(), "empty grouped train/validation/test split"
 
-        x_aug = np.column_stack([np.ones(len(x_train)), x_train])
+        x_train = x_arr[train_indices]
+        y_train = y_arr[train_indices]
+        feature_means = x_train.mean(axis=0)
+        feature_scales = x_train.std(axis=0)
+        feature_scales[feature_scales < 1e-12] = 1.0
+        x_train_scaled = (x_train - feature_means) / feature_scales
+        x_aug = np.column_stack([np.ones(len(x_train_scaled)), x_train_scaled])
         penalty = np.eye(x_aug.shape[1], dtype=float)
         penalty[0, 0] = 0.0
         reg = max(0.0, float(self.config.nonlinear_l2_regularization))
@@ -73,10 +95,22 @@ class DisturbanceModelTrainer:
             coeff_matrix, *_ = np.linalg.lstsq(x_aug, y_train, rcond=None)
         intercepts = coeff_matrix[0, :].tolist()
         coefficients = coeff_matrix[1:, :].T.tolist()
-        x_eval_aug = np.column_stack([np.ones(len(x_eval)), x_eval])
-        pred = x_eval_aug @ coeff_matrix
-        metrics = evaluate_predictions(y_eval[:, 0].tolist(), pred[:, 0].tolist())
-        confidence = max(0.0, min(1.0, (metrics.r2 + 1.0) / 2.0))
+        validation_metrics = self._evaluate_split(
+            x_arr[validation_indices], y_arr[validation_indices], feature_means, feature_scales, coeff_matrix
+        )
+        test_metrics = self._evaluate_split(
+            x_arr[test_indices], y_arr[test_indices], feature_means, feature_scales, coeff_matrix
+        )
+        for name, metrics in (("validation", validation_metrics), ("test", test_metrics)):
+            failure = self._validation_failure(metrics)
+            if failure:
+                return None, test_metrics, f"{name} failed: {failure}"
+        confidence = min(
+            validation_metrics.direction_accuracy,
+            test_metrics.direction_accuracy,
+            max(0.0, validation_metrics.persistence_improvement),
+            max(0.0, test_metrics.persistence_improvement),
+        )
         version = f"disturbance-{int(time.time())}"
         model = LinearDisturbanceModel(
             version=version,
@@ -86,8 +120,68 @@ class DisturbanceModelTrainer:
             intercepts=intercepts,
             confidence=confidence,
             model_type="quadratic_ridge",
+            schema_version=2,
+            feature_means=feature_means.tolist(),
+            feature_scales=feature_scales.tolist(),
+            training_data_hash=hashlib.sha256(
+                json.dumps(usable, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            ).hexdigest(),
         )
-        return model, metrics, f"trained with chronological holdout ({len(x_eval)} samples)"
+        return model, test_metrics, (
+            "trained with independent grouped validation/test "
+            f"({len(train_groups)}/{len(validation_groups)}/{len(test_groups)} groups)"
+        )
+
+    def _evaluate_split(self, x, y, means, scales, coefficients) -> ModelMetrics:
+        x_scaled = (x - means) / scales
+        predictions = np.column_stack([np.ones(len(x_scaled)), x_scaled]) @ coefficients
+        return evaluate_predictions(
+            y[:, 1].tolist(),
+            predictions[:, 1].tolist(),
+            response_delay_true=y[:, 5].tolist(),
+            response_delay_pred=predictions[:, 5].tolist(),
+        )
+
+    def _validation_failure(self, metrics: ModelMetrics) -> str:
+        if metrics.r2 < float(self.config.minimum_r2):
+            return f"delta-D R2 {metrics.r2:.3f} below {float(self.config.minimum_r2):.3f}"
+        if metrics.rmse > float(self.config.maximum_rmse):
+            return f"delta-D RMSE {metrics.rmse:.3f} above {float(self.config.maximum_rmse):.3f}"
+        if metrics.direction_accuracy < float(self.config.minimum_direction_accuracy):
+            return "delta-D direction accuracy below threshold"
+        if metrics.persistence_improvement < float(self.config.minimum_persistence_improvement):
+            return "does not beat persistence baseline"
+        return ""
+
+    @staticmethod
+    def _count_disturbance_events(samples: list[DisturbanceSample]) -> int:
+        count = 0
+        active_key: tuple[str, str, str] | None = None
+        for sample in samples:
+            disturbed = (
+                sample.disturbance_stage == DisturbanceStage.DISTURBED.value
+                or abs(float(sample.disturbance_amplitude or 0.0)) > 0.0
+            )
+            key = (sample.experiment_id, sample.chip_id, sample.disturbance_name)
+            if disturbed and active_key is None:
+                count += 1
+                active_key = key
+            elif disturbed and key != active_key:
+                count += 1
+                active_key = key
+            elif not disturbed:
+                active_key = None
+        return count
+
+    def _pairing_window(self, sample: DisturbanceSample) -> tuple[float, float]:
+        horizon_ms = max(0.0, float(self.config.prediction_horizon_ms))
+        if self.config.align_horizon_to_control_cycle:
+            horizon_ms = max(horizon_ms, float(sample.control_cycle_ms or 0.0))
+        tolerance_ms = max(
+            float(self.config.prediction_horizon_tolerance_ms),
+            horizon_ms * max(0.0, float(self.config.horizon_tolerance_fraction)),
+        )
+        return horizon_ms / 1000.0, tolerance_ms / 1000.0
 
     def _find_future_sample(
         self,
@@ -101,10 +195,13 @@ class DisturbanceModelTrainer:
             current = samples[current_index]
             return current if sample_is_usable(current) and int(current.droplet_count_frame or 0) >= min_droplets else None
         current_ts = float(samples[current_index].timestamp)
+        current_group = (samples[current_index].experiment_id, samples[current_index].chip_id)
         target_ts = current_ts + horizon_s
         best_sample: DisturbanceSample | None = None
         best_error = float("inf")
         for future_sample in samples[current_index + 1 :]:
+            if (future_sample.experiment_id, future_sample.chip_id) != current_group:
+                continue
             future_ts = float(future_sample.timestamp)
             if future_ts <= current_ts:
                 continue
@@ -120,17 +217,3 @@ class DisturbanceModelTrainer:
         if best_sample is not None and best_error <= tolerance_s:
             return best_sample
         return None
-
-    def _train_mean_model(self, y: list[list[float]]) -> LinearDisturbanceModel:
-        cols = list(zip(*y))
-        intercepts = [sum(col) / len(col) for col in cols]
-        coefficients = [[0.0 for _ in NONLINEAR_FEATURE_NAMES] for _ in TARGET_NAMES]
-        return LinearDisturbanceModel(
-            version=f"disturbance-{int(time.time())}",
-            feature_names=list(FEATURE_NAMES),
-            target_names=list(TARGET_NAMES),
-            coefficients=coefficients,
-            intercepts=intercepts,
-            confidence=0.25,
-            model_type="quadratic_ridge",
-        )

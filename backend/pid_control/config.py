@@ -48,6 +48,9 @@ class PIDConfig:
     feedforward_confidence_threshold: float = 0.65
     feedforward_timeout_ms: int = 2000
     feedforward_gain: float = 0.5
+    # Must only be enabled after feedforward_gain has been identified in
+    # controller-output units per micrometre on the actual plant.
+    feedforward_calibrated: bool = False
 
     output_min: float = -500.0
     output_max: float = 500.0
