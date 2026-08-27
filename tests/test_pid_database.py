@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from backend.orchestrator.pid_database import PIDSessionRecorder
+from backend.orchestrator.pid_database import PIDSessionRecorder, load_pid_replay
 
 
 def _sample(timestamp: float, q1: float, q2: float, *, frozen: bool = False) -> dict:
@@ -67,6 +67,18 @@ def test_pid_session_is_saved_to_user_selected_sqlite_database() -> None:
             ).fetchall()
         assert session is not None and session[0] == 2 and '"operator": "test"' in session[1]
         assert samples == [(60.0, 30.0, 225.5, 0), (59.5, 30.25, 225.5, 1)]
+
+        replay = load_pid_replay(database_path)
+        assert replay.session_id == session_id
+        assert replay.q1_flow_source == "device_parameter_estimate"
+        assert replay.q2_flow_source == "device_parameter_estimate"
+        assert replay.samples[0].elapsed_s == pytest.approx(0.0)
+        assert replay.samples[1].elapsed_s == pytest.approx(1.0)
+        assert replay.samples[0].q1_flow_ul_min == pytest.approx(59.9)
+        assert replay.samples[0].q2_flow_ul_min == pytest.approx(29.9)
+        assert replay.samples[0].target_diameter_um == pytest.approx(50.0)
+        assert replay.samples[0].measured_diameter_um == pytest.approx(52.0)
+        assert replay.samples[0].droplet_speed_um_s == pytest.approx(225.5)
     finally:
         if database_path.exists():
             database_path.unlink()
@@ -84,3 +96,40 @@ def test_unsaved_session_must_be_resolved_before_next_run() -> None:
     recorder.discard()
     recorder.begin_session()
     assert recorder.status()["record_count"] == 0
+
+
+def test_active_session_cannot_be_saved(tmp_path: Path) -> None:
+    recorder = PIDSessionRecorder()
+    recorder.begin_session()
+    recorder.record_sample(**_sample(time.time(), 60.0, 30.0))
+
+    with pytest.raises(RuntimeError, match="先停止实验"):
+        recorder.save_to_sqlite(tmp_path / "active.sqlite")
+
+
+def test_replay_falls_back_to_commands_when_readback_is_absent(tmp_path: Path) -> None:
+    recorder = PIDSessionRecorder()
+    recorder.begin_session()
+    sample = _sample(time.time(), 60.0, 30.0)
+    sample["q1_actual_ul_min"] = None
+    sample["q2_actual_ul_min"] = None
+    recorder.record_sample(**sample)
+    recorder.finish_session()
+    database_path = tmp_path / "command_only.sqlite"
+    recorder.save_to_sqlite(database_path)
+
+    replay = load_pid_replay(database_path)
+
+    assert replay.q1_flow_source == "command"
+    assert replay.q2_flow_source == "command"
+    assert replay.samples[0].q1_flow_ul_min == pytest.approx(60.0)
+    assert replay.samples[0].q2_flow_ul_min == pytest.approx(30.0)
+
+
+def test_replay_rejects_unrelated_sqlite_file(tmp_path: Path) -> None:
+    database_path = tmp_path / "unrelated.sqlite"
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)")
+
+    with pytest.raises(ValueError, match="不是有效的 PID 数据库"):
+        load_pid_replay(database_path)

@@ -48,6 +48,9 @@ class PIDConfig:
     feedforward_confidence_threshold: float = 0.65
     feedforward_timeout_ms: int = 2000
     feedforward_gain: float = 0.5
+    feedforward_require_leading_signal: bool = True
+    feedforward_min_lead_margin_ms: float = 100.0
+    feedforward_max_output_fraction: float = 0.30
     # Must only be enabled after feedforward_gain has been identified in
     # controller-output units per micrometre on the actual plant.
     feedforward_calibrated: bool = False
@@ -56,6 +59,7 @@ class PIDConfig:
     output_max: float = 500.0
     output_rate_limit: float = 200.0
     integral_limit: float = 10000.0
+    anti_windup_back_calculation_gain: float = 0.2
     diameter_deadband: float = 1.0
     integral_decay_in_deadband: float = 0.8
     min_droplet_count_for_feedback: int = 1
@@ -117,5 +121,11 @@ class PIDConfig:
             raise ValueError("min_q1_q2_gap must be greater than zero")
         if not 0.0 < self.q1_min <= self.q1_max or not 0.0 < self.q2_min <= self.q2_max:
             raise ValueError("pump min/max limits must be positive and ordered")
+        if not 0.0 <= self.feedforward_max_output_fraction <= 1.0:
+            raise ValueError("feedforward_max_output_fraction must be in [0, 1]")
+        if self.feedforward_min_lead_margin_ms < 0.0:
+            raise ValueError("feedforward_min_lead_margin_ms must be non-negative")
+        if self.anti_windup_back_calculation_gain < 0.0:
+            raise ValueError("anti_windup_back_calculation_gain must be non-negative")
         self.q1_control_sign = 1.0 if self.q1_control_sign > 0.0 else -1.0
         self.q2_control_sign = 1.0 if self.q2_control_sign > 0.0 else -1.0

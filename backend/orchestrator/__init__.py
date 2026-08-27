@@ -19,6 +19,7 @@ from .models import (
 from .service import OrchestratorService
 from .state import SystemState
 from .vision_adapter import GenericVisionAdapter, VisionAdapterProtocol
+from ..optimization import BayesianOptimizationConfig
 
 __all__ = [
     "OrchestratorService",
@@ -39,4 +40,5 @@ __all__ = [
     "stop_timeout_s",
     "VisionAdapterProtocol",
     "GenericVisionAdapter",
+    "BayesianOptimizationConfig",
 ]

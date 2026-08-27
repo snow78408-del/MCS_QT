@@ -108,6 +108,10 @@ class DisturbancePrediction:
     safety_fallback: bool = False
     model_version: str = ""
     reason: str = ""
+    prediction_horizon_ms: float = 0.0
+    leading_signal_available: bool = False
+    signal_lead_time_ms: float = 0.0
+    leading_signal_name: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

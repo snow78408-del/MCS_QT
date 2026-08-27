@@ -15,13 +15,14 @@
 4. 连接泵硬件并完成探测/回读。
 5. 下发并校验初始 Q1/Q2。
 6. 初始化完成后，用户点击开始运行。
-7. 周期读取识别结果并调用 PID。
-8. 根据 PID 输出执行：
+7. 可选：先运行安全 BO 寻找工作点并经过稳定保持，再切换 PID。
+8. 周期读取识别结果并调用 PID。
+9. 根据 PID 输出执行：
 - 冻结：保持当前流速。
 - 建议停机：执行停泵保护并进入异常/停止状态。
 - 正常：下发新流速并回读校验。
-9. 前端周期刷新识别、泵和控制状态。
-10. 用户停止时，停止控制循环、停泵、停止识别，进入 `STOPPED`。
+10. 前端周期刷新识别、泵和控制状态。
+11. 用户停止时，停止控制循环、停泵、停止识别，进入 `STOPPED`。
 
 ## 3. 本地视频模式流程
 1. 接收前端配置。
@@ -54,6 +55,8 @@
 - `VIDEO_READY`：视频源已准备。
 - `INITIALIZING`：初始化中（设备连接/回读/初始下发）。
 - `INITIALIZED`：初始化完成，可开始运行。
+- `OPTIMIZING`：BO 独占泵写权限并搜索安全工作点。
+- `STABILIZING`：保持 BO 最优点，等待有效稳定窗口。
 - `RUNNING`：运行中。
 - `PAUSED`：暂停中。
 - `STOPPING`：停止中。
@@ -61,7 +64,9 @@
 - `ERROR`：异常状态。
 
 推荐主路径：
-`IDLE -> CONFIGURED -> VIDEO_READY -> INITIALIZING -> INITIALIZED -> RUNNING -> STOPPING -> STOPPED`
+`IDLE -> CONFIGURED -> VIDEO_READY -> INITIALIZING -> INITIALIZED -> OPTIMIZING -> STABILIZING -> RUNNING -> STOPPING -> STOPPED`
+
+也可跳过 BO，从 `INITIALIZED` 直接进入 `RUNNING`。详细安全门控见 `docs/bo_pid_feedforward.md`。
 
 ## 7. 目录关键文件
 - `service.py`：耦合层主服务实现（流程调度与循环执行）。

@@ -8,6 +8,7 @@ from dataclasses import asdict
 from typing import Any, Callable
 
 from ..disturbance_model import DisturbanceModelConfig, DisturbanceModelService
+from ..optimization import BayesianOptimizationConfig, OptimizationObservation, SafeBayesianOptimizer
 from ..pid_control import DiameterPIDController, PIDConfig, PIDInput, PumpState, TargetParams, VisionMetrics
 from ..pump_hardware import ChannelParams, PumpHardwareService
 from .config import OrchestratorConfig
@@ -20,7 +21,7 @@ from .models import (
     SystemConfig,
     SystemSnapshot,
 )
-from .pid_database import PIDSessionRecorder
+from .pid_database import PIDReplayData, PIDSessionRecorder, load_pid_replay
 from .safety import RunToken, SafetyState, SafetySupervisor
 from .state import SystemState
 from .vision_adapter import GenericVisionAdapter, PipelineVisionService, VisionAdapterProtocol
@@ -101,6 +102,12 @@ class OrchestratorService:
         self._last_seen_vision_period_id: int | None = None
         self._last_disturbance_prediction = None
         self._disturbance_context: dict[str, Any] = {}
+        self._target_revision = 0
+        self._optimizer: SafeBayesianOptimizer | None = None
+        self._optimization_candidate = None
+        self._optimization_candidate_applied_monotonic = 0.0
+        self._optimization_candidate_period_id = 0
+        self._stabilizing_until_monotonic = 0.0
         self._run_token: RunToken | None = None
         self._safety = SafetySupervisor(self._safety_stop_pump, logger=self._log)
         self._refresh_pump_channels(communication_ok=False, error="not connected")
@@ -256,6 +263,9 @@ class OrchestratorService:
         disturbance_stage: str = "baseline",
         disturbance_amplitude: float = 0.0,
         temperature_c: float | None = None,
+        leading_signal_available: bool = False,
+        signal_lead_time_ms: float = 0.0,
+        leading_signal_name: str = "",
     ) -> None:
         self._disturbance_context = {
             "experiment_id": experiment_id,
@@ -264,6 +274,12 @@ class OrchestratorService:
             "disturbance_stage": disturbance_stage,
             "disturbance_amplitude": disturbance_amplitude,
             "temperature_c": temperature_c,
+            "leading_signal_available": bool(leading_signal_available),
+            "signal_lead_time_ms": max(0.0, float(signal_lead_time_ms)),
+            "leading_signal_name": str(leading_signal_name or ""),
+            "leading_signal_observed_monotonic": (
+                time.monotonic() if leading_signal_available else 0.0
+            ),
         }
 
     def _is_realtime_mode(self) -> bool:
@@ -325,9 +341,56 @@ class OrchestratorService:
 
         with self._lock:
             self._cfg = system_config
+            self._target_revision += 1
+            self._optimizer = None
+            self._optimization_candidate = None
+            self._optimization_candidate_applied_monotonic = 0.0
+            self._optimization_candidate_period_id = 0
+            self._stabilizing_until_monotonic = 0.0
+            self._pump_state.pump_response_delay_ms = None
+            self._pump_state.pump_response_measurement_status = "unmeasured"
             self._error = ""
             self._message = "configured"
         self._set_state(SystemState.CONFIGURED, message="configured")
+
+    def update_target_diameter(self, target_diameter_um: float) -> dict[str, Any]:
+        """Update the PID setpoint without restarting the active experiment."""
+        target = float(target_diameter_um)
+        if not math.isfinite(target) or target <= 0.0:
+            raise ValueError("target diameter must be finite and positive")
+
+        allowed_states = {
+            SystemState.CONFIGURED,
+            SystemState.VIDEO_READY,
+            SystemState.INITIALIZED,
+            SystemState.RUNNING,
+            SystemState.PAUSED,
+            SystemState.STOPPED,
+        }
+        with self._lock:
+            if self._cfg is None:
+                raise RuntimeError("system config is missing, call configure() first")
+            if self._state not in allowed_states:
+                raise RuntimeError(
+                    f"state does not allow target update: {self._state.value}"
+                )
+            previous = float(self._cfg.target_diameter)
+            self._cfg.target_diameter = target
+            self._target_revision += 1
+            revision = self._target_revision
+            state = self._state
+
+        self._log(
+            "[PID][TARGET][UPDATED] "
+            f"previous={previous:.6f}um target={target:.6f}um "
+            f"revision={revision} state={state.value}"
+        )
+        return {
+            "previous_target_diameter_um": previous,
+            "target_diameter_um": target,
+            "target_revision": revision,
+            "state": state.value,
+        }
 
     def prepare_video(self) -> None:
         with self._lock:
@@ -498,7 +561,7 @@ class OrchestratorService:
             raise ValueError("校验位仅支持 E 或 N")
         if float(q1) <= 0.0 or float(q2) <= 0.0:
             raise ValueError("Q1 和 Q2 必须大于 0")
-        if self._state == SystemState.RUNNING:
+        if self._state in {SystemState.OPTIMIZING, SystemState.STABILIZING, SystemState.RUNNING}:
             raise RuntimeError("系统正在运行，不能执行泵机交互测试")
 
         steps: list[dict[str, Any]] = []
@@ -725,7 +788,7 @@ class OrchestratorService:
         with self._lock:
             if (
                 generation != self._lifecycle_generation
-                or self._state != SystemState.RUNNING
+                or self._state not in {SystemState.OPTIMIZING, SystemState.STABILIZING, SystemState.RUNNING}
                 or self._stop_event.is_set()
                 or self._pause_event.is_set()
             ):
@@ -734,7 +797,7 @@ class OrchestratorService:
         with self._lock:
             current = (
                 generation == self._lifecycle_generation
-                and self._state == SystemState.RUNNING
+                and self._state in {SystemState.OPTIMIZING, SystemState.STABILIZING, SystemState.RUNNING}
                 and not self._stop_event.is_set()
                 and not self._pause_event.is_set()
             )
@@ -850,12 +913,65 @@ class OrchestratorService:
                 raise RuntimeError("start is already in progress")
             self._start_in_progress = True
         try:
-            self._start_impl()
+            self._start_impl(SystemState.RUNNING)
         finally:
             with self._lock:
                 self._start_in_progress = False
 
-    def _start_impl(self) -> None:
+    def start_optimization(self, config: BayesianOptimizationConfig) -> None:
+        """Start a bounded BO commissioning run before enabling PID control."""
+        with self._lock:
+            if self._cfg is None:
+                raise RuntimeError("system config is missing, call configure() first")
+            if not self._is_realtime_mode():
+                raise RuntimeError("BO requires realtime vision and pump control")
+            if abs(float(config.target_diameter_um) - float(self._cfg.target_diameter)) > 1e-9:
+                raise ValueError("optimizer target must equal the configured PID target")
+            if float(config.q1_min) < float(self.pid_config.q1_min) or float(config.q1_max) > float(self.pid_config.q1_max):
+                raise ValueError("optimizer Q1 bounds exceed controller safety limits")
+            if float(config.q2_min) < float(self.pid_config.q2_min) or float(config.q2_max) > float(self.pid_config.q2_max):
+                raise ValueError("optimizer Q2 bounds exceed controller safety limits")
+            if float(config.min_q1_q2_gap) < float(self.pid_config.min_q1_q2_gap):
+                raise ValueError("optimizer phase gap is weaker than controller safety limit")
+            if float(config.total_flow_max) > float(self.pid_config.total_flow_max):
+                raise ValueError("optimizer total-flow limit exceeds controller safety limit")
+            self._optimizer = SafeBayesianOptimizer(config)
+            self._optimization_candidate = None
+            self._optimization_candidate_applied_monotonic = 0.0
+            self._optimization_candidate_period_id = 0
+            self._stabilizing_until_monotonic = 0.0
+            previous_delay = self._pump_state.pump_response_delay_ms
+            previous_delay_status = self._pump_state.pump_response_measurement_status
+            self._pump_state.pump_response_delay_ms = float(
+                config.measured_response_delay_ms + config.response_delay_uncertainty_ms
+            )
+            self._pump_state.pump_response_measurement_status = (
+                f"{config.response_delay_source}; uncertainty +{config.response_delay_uncertainty_ms:.0f} ms"
+            )
+        try:
+            self.start_with_mode(SystemState.OPTIMIZING)
+        except Exception:
+            with self._lock:
+                self._optimizer = None
+                self._optimization_candidate = None
+                self._pump_state.pump_response_delay_ms = previous_delay
+                self._pump_state.pump_response_measurement_status = previous_delay_status
+            raise
+
+    def start_with_mode(self, start_state: SystemState) -> None:
+        if start_state not in {SystemState.OPTIMIZING, SystemState.RUNNING}:
+            raise ValueError("start mode must be OPTIMIZING or RUNNING")
+        with self._lock:
+            if self._start_in_progress:
+                raise RuntimeError("start is already in progress")
+            self._start_in_progress = True
+        try:
+            self._start_impl(start_state)
+        finally:
+            with self._lock:
+                self._start_in_progress = False
+
+    def _start_impl(self, start_state: SystemState = SystemState.RUNNING) -> None:
         with self._lock:
             if self._state not in {SystemState.INITIALIZED, SystemState.PAUSED, SystemState.STOPPED}:
                 raise RuntimeError(f"state does not allow start: {self._state.value}")
@@ -1018,7 +1134,7 @@ class OrchestratorService:
                     daemon=True,
                 )
                 self._loop_thread.start()
-                self._state = SystemState.RUNNING
+                self._state = start_state
         if stale:
             self._rollback_start(
                 adapter_started=adapter_started,
@@ -1026,12 +1142,16 @@ class OrchestratorService:
                 stop_pump=True,
             )
             raise RuntimeError("start superseded by a lifecycle transition")
-        self._log("[PID][START] PID feedback started")
-        self._set_state(SystemState.RUNNING, message="running")
+        if start_state == SystemState.OPTIMIZING:
+            self._log("[BO][START] safe operating-point optimization started; PID and feedforward disabled")
+            self._set_state(SystemState.OPTIMIZING, message="optimizing operating point")
+        else:
+            self._log("[PID][START] PID feedback started")
+            self._set_state(SystemState.RUNNING, message="running")
 
     def pause(self) -> None:
         with self._lock:
-            if self._state != SystemState.RUNNING:
+            if self._state not in {SystemState.OPTIMIZING, SystemState.STABILIZING, SystemState.RUNNING}:
                 return
             # Invalidate both guards before any pump I/O so an in-flight
             # control step cannot publish another command after pause.
@@ -1130,6 +1250,9 @@ class OrchestratorService:
         )
         return result
 
+    def load_pid_replay(self, database_path: str) -> PIDReplayData:
+        return load_pid_replay(database_path)
+
     def discard_pid_session_data(self) -> None:
         status = self._pid_data_recorder.status()
         self._pid_data_recorder.discard()
@@ -1175,6 +1298,11 @@ class OrchestratorService:
                         else None
                     ),
                     safety=asdict(self._safety.snapshot()),
+                    optimization=(
+                        self._optimizer.status().to_dict()
+                        if self._optimizer is not None
+                        else None
+                    ),
                 )
             )
 
@@ -1359,7 +1487,11 @@ class OrchestratorService:
                 q2_command_ul_min=float(ctrl.q2_command),
                 q1_actual_ul_min=None if q1_actual is None else float(q1_actual),
                 q2_actual_ul_min=None if q2_actual is None else float(q2_actual),
-                target_diameter_um=None if cfg is None else float(cfg.target_diameter),
+                target_diameter_um=(
+                    float(ctrl.target_diameter_um)
+                    if ctrl.target_diameter_um is not None
+                    else None if cfg is None else float(cfg.target_diameter)
+                ),
                 measured_diameter_um=(
                     None if rec is None or rec.avg_diameter is None else float(rec.avg_diameter)
                 ),
@@ -1425,7 +1557,7 @@ class OrchestratorService:
                 with self._lock:
                     lifecycle_valid = (
                         generation == self._lifecycle_generation
-                        and self._state == SystemState.RUNNING
+                        and self._state in {SystemState.OPTIMIZING, SystemState.STABILIZING, SystemState.RUNNING}
                         and self._pump_control_enabled
                         and not self._pause_event.is_set()
                         and not self._stop_event.is_set()
@@ -1458,7 +1590,7 @@ class OrchestratorService:
         if lock is not None:
             with lock:
                 if (
-                    self._state != SystemState.RUNNING
+                    self._state not in {SystemState.OPTIMIZING, SystemState.STABILIZING, SystemState.RUNNING}
                     or self._stop_event.is_set()
                     or self._pause_event.is_set()
                 ):
@@ -1571,6 +1703,9 @@ class OrchestratorService:
 
         if not rec.valid_for_control:
             reason = rec.reason or rec.control_reason or "recognition result invalid"
+            self._reject_optimization_window_if_due(
+                reason, monotonic_now, int(rec.control_period_id or 0)
+            )
             ctrl = ControlSnapshot(
                 diameter_error=0.0,
                 adjustment=0.0,
@@ -1605,6 +1740,9 @@ class OrchestratorService:
             control_interval_ms * 1.5,
         )
         if rec.timestamp <= 0.0 or recognition_age_ms > recognition_age_limit_ms:
+            self._reject_optimization_window_if_due(
+                "recognition result stale", monotonic_now, int(rec.control_period_id or 0)
+            )
             ctrl = ControlSnapshot(
                 diameter_error=0.0,
                 adjustment=0.0,
@@ -1680,12 +1818,34 @@ class OrchestratorService:
             self._set_state(SystemState.ERROR, error=reason)
             return
 
+        with self._lock:
+            if self._cfg is None:
+                raise RuntimeError("missing parameters required for PID")
+            target_diameter_um = float(self._cfg.target_diameter)
+            target_revision = int(getattr(self, "_target_revision", 0))
+            control_config = copy.copy(self._cfg)
+            control_state = self._state
+
+        if control_state == SystemState.OPTIMIZING:
+            self._run_optimization_step(
+                rec=rec,
+                current_diameter_um=float(current_avg_diameter),
+                generation=generation,
+                token=token,
+                now=now,
+                monotonic_now=monotonic_now,
+            )
+            return
+        if control_state == SystemState.STABILIZING:
+            self._run_stabilizing_step(rec=rec, now=now, monotonic_now=monotonic_now)
+            return
+
         vm = VisionMetrics(
             avg_diameter=float(current_avg_diameter),
             droplet_count=int(rec.frame_droplet_count),
             valid_for_control=bool(rec.valid_for_control),
         )
-        tp = TargetParams(target_diameter=float(self._cfg.target_diameter))
+        tp = TargetParams(target_diameter=target_diameter_um)
         ps = PumpState(q1=float(self._pump_state.q1), q2=float(self._pump_state.q2))
 
         expected_ms = (
@@ -1698,17 +1858,33 @@ class OrchestratorService:
             recognition=rec,
             pump_state=self._pump_state,
             control=self._control,
-            config=self._cfg,
-            system_state=self._state,
+            config=control_config,
+            system_state=control_state,
             dt=dt,
             jitter_ms=jitter_ms,
             disturbance=self._disturbance_context,
         )
         prediction = self.disturbance_service.predict(disturbance_sample)
+        # A leading disturbance signal is operational context, not a learned
+        # feature persisted in the sample database. This prevents historical
+        # event markers from being replayed as if they were observable now.
+        if prediction is not None:
+            signal_declared = bool(self._disturbance_context.get("leading_signal_available", False))
+            observed = float(self._disturbance_context.get("leading_signal_observed_monotonic", 0.0) or 0.0)
+            elapsed_ms = max(0.0, (time.monotonic() - observed) * 1000.0) if observed > 0.0 else float("inf")
+            remaining_lead_ms = max(
+                0.0,
+                float(self._disturbance_context.get("signal_lead_time_ms", 0.0) or 0.0) - elapsed_ms,
+            )
+            prediction.leading_signal_available = bool(signal_declared and remaining_lead_ms > 0.0)
+            prediction.signal_lead_time_ms = remaining_lead_ms
+            prediction.leading_signal_name = str(
+                self._disturbance_context.get("leading_signal_name", "") or ""
+            )
         self._last_disturbance_prediction = prediction
 
         pid_input = PIDInput(
-            target_diameter_um=float(self._cfg.target_diameter),
+            target_diameter_um=target_diameter_um,
             current_diameter_um=float(current_avg_diameter),
             current_q1=float(self._pump_state.q1),
             current_q2=float(self._pump_state.q2),
@@ -1724,6 +1900,7 @@ class OrchestratorService:
             pump_response_delay_ms=float(getattr(disturbance_sample, "pump_response_delay_ms", 0.0) or 0.0),
         )
         cmd = self._pid_controller.update_input(pid_input)
+        operating_point = self._pid_controller.operating_point
         if int(rec.frame_id) > 0:
             self._last_control_frame_id = int(rec.frame_id)
             self._last_control_period_id = int(rec.control_period_id)
@@ -1758,6 +1935,13 @@ class OrchestratorService:
             session_id=(token.session_id if token is not None else ""),
             run_generation=(token.generation if token is not None else 0),
             monotonic_timestamp=monotonic_now,
+            target_diameter_um=target_diameter_um,
+            control_owner=str(cmd.control_owner or "PID"),
+            operating_point_q1=(None if operating_point is None else operating_point[0]),
+            operating_point_q2=(None if operating_point is None else operating_point[1]),
+            actuator_saturated=bool(cmd.actuator_saturated),
+            requested_output=float(cmd.requested_output),
+            realized_output=float(cmd.realized_output),
         )
 
         if cmd.freeze_feedback:
@@ -1802,6 +1986,7 @@ class OrchestratorService:
             f"kp={cmd.kp:.6f} ki={cmd.ki:.6f} kd={cmd.kd:.6f} "
             f"q1_gain={cmd.q1_output_gain:.3f} q2_gain={cmd.q2_output_gain:.3f} "
             f"q1={cmd.q1:.6f}, q2={cmd.q2:.6f}, adj={cmd.adjustment:.6f} "
+            f"owner={cmd.control_owner} saturated={cmd.actuator_saturated} "
             f"adaptive_reason={cmd.adaptive_reason}"
         )
         # Revalidate immediately before hardware I/O. The safety token binds
@@ -1812,11 +1997,20 @@ class OrchestratorService:
         with self._lock:
             if (
                 generation != self._lifecycle_generation
-                or self._state != SystemState.RUNNING
+                or self._state not in {SystemState.OPTIMIZING, SystemState.STABILIZING, SystemState.RUNNING}
                 or self._stop_event.is_set()
                 or self._pause_event.is_set()
             ):
                 raise RuntimeError("pump command rejected because the run is stopping or paused")
+            if target_revision != int(getattr(self, "_target_revision", 0)):
+                ctrl.freeze_feedback = True
+                ctrl.reason = (
+                    "target changed during control calculation; "
+                    "discard old command and recompute on the next control period"
+                )
+                self._log(f"[PID][TARGET][RACE] {ctrl.reason}")
+                self._update_control_snapshot(ctrl)
+                return
         update_res = self._update_flow_with_lifecycle_guard(cmd.q1, cmd.q2, generation)
         if update_res is None:
             return
@@ -1867,6 +2061,225 @@ class OrchestratorService:
 
         self._update_control_snapshot(ctrl)
 
+    def _reject_optimization_window_if_due(
+        self,
+        reason: str,
+        monotonic_now: float,
+        control_period_id: int,
+    ) -> None:
+        with self._lock:
+            optimizer = self._optimizer
+            candidate = self._optimization_candidate
+            state = self._state
+            applied = self._optimization_candidate_applied_monotonic
+        if optimizer is None or candidate is None or state != SystemState.OPTIMIZING:
+            return
+        elapsed_ms = max(0.0, (monotonic_now - applied) * 1000.0)
+        if elapsed_ms > float(optimizer.config.candidate_timeout_ms):
+            raise RuntimeError(
+                f"BO candidate {candidate.candidate_id} timed out after {elapsed_ms:.0f} ms"
+            )
+        settle_s = float(optimizer.config.settling_time_ms) / 1000.0
+        if monotonic_now - applied < settle_s:
+            return
+        if int(control_period_id or 0) <= int(self._optimization_candidate_period_id or 0):
+            return
+        self._optimization_candidate_period_id = int(control_period_id)
+        optimizer.reject_current(reason)
+        status = optimizer.status()
+        self._log(f"[BO][QUALITY][REJECT] candidate={candidate.candidate_id} reason={reason}")
+        if status.failed:
+            raise RuntimeError(f"BO failed: {status.reason}")
+
+    def _run_optimization_step(
+        self,
+        *,
+        rec: RecognitionSnapshot,
+        current_diameter_um: float,
+        generation: int,
+        token: RunToken | None,
+        now: float,
+        monotonic_now: float,
+    ) -> None:
+        optimizer = self._optimizer
+        if optimizer is None:
+            raise RuntimeError("OPTIMIZING state has no optimizer")
+        candidate = self._optimization_candidate
+        if candidate is None:
+            self._apply_next_optimization_candidate(optimizer, generation, token, now, monotonic_now, rec)
+            return
+
+        elapsed_ms = max(0.0, (monotonic_now - self._optimization_candidate_applied_monotonic) * 1000.0)
+        if elapsed_ms > float(optimizer.config.candidate_timeout_ms):
+            raise RuntimeError(
+                f"BO candidate {candidate.candidate_id} timed out after {elapsed_ms:.0f} ms"
+            )
+        if elapsed_ms < float(optimizer.config.settling_time_ms):
+            self._update_control_snapshot(
+                self._optimization_snapshot(
+                    now,
+                    candidate.q1,
+                    candidate.q2,
+                    f"BO candidate settling ({elapsed_ms:.0f}/{optimizer.config.settling_time_ms:.0f} ms)",
+                )
+            )
+            return
+        if int(rec.control_period_id or 0) <= int(self._optimization_candidate_period_id or 0):
+            return
+
+        raw_count = len(list(rec.raw_frame_diameters or []))
+        accepted_count = len(list(rec.frame_diameters or []))
+        invalid_fraction = (
+            max(0.0, min(1.0, float(raw_count - accepted_count) / float(raw_count)))
+            if raw_count > 0
+            else 0.0
+        )
+        observation = OptimizationObservation(
+            candidate_id=int(candidate.candidate_id),
+            q1=float(self._pump_state.q1_actual if self._pump_state.q1_actual is not None else candidate.q1),
+            q2=float(self._pump_state.q2_actual if self._pump_state.q2_actual is not None else candidate.q2),
+            diameter_um=float(current_diameter_um),
+            frequency_hz=float(rec.droplet_generation_rate_hz),
+            diameter_cv_percent=(None if rec.frame_diameter_cv is None else float(rec.frame_diameter_cv)),
+            valid_droplets=int(len(rec.frame_diameters or [])),
+            invalid_fraction=invalid_fraction,
+            measurement_valid=bool(rec.valid_for_control),
+            invalid_reason=str(rec.reason or rec.control_reason or ""),
+        )
+        optimizer.tell(observation)
+        status = optimizer.status()
+        self._log(
+            f"[BO][OBSERVE] candidate={candidate.candidate_id} q1={candidate.q1:.6f} q2={candidate.q2:.6f} "
+            f"diameter={current_diameter_um:.6f} objective={status.objective_history[-1] if status.objective_history else float('nan'):.6f} "
+            f"phase={status.phase}"
+        )
+        if status.failed:
+            raise RuntimeError(f"BO failed: {status.reason}")
+        if status.completed:
+            best = status.best_operating_point
+            if best is None:
+                raise RuntimeError("BO completed without an operating point")
+            if abs(float(best.q1) - float(candidate.q1)) > 1e-9 or abs(float(best.q2) - float(candidate.q2)) > 1e-9:
+                self._apply_optimizer_flow(best.q1, best.q2, generation, token)
+            self._optimization_candidate = None
+            self._stabilizing_until_monotonic = monotonic_now + float(optimizer.config.settling_time_ms) / 1000.0
+            self._set_state(SystemState.STABILIZING, message="BO completed; holding optimum before PID")
+            self._update_control_snapshot(
+                self._optimization_snapshot(now, best.q1, best.q2, "BO completed; stabilizing at optimum")
+            )
+            return
+        self._optimization_candidate = None
+        self._apply_next_optimization_candidate(optimizer, generation, token, now, monotonic_now, rec)
+
+    def _apply_next_optimization_candidate(
+        self,
+        optimizer: SafeBayesianOptimizer,
+        generation: int,
+        token: RunToken | None,
+        now: float,
+        monotonic_now: float,
+        rec: RecognitionSnapshot,
+    ) -> None:
+        candidate = optimizer.ask()
+        self._require_valid_phase_flows(candidate.q1, candidate.q2)
+        self._apply_optimizer_flow(candidate.q1, candidate.q2, generation, token)
+        self._optimization_candidate = candidate
+        self._optimization_candidate_applied_monotonic = monotonic_now
+        self._optimization_candidate_period_id = int(rec.control_period_id or 0)
+        self._log(
+            f"[BO][APPLY] candidate={candidate.candidate_id} q1={candidate.q1:.6f} "
+            f"q2={candidate.q2:.6f} reason={candidate.reason}"
+        )
+        self._update_control_snapshot(
+            self._optimization_snapshot(now, candidate.q1, candidate.q2, candidate.reason)
+        )
+
+    def _apply_optimizer_flow(
+        self,
+        q1: float,
+        q2: float,
+        generation: int,
+        token: RunToken | None,
+    ) -> None:
+        if token is None or not self._safety.permits(token):
+            raise RuntimeError("BO pump command rejected because run token is invalid")
+        result = self._update_flow_with_lifecycle_guard(float(q1), float(q2), generation)
+        if result is None:
+            raise RuntimeError("BO pump command superseded by lifecycle transition")
+        if not result.ok:
+            raise RuntimeError(f"BO pump update failed: {result.reason or result.error}")
+        q1_actual = self._flow_from_channel_params(result.verified_q1) or float(q1)
+        q2_actual = self._flow_from_channel_params(result.verified_q2) or float(q2)
+        ok1, reason1 = self._flow_matches("Q1", q1, q1_actual)
+        ok2, reason2 = self._flow_matches("Q2", q2, q2_actual)
+        if not (ok1 and ok2):
+            raise RuntimeError(f"BO readback mismatch: {reason1 or reason2}")
+        self._pump_state.q1 = float(q1)
+        self._pump_state.q2 = float(q2)
+        self._pump_state.q1_actual = float(q1_actual)
+        self._pump_state.q2_actual = float(q2_actual)
+        self._pump_state.last_update_ok = True
+        self._pump_state.last_update_reason = "BO flow update succeeded"
+        self._pump_state.last_error = ""
+        self._refresh_pump_channels(communication_ok=True, error="")
+
+    def _run_stabilizing_step(
+        self,
+        *,
+        rec: RecognitionSnapshot,
+        now: float,
+        monotonic_now: float,
+    ) -> None:
+        optimizer = self._optimizer
+        if optimizer is None:
+            raise RuntimeError("STABILIZING state has no optimizer")
+        status = optimizer.status()
+        best = status.best_operating_point
+        if best is None:
+            raise RuntimeError("STABILIZING state has no BO operating point")
+        if monotonic_now < self._stabilizing_until_monotonic:
+            remaining_ms = (self._stabilizing_until_monotonic - monotonic_now) * 1000.0
+            self._update_control_snapshot(
+                self._optimization_snapshot(now, best.q1, best.q2, f"holding optimum ({remaining_ms:.0f} ms remaining)")
+            )
+            return
+        if not rec.valid_for_control or int(len(rec.frame_diameters or [])) < int(optimizer.config.minimum_valid_droplets):
+            self._update_control_snapshot(
+                self._optimization_snapshot(now, best.q1, best.q2, "waiting for a valid settled confirmation window")
+            )
+            return
+        q1_actual = float(self._pump_state.q1_actual if self._pump_state.q1_actual is not None else best.q1)
+        q2_actual = float(self._pump_state.q2_actual if self._pump_state.q2_actual is not None else best.q2)
+        self._pid_controller.set_operating_point(q1_actual, q2_actual)
+        self._last_control_frame_id = int(rec.frame_id or 0)
+        self._last_control_period_id = int(rec.control_period_id or 0)
+        self._last_control_ts = monotonic_now
+        self._set_state(SystemState.RUNNING, message="BO optimum accepted; PID control enabled")
+        self._update_control_snapshot(
+            self._optimization_snapshot(now, q1_actual, q2_actual, "bumpless transfer complete; PID enabled")
+        )
+        self._log(
+            f"[BO][TRANSFER] q1_bias={q1_actual:.6f} q2_bias={q2_actual:.6f}; "
+            "PID reset and feedforward remains subject to deployment gates"
+        )
+
+    def _optimization_snapshot(self, now: float, q1: float, q2: float, reason: str) -> ControlSnapshot:
+        return ControlSnapshot(
+            diameter_error=0.0,
+            adjustment=0.0,
+            q1_command=float(q1),
+            q2_command=float(q2),
+            freeze_feedback=True,
+            suggested_stop=False,
+            reason=str(reason),
+            timestamp=float(now),
+            control_mode="BO_OPERATING_POINT",
+            control_owner="BO" if self._state == SystemState.OPTIMIZING else "HOLD",
+            operating_point_q1=float(q1),
+            operating_point_q2=float(q2),
+            target_diameter_um=(None if self._cfg is None else float(self._cfg.target_diameter)),
+        )
+
 
 _RUNTIME_MESSAGE_LABELS = {
     "": "",
@@ -1875,6 +2288,9 @@ _RUNTIME_MESSAGE_LABELS = {
     "initializing": "正在初始化",
     "initialized": "初始化完成",
     "running": "系统运行中",
+    "bo optimization running": "BO 正在寻找安全工作点",
+    "bo completed; holding optimum before pid": "BO 完成，正在稳定保持后切换 PID",
+    "bo optimum accepted; pid control enabled": "最优工作点已确认，PID 已接管",
     "paused": "系统已暂停",
     "stopping": "正在停止",
     "stopped": "系统已停止",

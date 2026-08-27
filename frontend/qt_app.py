@@ -16,10 +16,10 @@ from PySide6.QtCore import QLockFile, QObject, QPoint, QRect, QRunnable, QSize, 
 from PySide6.QtGui import QColor, QCloseEvent, QFont, QFontDatabase, QImage, QMouseEvent, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout,
     QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSplitter, QStackedWidget,
+    QInputDialog, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSplitter, QStackedWidget,
     QVBoxLayout, QWidget)
 
-from backend.orchestrator import OrchestratorService
+from backend.orchestrator import BayesianOptimizationConfig, OrchestratorService
 from backend.orchestrator.models import SystemConfig
 from backend.vision.calibration import load_calibration
 from .config import APP_TITLE, DEFAULT_REFRESH_INTERVAL_MS
@@ -27,6 +27,7 @@ from .runtime_logging import create_runtime_logger
 from .settings_store import FrontendSettingsStore
 from .vision_tuning import TuningWindow
 from .paths import ensure_user_subdir
+from .pid_replay import PIDReplayDialog
 
 
 def jsonable(value):
@@ -730,14 +731,19 @@ class MonitorPage(Page):
         self._status_poller = None
         self._last_control_status_ts = 0.0
         self._gallery_dialog = None
+        self._replay_dialog = None
         layout = QVBoxLayout(self)
         layout.addWidget(app.title("运行监控", "视频、识别、泵机与 PID 状态分别刷新"))
         controls=QHBoxLayout()
         self.action_buttons={}
         for text,callback in (("初始化",app.configure_prepare_initialize),("开始",app.orchestrator.start),("暂停",app.orchestrator.pause),("继续",app.orchestrator.resume),("复位安全锁",app.orchestrator.reset_safety_latch)):
             button=QPushButton(text); button.clicked.connect(lambda _=False,cb=callback:app.task(cb)); controls.addWidget(button); self.action_buttons[text]=button
+        self.bo_button=QPushButton("BO寻优"); self.bo_button.clicked.connect(self._start_bo); controls.addWidget(self.bo_button)
         self.preflight_button=QPushButton("实验前检查"); self.preflight_button.clicked.connect(self._run_preflight); controls.addWidget(self.preflight_button)
         self.stop_button=QPushButton("停止"); self.stop_button.clicked.connect(self._stop_pid); controls.addWidget(self.stop_button)
+        self.target_button=QPushButton("更改目标"); self.target_button.clicked.connect(self._change_target_diameter); controls.addWidget(self.target_button)
+        self.save_data_button=QPushButton("保存数据"); self.save_data_button.clicked.connect(self._save_pid_data); controls.addWidget(self.save_data_button)
+        self.import_data_button=QPushButton("导入数据"); self.import_data_button.clicked.connect(self._import_pid_data); controls.addWidget(self.import_data_button)
         self.gallery_button = QPushButton("上一周期识别帧")
         self.gallery_button.clicked.connect(self._show_last_period_droplets)
         controls.addWidget(self.gallery_button)
@@ -826,6 +832,49 @@ class MonitorPage(Page):
             return
         QMessageBox.warning(self,"实验前检查未通过","\n".join(f"• {item}" for item in issues))
 
+    def _start_bo(self):
+        try:
+            snapshot=self.app.orchestrator.get_snapshot()
+            config=getattr(snapshot,"config",None)
+            if config is None:
+                raise RuntimeError("请先完成参数配置和系统初始化")
+            q1=float(config.initial_q1); q2=float(config.initial_q2)
+            target=float(config.target_diameter)
+        except Exception as exc:
+            QMessageBox.warning(self,"无法启动 BO",str(exc)); return
+
+        dialog=QDialog(self); dialog.setWindowTitle("安全 BO 工作点寻优")
+        layout=QVBoxLayout(dialog)
+        note=QLabel("仅填写实际实验测得的泵到液滴响应延迟；串口应答时间不能作为响应延迟。BO 期间 PID 与前馈不写泵。")
+        note.setWordWrap(True); layout.addWidget(note)
+        form=QFormLayout(); fields={}
+        defaults={
+            "q1_min":max(0.2,q1*0.7), "q1_max":q1*1.3,
+            "q2_min":max(0.2,q2*0.7), "q2_max":q2*1.3,
+            "delay":"", "uncertainty":"", "settling":"", "source":"阶跃实验",
+        }
+        for key,label in (("q1_min","Q1 下限 (uL/min)"),("q1_max","Q1 上限 (uL/min)"),("q2_min","Q2 下限 (uL/min)"),("q2_max","Q2 上限 (uL/min)"),("delay","实测响应延迟 (ms)"),("uncertainty","延迟不确定度/安全余量 (ms)"),("settling","候选点稳定时间 (ms)"),("source","延迟测量来源")):
+            edit=QLineEdit(str(defaults[key])); fields[key]=edit; form.addRow(label,edit)
+        layout.addLayout(form)
+        buttons=QHBoxLayout(); cancel=QPushButton("取消"); start=QPushButton("开始寻优")
+        cancel.clicked.connect(dialog.reject); start.clicked.connect(dialog.accept)
+        buttons.addStretch(); buttons.addWidget(cancel); buttons.addWidget(start); layout.addLayout(buttons)
+        if dialog.exec()!=QDialog.DialogCode.Accepted: return
+        try:
+            delay=float(fields["delay"].text())
+            bo_config=BayesianOptimizationConfig(
+                target_diameter_um=target,
+                q1_min=float(fields["q1_min"].text()), q1_max=float(fields["q1_max"].text()),
+                q2_min=float(fields["q2_min"].text()), q2_max=float(fields["q2_max"].text()),
+                measured_response_delay_ms=delay,
+                response_delay_uncertainty_ms=float(fields["uncertainty"].text()),
+                settling_time_ms=float(fields["settling"].text()),
+                response_delay_source=fields["source"].text().strip(),
+            )
+        except Exception as exc:
+            QMessageBox.warning(self,"BO 参数无效",str(exc)); return
+        self.app.task(lambda:self.app.orchestrator.start_optimization(bo_config),disable=self.bo_button)
+
     def _open_droplet_gallery(self, gallery):
         if self._gallery_dialog is not None:
             self._gallery_dialog.close()
@@ -839,6 +888,43 @@ class MonitorPage(Page):
 
     def _stop_pid(self):
         self.app.task(self.app.orchestrator.stop, self._after_pid_stopped, disable=self.stop_button)
+
+    def _change_target_diameter(self):
+        try:
+            snapshot=self.app.orchestrator.get_snapshot()
+            config=getattr(snapshot,"config",None)
+            current=float(getattr(config,"target_diameter",self.app.frontend_config.get("target_diameter",60.0)))
+        except Exception as exc:
+            QMessageBox.warning(self,"无法读取目标",str(exc))
+            return
+        dialog=QInputDialog(self)
+        dialog.setWindowTitle("更改目标液滴直径")
+        dialog.setLabelText("新的目标液滴平均直径（μm）：")
+        dialog.setInputMode(QInputDialog.InputMode.DoubleInput)
+        dialog.setDoubleRange(0.001,1_000_000.0)
+        dialog.setDoubleDecimals(3)
+        dialog.setDoubleValue(current)
+        dialog.setOkButtonText("确定")
+        dialog.setCancelButtonText("取消")
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        target=dialog.doubleValue()
+        self.app.task(
+            lambda:self.app.orchestrator.update_target_diameter(float(target)),
+            self._target_diameter_updated,
+            disable=self.target_button,
+        )
+
+    def _target_diameter_updated(self,result):
+        target=float(result.get("target_diameter_um"))
+        previous=float(result.get("previous_target_diameter_um"))
+        self.app.save(target_diameter=target)
+        self.refresh_system_panel()
+        self.show_status(self.app.orchestrator.get_snapshot())
+        self.app.runtime_logger(
+            f"[PID][TARGET][UI] {previous:.3f}um -> {target:.3f}um; "
+            "effective from next control period"
+        )
 
     def _after_pid_stopped(self, _result=None):
         status=self.app.orchestrator.get_pid_session_data_status(); count=int(status.get("record_count",0) or 0); summary=self._experiment_summary(count)
@@ -855,6 +941,22 @@ class MonitorPage(Page):
         if answer == QMessageBox.StandardButton.No:
             self.app.orchestrator.discard_pid_session_data()
             return
+        self._choose_and_save_pid_data()
+
+    def _save_pid_data(self):
+        status=self.app.orchestrator.get_pid_session_data_status()
+        if bool(status.get("active",False)):
+            QMessageBox.warning(self,"无法保存","PID 仍在运行，请先停止实验再保存数据。")
+            return
+        if int(status.get("record_count",0) or 0) <= 0:
+            QMessageBox.information(self,"没有数据","当前没有可保存的 PID 控制周期数据。")
+            return
+        if not bool(status.get("has_unsaved_data",False)):
+            QMessageBox.information(self,"无需保存","当前 PID 数据已经保存。")
+            return
+        self._choose_and_save_pid_data()
+
+    def _choose_and_save_pid_data(self):
         default_dir=Path(str(self.app.frontend_config.get("pid_database_dir",ensure_user_subdir("experiments"))))
         default_name=f"pid_data_{time.strftime('%Y%m%d_%H%M%S')}.sqlite"
         selected,_=QFileDialog.getSaveFileName(
@@ -873,7 +975,37 @@ class MonitorPage(Page):
         self.app.task(
             lambda:self.app.orchestrator.save_pid_session_data(str(database_path)),
             self._pid_data_saved,
+            disable=self.save_data_button,
         )
+
+    def _import_pid_data(self):
+        default_dir=Path(str(self.app.frontend_config.get("pid_database_dir",ensure_user_subdir("experiments"))))
+        selected,_=QFileDialog.getOpenFileName(
+            self,
+            "选择已保存的 PID 数据",
+            str(default_dir),
+            "SQLite 数据库 (*.sqlite *.db);;所有文件 (*)",
+        )
+        if not selected:
+            return
+        database_path=Path(selected)
+        self.app.save(pid_database_dir=str(database_path.parent))
+        self.app.task(
+            lambda:self.app.orchestrator.load_pid_replay(str(database_path)),
+            self._open_pid_replay,
+            disable=self.import_data_button,
+        )
+
+    def _open_pid_replay(self,replay):
+        if self._replay_dialog is not None:
+            self._replay_dialog.close()
+        self._replay_dialog=PIDReplayDialog(replay,self)
+        self._replay_dialog.destroyed.connect(
+            lambda _object=None:setattr(self,"_replay_dialog",None)
+        )
+        self._replay_dialog.show()
+        self._replay_dialog.raise_()
+        self._replay_dialog.activateWindow()
 
     def _experiment_summary(self,count):
         try:snapshot=self.app.orchestrator.get_snapshot()
@@ -944,13 +1076,18 @@ class MonitorPage(Page):
         allowed={
             "初始化":{"IDLE","CONFIGURED","VIDEO_READY","STOPPED","ERROR"},
             "开始":{"INITIALIZED","PAUSED","STOPPED"},
-            "暂停":{"RUNNING"},
+            "暂停":{"OPTIMIZING","STABILIZING","RUNNING"},
             "继续":{"PAUSED"},
             "复位安全锁":{"ERROR"},
         }
         for name,button in self.action_buttons.items():
             button.setEnabled(state in allowed[name])
-        self.stop_button.setEnabled(state in {"RUNNING","PAUSED","INITIALIZING","ERROR"})
+        config=getattr(snapshot,"config",None)
+        source_type=str(getattr(config,"video_source_type","") or "").strip().lower()
+        realtime=source_type not in {"file","local","local_video","video"}
+        self.bo_button.setEnabled(realtime and state in {"INITIALIZED","PAUSED","STOPPED"})
+        self.stop_button.setEnabled(state in {"OPTIMIZING","STABILIZING","RUNNING","PAUSED","INITIALIZING","ERROR"})
+        self.target_button.setEnabled(state in {"CONFIGURED","VIDEO_READY","INITIALIZED","RUNNING","PAUSED","STOPPED"})
 
     def refresh_vision_panel(self):
         try:
@@ -990,7 +1127,7 @@ class MonitorPage(Page):
 
     @staticmethod
     def _display_helpers(snap):
-        state_map={"idle":"空闲","configured":"参数已配置","video_ready":"视频已就绪","initializing":"正在初始化","initialized":"初始化完成","running":"运行中","paused":"已暂停","stopping":"正在停止","stopped":"已停止","error":"错误"}
+        state_map={"idle":"空闲","configured":"参数已配置","video_ready":"视频已就绪","initializing":"正在初始化","initialized":"初始化完成","optimizing":"BO 寻优中","stabilizing":"最优点稳定保持中","running":"运行中","paused":"已暂停","stopping":"正在停止","stopped":"已停止","error":"错误"}
         state=getattr(getattr(snap,"system_state",None),"value",getattr(snap,"system_state","--")); state_cn=state_map.get(str(state).lower(),str(state))
         yes=lambda value:"是" if value else "否"
         number=lambda value,digits=2:"--" if value is None else f"{float(value):.{digits}f}"
@@ -999,8 +1136,14 @@ class MonitorPage(Page):
     @staticmethod
     def _system_text(snap):
         state_cn, _yes, _number = MonitorPage._display_helpers(snap)
+        optimization=dict(getattr(snap,"optimization",None) or {})
+        bo_text="未启动"
+        if optimization:
+            bo_text=(f"{optimization.get('phase','--')}，有效观测 {optimization.get('observation_count',0)}，"
+                     f"确认 {optimization.get('confirmation_count',0)}；{optimization.get('reason','') or '无说明'}")
         return "\n".join([
             f"运行状态：{state_cn}",
+            f"BO 状态：{bo_text}",
             f"提示信息：{getattr(snap,'message','') or '无'}",
             f"错误信息：{getattr(snap,'error','') or '无'}",
         ])
@@ -1073,6 +1216,7 @@ class MonitorPage(Page):
     @staticmethod
     def _pid_text(snap):
         ctrl = getattr(snap, "control", None)
+        config = getattr(snap, "config", None)
         _state, yes, number = MonitorPage._display_helpers(snap)
         if ctrl is None:
             return "等待控制数据…"
@@ -1084,13 +1228,20 @@ class MonitorPage(Page):
         else:
             adaptive_status = "未启用"
         return "\n".join([
+            f"控制权所有者：{getattr(ctrl,'control_owner','--')}",
             f"控制模式：{getattr(ctrl,'control_mode','--')}",
             f"自适应状态：{adaptive_status}",
             f"自适应说明：{getattr(ctrl,'adaptive_reason','') or '无'}",
             f"Kp / Ki / Kd：{number(getattr(ctrl,'kp',None),6)} / {number(getattr(ctrl,'ki',None),6)} / {number(getattr(ctrl,'kd',None),6)}",
             f"Q1/Q2 调节倍率：{number(getattr(ctrl,'q1_output_gain',None),2)} : {number(getattr(ctrl,'q2_output_gain',None),2)}",
+            f"当前设定目标：{number(getattr(config,'target_diameter',None),3)} μm",
+            f"本周期采用目标：{number(getattr(ctrl,'target_diameter_um',None),3)} μm",
             f"直径误差：{number(getattr(ctrl,'diameter_error',None))} μm",
-            f"PID / 最终输出：{number(getattr(ctrl,'pid_output',None),4)} / {number(getattr(ctrl,'final_output',None),4)}",
+            f"PID / 前馈 / 最终输出：{number(getattr(ctrl,'pid_output',None),4)} / {number(getattr(ctrl,'feedforward_output',None),4)} / {number(getattr(ctrl,'final_output',None),4)}",
+            f"请求/实际分配输出：{number(getattr(ctrl,'requested_output',None),4)} / {number(getattr(ctrl,'realized_output',None),4)}",
+            f"执行器饱和：{yes(getattr(ctrl,'actuator_saturated',False))}",
+            f"BO/PID 工作点 Q1/Q2：{number(getattr(ctrl,'operating_point_q1',None))} / {number(getattr(ctrl,'operating_point_q2',None))} μL/min",
+            f"前馈状态：{yes(getattr(ctrl,'feedforward_active',False))}；{getattr(ctrl,'feedforward_reason','') or '无'}",
             f"Q1 指令：{number(getattr(ctrl,'q1_command',None))} μL/min",
             f"Q2 指令：{number(getattr(ctrl,'q2_command',None))} μL/min",
             f"反馈冻结：{yes(getattr(ctrl,'freeze_feedback',False))}",

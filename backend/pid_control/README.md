@@ -42,3 +42,9 @@ Safety behavior is internal to this package:
 - output rate changes are limited,
 - feedforward falls back to zero when the model is stale, invalid, or low
   confidence.
+- BO hands its confirmed Q1/Q2 point to `set_operating_point()`, which resets
+  controller history before using that point as the PID bias.
+- PID and feedforward are summed inside this package and pass through one
+  actuator allocator. Saturation is reported and integral windup is prevented.
+- Feedforward also requires a measured physical pump response delay and a
+  causal signal whose lead time exceeds that delay plus the configured margin.

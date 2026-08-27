@@ -23,6 +23,7 @@ class DiameterPIDController(BaseDiameterController):
         self._has_previous = False
         self._last_frame_id: int | None = None
         self._last_output = 0.0
+        self._last_pid_output = 0.0
         self._q1_bias: float | None = None
         self._q2_bias: float | None = None
 
@@ -32,6 +33,7 @@ class DiameterPIDController(BaseDiameterController):
         self._has_previous = False
         self._last_frame_id = None
         self._last_output = 0.0
+        self._last_pid_output = 0.0
         self._q1_bias = None
         self._q2_bias = None
         self.adaptive.reset()
@@ -39,6 +41,26 @@ class DiameterPIDController(BaseDiameterController):
         self.kp = float(self.config.base_kp)
         self.ki = float(self.config.base_ki)
         self.kd = float(self.config.base_kd)
+
+    def set_operating_point(self, q1: float, q2: float) -> None:
+        """Perform a bumpless handoff from BO/hold control to PID control."""
+        q1_value = float(q1)
+        q2_value = float(q2)
+        if not is_finite(q1_value) or not is_finite(q2_value):
+            raise ValueError("operating point must be finite")
+        if q1_value <= 0.0 or q2_value <= 0.0:
+            raise ValueError("operating point flows must be positive")
+        if q1_value < q2_value + float(self.config.min_q1_q2_gap):
+            raise ValueError("operating point violates Q1/Q2 phase gap")
+        self.reset()
+        self._q1_bias = q1_value
+        self._q2_bias = q2_value
+
+    @property
+    def operating_point(self) -> tuple[float, float] | None:
+        if self._q1_bias is None or self._q2_bias is None:
+            return None
+        return float(self._q1_bias), float(self._q2_bias)
 
     def update(
         self,
@@ -90,60 +112,47 @@ class DiameterPIDController(BaseDiameterController):
         target = float(pid_input.target_diameter_um)
         current = float(pid_input.current_diameter_um)
         error = target - current
-        if abs(error) <= float(self.config.diameter_deadband):
+        inside_deadband = abs(error) <= float(self.config.diameter_deadband)
+        if inside_deadband:
             decay = min(1.0, max(0.0, float(self.config.integral_decay_in_deadband)))
             self.integral *= decay
-            self.previous_error = error
-            self._has_previous = True
-            if pid_input.frame_id > 0:
-                self._last_frame_id = int(pid_input.frame_id)
-            return PIDCommand(
-                q1=q1_current,
-                q2=q2_current,
-                diameter_error=error,
-                adjustment=0.0,
-                freeze_feedback=False,
-                suggested_stop=False,
-                reason="diameter error inside deadband",
-                kp=self.kp,
-                ki=self.ki,
-                kd=self.kd,
-                adaptive_active=bool(self.adaptive.state.active),
-                adaptive_enabled=adaptive_enabled,
-                adaptive_reason="diameter inside deadband; adaptive state retained",
-                control_mode=mode,
-                q1_output_gain=float(self.config.q1_output_gain),
-                q2_output_gain=float(self.config.q2_output_gain),
-                frame_id=int(pid_input.frame_id),
-            )
-
         adaptive_active = False
-        adaptive_reason = "classic PID mode"
-        if adaptive_enabled:
+        adaptive_reason = "diameter inside deadband; adaptive state retained" if inside_deadband else "classic PID mode"
+        if not inside_deadband and adaptive_enabled:
             state = self.adaptive.update(pid_input, error)
             self.kp, self.ki, self.kd = self.parameter_manager.clamp_gains(state.kp, state.ki, state.kd)
             adaptive_active = bool(state.active)
             adaptive_reason = str(state.reason or "")
-        else:
+        elif not adaptive_enabled:
             self.kp, self.ki, self.kd = self.parameter_manager.base_gains()
 
         previous_integral = self.integral
-        candidate_integral = self.integral + error * float(pid_input.dt)
-        candidate_integral = clamp(
-            candidate_integral,
-            -abs(self.config.integral_limit),
-            abs(self.config.integral_limit),
-        )
-        derivative = 0.0 if not self._has_previous else (error - self.previous_error) / float(pid_input.dt)
-        p_term = self.kp * error
-        candidate_i_term = self.ki * candidate_integral
-        d_term = self.kd * derivative
-        unsaturated_pid = p_term + candidate_i_term + d_term
-        saturating_high = unsaturated_pid > float(self.config.output_max) and error > 0.0
-        saturating_low = unsaturated_pid < float(self.config.output_min) and error < 0.0
-        self.integral = previous_integral if (saturating_high or saturating_low) else candidate_integral
-        i_term = self.ki * self.integral
-        u_pid = clamp(p_term + i_term + d_term, self.config.output_min, self.config.output_max)
+        if inside_deadband:
+            derivative = 0.0
+            p_term = 0.0
+            i_term = self.ki * self.integral
+            d_term = 0.0
+            # Hold the last feedback correction while allowing a new causal
+            # feedforward term to act before the diameter error appears.
+            u_pid = clamp(self._last_pid_output, self.config.output_min, self.config.output_max)
+        else:
+            candidate_integral = self.integral + error * float(pid_input.dt)
+            candidate_integral = clamp(
+                candidate_integral,
+                -abs(self.config.integral_limit),
+                abs(self.config.integral_limit),
+            )
+            derivative = 0.0 if not self._has_previous else (error - self.previous_error) / float(pid_input.dt)
+            p_term = self.kp * error
+            candidate_i_term = self.ki * candidate_integral
+            d_term = self.kd * derivative
+            unsaturated_pid = p_term + candidate_i_term + d_term
+            saturating_high = unsaturated_pid > float(self.config.output_max) and error > 0.0
+            saturating_low = unsaturated_pid < float(self.config.output_min) and error < 0.0
+            self.integral = previous_integral if (saturating_high or saturating_low) else candidate_integral
+            i_term = self.ki * self.integral
+            u_pid = clamp(p_term + i_term + d_term, self.config.output_min, self.config.output_max)
+        self._last_pid_output = u_pid
 
         ff = self.feedforward.compute(pid_input) if mode == PIDControlMode.ADAPTIVE_PID_WITH_FEEDFORWARD.value else None
         u_ff = float(ff.u_ff) if ff is not None else 0.0
@@ -208,6 +217,7 @@ class DiameterPIDController(BaseDiameterController):
             self.integral = previous_integral
             i_term = self.ki * self.integral
             u_pid = clamp(p_term + i_term + d_term, self.config.output_min, self.config.output_max)
+            self._last_pid_output = u_pid
             requested_output = clamp(u_pid + u_ff, self.config.output_min, self.config.output_max)
             requested_output = rate_limit(requested_output, self._last_output, self.config.output_rate_limit)
             u_final = clamp(requested_output, actuator_low, actuator_high)
@@ -216,8 +226,10 @@ class DiameterPIDController(BaseDiameterController):
         # decelerated together. error = target - measured:
         #   droplet too large (error < 0): Q1 up, Q2 down
         #   droplet too small (error > 0): Q1 down, Q2 up
-        q1_raw = q1_base + q1_coefficient * u_final
-        q2_raw = q2_base + q2_coefficient * u_final
+        q1_ideal = q1_base + q1_coefficient * u_final
+        q2_ideal = q2_base + q2_coefficient * u_final
+        q1_raw = q1_ideal
+        q2_raw = q2_ideal
         max_step = max(0.0, float(self.config.max_flow_change_per_cycle))
         if max_step > 0.0:
             q1_raw = clamp(q1_raw, q1_current - max_step, q1_current + max_step)
@@ -227,34 +239,6 @@ class DiameterPIDController(BaseDiameterController):
             scale = total_max / (q1_raw + q2_raw)
             q1_raw *= scale
             q2_raw *= scale
-        self.previous_error = error
-        self._has_previous = True
-        self._last_output = u_final
-        if pid_input.frame_id > 0:
-            self._last_frame_id = int(pid_input.frame_id)
-
-        common = dict(
-            diameter_error=error,
-            adjustment=u_final,
-            p_term=p_term,
-            i_term=i_term,
-            d_term=d_term,
-            pid_output=u_pid,
-            feedforward_output=u_ff,
-            final_output=u_final,
-            kp=self.kp,
-            ki=self.ki,
-            kd=self.kd,
-            adaptive_active=adaptive_active,
-            adaptive_enabled=adaptive_enabled,
-            adaptive_reason=adaptive_reason,
-            feedforward_active=feedforward_active,
-            feedforward_reason=feedforward_reason,
-            control_mode=mode,
-            q1_output_gain=float(self.config.q1_output_gain),
-            q2_output_gain=float(self.config.q2_output_gain),
-            frame_id=int(pid_input.frame_id),
-        )
         q1_final = clamp(q1_raw, self.config.q1_min, self.config.q1_max)
         q2_final = clamp(q2_raw, self.config.q2_min, self.config.q2_max)
         if q1_final < q2_final + min_phase_gap:
@@ -268,6 +252,63 @@ class DiameterPIDController(BaseDiameterController):
                 mode,
             )
 
+        realized_candidates = [
+            (q1_final - q1_base) / q1_coefficient,
+            (q2_final - q2_base) / q2_coefficient,
+        ]
+        realized_output = float(sum(realized_candidates) / len(realized_candidates))
+        allocation_saturated = bool(
+            actuator_saturated
+            or abs(q1_final - q1_ideal) > 1e-9
+            or abs(q2_final - q2_ideal) > 1e-9
+            or abs(realized_output - requested_output) > 1e-9
+        )
+        if allocation_saturated and self.ki > 0.0 and not pushes_further_into_limit:
+            correction = (
+                float(self.config.anti_windup_back_calculation_gain)
+                * (realized_output - requested_output)
+                / self.ki
+            )
+            self.integral = clamp(
+                self.integral + correction,
+                -abs(self.config.integral_limit),
+                abs(self.config.integral_limit),
+            )
+            i_term = self.ki * self.integral
+
+        self.previous_error = error
+        self._has_previous = True
+        self._last_output = realized_output
+        if pid_input.frame_id > 0:
+            self._last_frame_id = int(pid_input.frame_id)
+
+        common = dict(
+            diameter_error=error,
+            adjustment=realized_output,
+            p_term=p_term,
+            i_term=i_term,
+            d_term=d_term,
+            pid_output=u_pid,
+            feedforward_output=u_ff,
+            final_output=realized_output,
+            kp=self.kp,
+            ki=self.ki,
+            kd=self.kd,
+            adaptive_active=adaptive_active,
+            adaptive_enabled=adaptive_enabled,
+            adaptive_reason=adaptive_reason,
+            feedforward_active=feedforward_active,
+            feedforward_reason=feedforward_reason,
+            control_mode=mode,
+            q1_output_gain=float(self.config.q1_output_gain),
+            q2_output_gain=float(self.config.q2_output_gain),
+            frame_id=int(pid_input.frame_id),
+            actuator_saturated=allocation_saturated,
+            requested_output=requested_output,
+            realized_output=realized_output,
+            control_owner="PID+FEEDFORWARD" if feedforward_active else "PID",
+        )
+
         return PIDCommand(
             q1=q1_final,
             q2=q2_final,
@@ -275,7 +316,11 @@ class DiameterPIDController(BaseDiameterController):
             suggested_stop=False,
             reason=(
                 "PID update completed; pump output saturated at configured limit"
-                if actuator_saturated
+                if allocation_saturated
+                else "feedforward pre-compensation inside diameter deadband"
+                if inside_deadband and feedforward_active
+                else "diameter error inside deadband"
+                if inside_deadband
                 else "PID update completed"
             ),
             **common,

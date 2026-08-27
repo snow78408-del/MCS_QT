@@ -49,15 +49,47 @@ class FeedforwardCompensator:
             self._last_u_ff = 0.0
             return FeedforwardResult(0.0, False, "prediction stale", confidence)
 
+        if not self.config.feedforward_calibrated:
+            self._last_u_ff = 0.0
+            return FeedforwardResult(0.0, False, "feedforward plant gain not calibrated", confidence)
+
+        if self.config.feedforward_require_leading_signal:
+            leading_available = bool(getattr(prediction, "leading_signal_available", False))
+            lead_ms = max(0.0, float(getattr(prediction, "signal_lead_time_ms", 0.0) or 0.0))
+            measured_delay_ms = max(0.0, float(pid_input.pump_response_delay_ms or 0.0))
+            required_lead_ms = measured_delay_ms + max(0.0, float(self.config.feedforward_min_lead_margin_ms))
+            if measured_delay_ms <= 0.0:
+                self._last_u_ff = 0.0
+                return FeedforwardResult(0.0, False, "physical pump response delay is unmeasured", confidence)
+            prediction_horizon_ms = max(
+                0.0,
+                float(getattr(prediction, "prediction_horizon_ms", 0.0) or 0.0),
+            )
+            if prediction_horizon_ms < measured_delay_ms:
+                self._last_u_ff = 0.0
+                return FeedforwardResult(
+                    0.0,
+                    False,
+                    f"prediction horizon is shorter than pump delay ({prediction_horizon_ms:.0f} < {measured_delay_ms:.0f} ms)",
+                    confidence,
+                )
+            if not leading_available:
+                self._last_u_ff = 0.0
+                return FeedforwardResult(0.0, False, "no causal leading disturbance signal", confidence)
+            if lead_ms < required_lead_ms:
+                self._last_u_ff = 0.0
+                return FeedforwardResult(
+                    0.0,
+                    False,
+                    f"leading signal is too late ({lead_ms:.0f} < {required_lead_ms:.0f} ms)",
+                    confidence,
+                )
+
         weight = float(getattr(prediction, "feedforward_weight", 1.0) or 0.0)
         if weight <= 0.0:
             self._last_u_ff = 0.0
             stage = str(getattr(prediction, "control_stage", "") or "")
             return FeedforwardResult(0.0, False, f"feedforward gated by stage {stage}".strip(), confidence)
-
-        if not self.config.feedforward_calibrated:
-            self._last_u_ff = 0.0
-            return FeedforwardResult(0.0, False, "feedforward plant gain not calibrated", confidence)
 
         recommended = getattr(prediction, "recommended_feedforward", None)
         if recommended is None:
@@ -67,7 +99,13 @@ class FeedforwardCompensator:
             self._last_u_ff = 0.0
             return FeedforwardResult(0.0, False, "invalid feedforward value", confidence)
 
-        limited = clamp(float(recommended), self.config.feedforward_min, self.config.feedforward_max)
+        authority = max(0.0, float(self.config.feedforward_max_output_fraction)) * min(
+            abs(float(self.config.output_min)),
+            abs(float(self.config.output_max)),
+        )
+        lower = max(float(self.config.feedforward_min), -authority)
+        upper = min(float(self.config.feedforward_max), authority)
+        limited = clamp(float(recommended), lower, upper)
         limited = rate_limit(limited, self._last_u_ff, self.config.feedforward_rate_limit)
         self._last_u_ff = limited
         return FeedforwardResult(limited, True, "feedforward active", confidence)

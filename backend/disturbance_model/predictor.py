@@ -34,6 +34,7 @@ class DisturbancePredictor:
             return DisturbancePrediction(timestamp=time.time(), reason="model not ready")
         try:
             self._last_prediction = self._model.predict(sample, previous_diameter=sample.droplet_mean_diameter_um)
+            self._last_prediction.prediction_horizon_ms = float(self.config.prediction_horizon_ms)
             return self._last_prediction
         except Exception as exc:
             if self._previous_model is not None:

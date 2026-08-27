@@ -52,6 +52,10 @@ class PIDCommand:
     q1_output_gain: float = 1.0
     q2_output_gain: float = 1.0
     frame_id: int = 0
+    actuator_saturated: bool = False
+    requested_output: float = 0.0
+    realized_output: float = 0.0
+    control_owner: str = "PID"
 
 
 @dataclass(slots=True)

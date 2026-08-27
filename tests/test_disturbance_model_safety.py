@@ -56,6 +56,9 @@ def _prediction(**overrides) -> DisturbancePrediction:
         "predicted_diameter_change_um": 5.0,
         "feedforward_weight": 0.2,
         "control_stage": "LOW_WEIGHT_FEEDFORWARD",
+        "leading_signal_available": True,
+        "signal_lead_time_ms": 2000.0,
+        "prediction_horizon_ms": 1000.0,
     }
     values.update(overrides)
     return DisturbancePrediction(**values)
@@ -72,6 +75,7 @@ def _pid_input(prediction: DisturbancePrediction) -> PIDInput:
         vision_valid=True,
         pump_communication_ok=True,
         disturbance_prediction=prediction,
+        pump_response_delay_ms=500.0,
     )
 
 
@@ -203,6 +207,22 @@ def test_feedforward_is_fail_closed_until_plant_gain_is_calibrated() -> None:
     assert "not calibrated" in blocked.reason
     assert active.active
     assert active.u_ff == -2.0  # -gain * delta-D * stage weight
+
+
+def test_feedforward_requires_a_signal_that_leads_the_measured_pump_delay() -> None:
+    compensator = FeedforwardCompensator(
+        PIDConfig(feedforward_enabled=True, feedforward_calibrated=True, feedforward_gain=2.0)
+    )
+
+    absent = compensator.compute(_pid_input(_prediction(leading_signal_available=False)))
+    late = compensator.compute(_pid_input(_prediction(signal_lead_time_ms=550.0)))
+    unmeasured_input = _pid_input(_prediction())
+    unmeasured_input.pump_response_delay_ms = 0.0
+    unmeasured = compensator.compute(unmeasured_input)
+
+    assert not absent.active and "no causal leading" in absent.reason
+    assert not late.active and "too late" in late.reason
+    assert not unmeasured.active and "unmeasured" in unmeasured.reason
 
 
 def test_shadow_does_not_match_a_late_observation_to_expired_predictions() -> None:

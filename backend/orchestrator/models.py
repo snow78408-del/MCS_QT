@@ -203,6 +203,13 @@ class ControlSnapshot:
     session_id: str = ""
     run_generation: int = 0
     monotonic_timestamp: float = 0.0
+    target_diameter_um: float | None = None
+    control_owner: str = "PID"
+    operating_point_q1: float | None = None
+    operating_point_q2: float | None = None
+    actuator_saturated: bool = False
+    requested_output: float = 0.0
+    realized_output: float = 0.0
 
 
 @dataclass(slots=True)
@@ -219,3 +226,4 @@ class SystemSnapshot:
     disturbance_model: Optional[dict[str, Any]] = None
     disturbance_prediction: Optional[dict[str, Any]] = None
     safety: Optional[dict[str, Any]] = None
+    optimization: Optional[dict[str, Any]] = None

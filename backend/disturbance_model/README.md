@@ -21,3 +21,9 @@ model files are rejected. Online retraining is opt-in and disabled by default.
 
 The frontend must not call this package directly. The orchestrator owns sample
 collection and prediction handoff.
+
+Leading-signal metadata is current operational context and is deliberately not
+persisted as a training feature. The orchestrator attaches it to the current
+prediction only; otherwise an old event marker could be replayed as a false
+advance warning. Without a causal leading signal, prediction remains available
+for monitoring but feedforward output is forced to zero.
