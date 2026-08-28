@@ -19,6 +19,14 @@ class NearestTracker(BaseTracker):
         self._next_id = 1
         self._last_timestamp: float | None = None
 
+    def _record_observation(self, track: DropletTrack, observed: bool) -> None:
+        window = max(1, int(self._config.confirmation_window))
+        minimum_hits = min(window, max(1, int(self._config.confirmation_min_hits)))
+        track.observation_history.append(bool(observed))
+        if len(track.observation_history) > window:
+            del track.observation_history[:-window]
+        track.is_confirmed = track.is_confirmed or sum(track.observation_history) >= minimum_hits
+
     def update(
         self,
         detections: Sequence[np.ndarray],
@@ -61,6 +69,7 @@ class NearestTracker(BaseTracker):
             track.radius = (1.0 - alpha) * float(track.radius) + alpha * float(radius_values[det_idx])
             track.unmatched_frames = 0
             track.age += 1
+            self._record_observation(track, True)
             matched_pairs.append((track.id, det_idx))
 
         removed_track_ids: List[int] = []
@@ -70,6 +79,7 @@ class NearestTracker(BaseTracker):
             track.predicted_position = track.position.copy()
             track.unmatched_frames += 1
             track.age += 1
+            self._record_observation(track, False)
             if track.unmatched_frames > self._config.max_unmatched_frames:
                 track.is_active = False
                 removed_track_ids.append(track.id)
@@ -83,7 +93,9 @@ class NearestTracker(BaseTracker):
                 position=points[det_idx],
                 radius=float(radius_values[det_idx]),
                 last_timestamp=float(timestamp) if timestamp is not None else None,
+                is_confirmed=False,
             )
+            self._record_observation(track, True)
             track.predicted_position = track.position.copy()
             self._tracks.append(track)
             new_track_ids.append(track.id)

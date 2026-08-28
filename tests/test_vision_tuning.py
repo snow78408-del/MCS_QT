@@ -38,11 +38,11 @@ class VisionTuningTests(unittest.TestCase):
         result, stages = inspect_frame(frame, DetectorConfig())
         self.assertEqual(len(stages), 12)
         self.assertEqual(stages[0].name, "1. 原始图像")
-        self.assertEqual(stages[-1].name, "12. 最终评分与抑制")
-        self.assertIn("Hough 局部对比度", stages[4].name)
-        self.assertIn("Hough 原始圆", stages[7].name)
-        self.assertIn("目标尺寸过滤", stages[9].name)
-        self.assertIn("圆周边缘归属", stages[10].name)
+        self.assertEqual(stages[-1].name, "12. 融合评分与抑制")
+        self.assertIn("缩放检测图", stages[4].name)
+        self.assertIn("自适应二值分割", stages[5].name)
+        self.assertIn("局部 Watershed", stages[9].name)
+        self.assertIn("局部 Hough", stages[10].name)
         self.assertTrue(all(stage.image.size > 0 for stage in stages))
         self.assertEqual(len(result.centers), len(result.radii))
 
@@ -51,18 +51,12 @@ class VisionTuningTests(unittest.TestCase):
         config = DetectorConfig(
             enable_intensity_normalization=False,
             enable_gaussian_blur=False,
-            enable_hough_clahe=False,
-            enable_hough_median_blur=False,
         )
         _, stages = inspect_frame(frame, config)
         np.testing.assert_array_equal(stages[2].image, stages[1].image)
         np.testing.assert_array_equal(stages[3].image, stages[2].image)
-        np.testing.assert_array_equal(stages[4].image, stages[3].image)
-        np.testing.assert_array_equal(stages[5].image, stages[4].image)
         self.assertEqual(stages[2].parameters, "已跳过")
         self.assertEqual(stages[3].parameters, "已跳过")
-        self.assertEqual(stages[4].parameters, "已跳过")
-        self.assertEqual(stages[5].parameters, "已跳过")
 
     def test_grid_search_returns_best_first_and_does_not_mutate_base(self):
         frames = self._frames()

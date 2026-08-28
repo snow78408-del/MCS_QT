@@ -52,7 +52,28 @@ class DetectorConfig:
     deduplicate_distance_ratio: float = 0.60
     deduplicate_min_distance: float = 6.0
     deduplicate_contained_ratio: float = 0.88
-    # Deprecated JSON compatibility fields from the removed contour detector.
+    # Fast contour branch. It supplies high-recall candidates on every frame;
+    # Hough remains an independent periodic/fallback source for weak outlines.
+    enable_contour_candidates: bool = True
+    contour_work_scale: float = 0.50
+    enable_background_subtraction: bool = True
+    background_difference_threshold: float = 12.0
+    background_learning_rate: float = 0.02
+    contour_canny_low: float = 40.0
+    contour_canny_high: float = 120.0
+    contour_close_kernel: int = 3
+    contour_min_circularity: float = 0.58
+    contour_min_axis_ratio: float = 0.52
+    contour_min_edge_support: float = 0.18
+    contour_min_area_fill_ratio: float = 0.45
+    contour_max_candidates: int = 160
+    enable_watershed_split: bool = True
+    watershed_peak_ratio: float = 0.70
+    watershed_min_peak_radius_ratio: float = 0.45
+    watershed_max_markers: int = 12
+    local_hough_padding_ratio: float = 0.45
+    local_hough_max_regions: int = 12
+    # Saved-profile compatibility aliases from the former contour detector.
     circularity_threshold: float = 0.12
     min_contour_area: float = 40.0
     enable_intensity_normalization: bool = True
@@ -69,11 +90,13 @@ class DetectorConfig:
     split_peak_threshold_ratio: float = 0.55
     split_min_radius_ratio: float = 0.65
     split_large_area_ratio: float = 1.15
-    # Retained for saved-profile compatibility. The current detector always
-    # uses Hough as its sole candidate source; it cannot be disabled or changed
-    # into a contour fallback by these legacy flags.
+    # Hough is deliberately not paid on every frame. Ambiguous local regions,
+    # empty fast-path frames, and optional refresh frames run it as needed.
     enable_hough_candidates: bool = True
     hough_fallback_only: bool = False
+    # Zero disables periodic full-frame Hough. Set this to 2 or 3 only when a
+    # camera setup has outlines too weak for segmentation/background motion.
+    hough_refresh_interval: int = 0
     enable_hough_clahe: bool = True
     enable_hough_median_blur: bool = True
     hough_dp: float = 1.2
@@ -98,7 +121,7 @@ class DetectorConfig:
     hough_work_max_height: int = 560
     hough_max_candidates: int = 120
     # Deprecated JSON compatibility fields from the removed intensity-peak
-    # candidate path. Hough is the only liquid-droplet candidate source.
+    # candidate path. They remain inactive in the hybrid detector.
     enable_intensity_peak_candidates: bool = False
     enable_intensity_peak_fallback: bool = True
     intensity_peak_kernel_radius_ratio: float = 1.25
@@ -120,9 +143,11 @@ class DetectorConfig:
     # dark junctions between neighbouring droplets that Hough may fit as
     # small circles.
     candidate_min_center_contrast: float = -1.0
-    # Only use circles whose complete geometry is inside the analysis ROI;
-    # partial circles at the crop/channel boundary bias diameter and create
-    # false positives.
+    # Partial candidates may still be tracked, but only sufficiently complete
+    # geometry contributes a diameter sample to metrics/PID.
+    candidate_min_visible_circle_ratio: float = 0.50
+    # Diameter validity gate. Partial circles remain available to the tracker,
+    # but do not contribute biased diameter samples to metrics/PID.
     candidate_full_circle_ratio: float = 0.85
     candidate_nms_overlap_ratio: float = 0.42
     cut_line_ratio: float = 1.0
@@ -147,6 +172,8 @@ class TrackerConfig:
     max_unmatched_frames: int = 5
     radius_match_ratio: float = 0.65
     radius_smoothing_alpha: float = 0.25
+    confirmation_window: int = 3
+    confirmation_min_hits: int = 2
     kalman: KalmanConfig = field(default_factory=KalmanConfig)
 
 

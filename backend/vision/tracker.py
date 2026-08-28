@@ -17,6 +17,8 @@ class DropletTrack:
     unmatched_frames: int = 0
     age: int = 1
     is_active: bool = True
+    is_confirmed: bool = True
+    observation_history: List[bool] = field(default_factory=list)
     metadata: Dict[str, float] = field(default_factory=dict)
     last_timestamp: float | None = None
 

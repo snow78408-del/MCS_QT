@@ -195,6 +195,7 @@ class MetricsCalculator:
             track
             for track in tracking.active_tracks
             if int(track.id) in observed_track_ids
+            and bool(track.is_confirmed)
             and int(track.age) >= int(self._config.min_track_age_for_count)
         ]
         valid_track_ids = {int(track.id) for track in valid_tracks}
@@ -217,7 +218,12 @@ class MetricsCalculator:
                 self._track_bead_max[droplet_id] = bead_count
 
         for track in valid_tracks:
-            observed_radius = float(track.metadata.get("observed_radius", track.radius))
+            diameter_valid = bool(track.metadata.get("diameter_valid", 1.0))
+            observed_radius = (
+                float(track.metadata.get("observed_radius", track.radius))
+                if diameter_valid
+                else 0.0
+            )
             diameter = observed_radius * 2.0 if observed_radius > 0.0 else None
             if diameter is not None:
                 frame_diameters.append(diameter)

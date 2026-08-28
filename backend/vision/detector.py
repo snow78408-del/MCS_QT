@@ -1,6 +1,6 @@
 ﻿from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 import cv2
@@ -18,6 +18,7 @@ class DetectionResult:
     radii: List[float]
     debug_image: np.ndarray
     helper_mask: np.ndarray
+    diameter_valid: List[bool] = field(default_factory=list)
 
 
 @dataclass
@@ -35,6 +36,8 @@ class DropletDetector:
         self._config = config
         self._debug = debug
         self._circle_offset_cache: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
+        self._frame_index = 0
+        self._background: np.ndarray | None = None
         self._runtime_min_radius = max(1.0, float(config.min_radius))
         self._runtime_max_radius = max(self._runtime_min_radius + 1.0, float(config.max_radius))
         configured_preferred = float(config.expected_radius or config.hough_preferred_radius)
@@ -58,6 +61,8 @@ class DropletDetector:
 
     def reset_adaptive_size(self) -> None:
         self._runtime_preferred_radius = float(self._configured_preferred_radius)
+        self._background = None
+        self._frame_index = 0
 
     def runtime_radius_range(self) -> tuple[float, float, float]:
         return (
@@ -92,22 +97,502 @@ class DropletDetector:
             else normalized
         )
 
-        # Hough gradient circles are the sole candidate source. Connected
-        # components and intensity peaks are intentionally not fused or used
-        # as fallbacks, so every accepted droplet has explicit circular-edge
-        # evidence from the Hough transform.
         cut_line = int(smoothed.shape[0] * self._config.cut_line_ratio)
-        centers, radii = self._detect_hough_candidates(smoothed, cut_line)
+        centers, radii = self._detect_hybrid_candidates(smoothed, cut_line)
         centers, radii = self._score_and_suppress_candidates(normalized, centers, radii)
+        diameter_valid = [
+            self._candidate_diameter_valid(normalized.shape[:2], center, radius)
+            for center, radius in zip(centers, radii)
+        ]
         helper_mask = self._build_bead_helper_mask(normalized)
         debug_image = np.empty((0, 0, 3), dtype=np.uint8)
 
-        return DetectionResult(centers=centers, radii=radii, debug_image=debug_image, helper_mask=helper_mask)
+        return DetectionResult(
+            centers=centers,
+            radii=radii,
+            debug_image=debug_image,
+            helper_mask=helper_mask,
+            diameter_valid=diameter_valid,
+        )
 
     def _ensure_gray(self, frame: np.ndarray) -> np.ndarray:
         if frame.ndim == 2:
             return frame
         return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    def _detect_hybrid_candidates(
+        self,
+        normalized_gray: np.ndarray,
+        cut_line: int,
+        trace: dict[str, object] | None = None,
+        *,
+        force_hough: bool = False,
+    ) -> Tuple[List[np.ndarray], List[float]]:
+        contour_centers: List[np.ndarray] = []
+        contour_radii: List[float] = []
+        ambiguous_regions: List[Tuple[int, int, int, int]] = []
+        if self._config.enable_contour_candidates:
+            contour_centers, contour_radii, ambiguous_regions = self._detect_contour_candidates(
+                normalized_gray,
+                cut_line,
+                trace,
+            )
+
+        interval = max(0, int(self._config.hough_refresh_interval))
+        periodic_refresh = interval > 0 and self._frame_index % interval == 0
+        contour_empty = not contour_centers
+        hough_enabled = bool(self._config.enable_hough_candidates)
+        run_full_hough = hough_enabled and (
+            force_hough or (contour_empty and not ambiguous_regions) or periodic_refresh
+        )
+        run_local_hough = hough_enabled and bool(ambiguous_regions) and not run_full_hough
+        self._frame_index += 1
+
+        hough_centers: List[np.ndarray] = []
+        hough_radii: List[float] = []
+        hough_trace: dict[str, object] | None = {} if trace is not None else None
+        if run_full_hough:
+            hough_centers, hough_radii = self._detect_hough_candidates(
+                normalized_gray,
+                cut_line,
+                hough_trace,
+            )
+        elif run_local_hough:
+            hough_centers, hough_radii = self._detect_local_hough_candidates(
+                normalized_gray,
+                cut_line,
+                ambiguous_regions,
+            )
+        if trace is not None:
+            trace["hough_executed"] = run_full_hough or run_local_hough
+            trace["hough_scope"] = "full" if run_full_hough else ("local" if run_local_hough else "skipped")
+            trace["hough"] = hough_trace or {}
+            trace["hybrid_contour_count"] = len(contour_centers)
+            trace["hybrid_hough_count"] = len(hough_centers)
+            trace["hybrid_hough_centers"] = list(hough_centers)
+            trace["hybrid_hough_radii"] = list(hough_radii)
+            trace["ambiguous_regions"] = list(ambiguous_regions)
+
+        novel_hough_centers: List[np.ndarray] = []
+        novel_hough_radii: List[float] = []
+        for hough_center, hough_radius in zip(hough_centers, hough_radii):
+            overlaps_verified_contour = any(
+                float(np.linalg.norm(hough_center - contour_center))
+                < 0.35 * (float(hough_radius) + float(contour_radius))
+                for contour_center, contour_radius in zip(contour_centers, contour_radii)
+            )
+            if not overlaps_verified_contour:
+                novel_hough_centers.append(hough_center)
+                novel_hough_radii.append(float(hough_radius))
+
+        return (
+            [*contour_centers, *novel_hough_centers],
+            [*contour_radii, *novel_hough_radii],
+        )
+
+    def _detect_contour_candidates(
+        self,
+        normalized_gray: np.ndarray,
+        cut_line: int,
+        trace: dict[str, object] | None = None,
+    ) -> Tuple[List[np.ndarray], List[float], List[Tuple[int, int, int, int]]]:
+        """Segment cheaply at reduced resolution and refine accepted shapes."""
+        work_scale = min(1.0, max(0.25, float(self._config.contour_work_scale)))
+        if work_scale < 0.999:
+            target = (
+                max(1, int(round(normalized_gray.shape[1] * work_scale))),
+                max(1, int(round(normalized_gray.shape[0] * work_scale))),
+            )
+            work_gray = cv2.resize(normalized_gray, target, interpolation=cv2.INTER_AREA)
+        else:
+            work_gray = normalized_gray
+            work_scale = 1.0
+        scaled_cut_line = int(round(float(cut_line) * work_scale))
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(work_gray)
+        blurred = cv2.GaussianBlur(enhanced, (3, 3), 0)
+
+        block_size = self._odd(self._config.adaptive_threshold_block_size)
+        block_size = max(3, block_size)
+        binary = cv2.adaptiveThreshold(
+            blurred,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            block_size,
+            float(self._config.adaptive_threshold_c),
+        )
+        open_size = self._odd(self._config.morphology_open_kernel)
+        close_size = self._odd(self._config.morphology_close_kernel)
+        if self._config.enable_morphology and open_size > 1:
+            binary = cv2.morphologyEx(
+                binary,
+                cv2.MORPH_OPEN,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_size, open_size)),
+            )
+        if self._config.enable_morphology and close_size > 1:
+            binary = cv2.morphologyEx(
+                binary,
+                cv2.MORPH_CLOSE,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_size, close_size)),
+            )
+
+        foreground = self._background_foreground_mask(work_gray)
+        low = max(1.0, float(self._config.contour_canny_low))
+        high = max(low + 1.0, float(self._config.contour_canny_high))
+        edges = cv2.Canny(blurred, low, high)
+        kernel_size = self._odd(self._config.contour_close_kernel)
+        if kernel_size > 1:
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+            closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
+        else:
+            closed = edges
+        segmentation = cv2.bitwise_or(binary, foreground)
+        segmentation = cv2.bitwise_or(segmentation, closed)
+        support_edges = self._build_support_edges(edges)
+        component_count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+            np.uint8(segmentation > 0),
+            connectivity=8,
+        )
+
+        raw_candidates: List[Tuple[float, float, float]] = []
+        accepted: List[Tuple[float, float, float]] = []
+        split_candidates: set[Tuple[float, float, float]] = set()
+        ambiguous_regions: List[Tuple[int, int, int, int]] = []
+        split_regions = 0
+        minimum_component_pixels = max(4, int(round(float(self._config.min_contour_area) * work_scale)))
+        for label in range(1, component_count):
+            if int(stats[label, cv2.CC_STAT_AREA]) < minimum_component_pixels:
+                continue
+            component = np.uint8(labels == label) * 255
+            contours, _hierarchy = cv2.findContours(
+                component,
+                cv2.RETR_EXTERNAL,
+                cv2.CHAIN_APPROX_NONE,
+            )
+            if not contours:
+                continue
+            contour = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(contour) < max(1.0, float(self._config.min_contour_area) * work_scale * work_scale):
+                continue
+            segments: List[np.ndarray] = []
+            if self._config.enable_watershed_split and self._contour_needs_split(contour):
+                segments = self._split_contour_watershed(work_gray, contour)
+            shapes = segments if len(segments) > 1 else [contour]
+            if len(segments) > 1:
+                split_regions += 1
+            region_accepted = 0
+            for shape in shapes:
+                if len(segments) > 1:
+                    (split_cx, split_cy), split_radius = cv2.minEnclosingCircle(shape)
+                    fitted = (float(split_cx), float(split_cy), float(split_radius))
+                else:
+                    fitted = self._fit_contour_candidate(shape)
+                if fitted is None:
+                    continue
+                raw_candidates.append(fitted)
+                if self._validate_contour_candidate(shape, fitted, support_edges, scaled_cut_line):
+                    accepted.append(fitted)
+                    if len(segments) > 1:
+                        split_candidates.add(fitted)
+                    region_accepted += 1
+            if len(segments) > 1 or region_accepted == 0:
+                x, y, width, height = cv2.boundingRect(contour)
+                ambiguous_regions.append(
+                    (
+                        int(round(x / work_scale)),
+                        int(round(y / work_scale)),
+                        int(round(width / work_scale)),
+                        int(round(height / work_scale)),
+                    )
+                )
+
+        accepted = self._filter_expected_size(accepted)
+        accepted.sort(key=lambda item: self._candidate_priority(item[2]))
+        accepted = accepted[: max(1, int(self._config.contour_max_candidates))]
+        refinement_edges = cv2.Canny(
+            cv2.GaussianBlur(normalized_gray, (3, 3), 0),
+            low,
+            high,
+        )
+        refined: List[Tuple[float, float, float]] = []
+        for cx, cy, radius in accepted:
+            scaled_candidate = (cx / work_scale, cy / work_scale, radius / work_scale)
+            refined.append(
+                scaled_candidate
+                if (cx, cy, radius) in split_candidates
+                else self._refine_contour_candidate(refinement_edges, scaled_candidate)
+            )
+        if trace is not None:
+            trace.update(
+                {
+                    "contour_work_gray": work_gray,
+                    "contour_work_scale": work_scale,
+                    "contour_enhanced": enhanced,
+                    "contour_binary": binary,
+                    "contour_foreground": foreground,
+                    "contour_edges": edges,
+                    "contour_closed": segmentation,
+                    "contour_raw_centers": [
+                        np.array([cx / work_scale, cy / work_scale], dtype=np.float32)
+                        for cx, cy, _radius in raw_candidates
+                    ],
+                    "contour_raw_radii": [
+                        float(radius / work_scale) for _cx, _cy, radius in raw_candidates
+                    ],
+                    "contour_centers": [
+                        np.array([cx, cy], dtype=np.float32) for cx, cy, _radius in refined
+                    ],
+                    "contour_radii": [float(radius) for _cx, _cy, radius in refined],
+                    "contour_split_regions": split_regions,
+                }
+            )
+        return (
+            [np.array([cx, cy], dtype=np.float32) for cx, cy, _radius in refined],
+            [float(radius) for _cx, _cy, radius in refined],
+            ambiguous_regions[: max(1, int(self._config.local_hough_max_regions))],
+        )
+
+    def _background_foreground_mask(self, gray: np.ndarray) -> np.ndarray:
+        if not self._config.enable_background_subtraction:
+            return np.zeros_like(gray)
+        if self._background is None or self._background.shape != gray.shape:
+            self._background = gray.astype(np.float32)
+            return np.zeros_like(gray)
+
+        background_u8 = cv2.convertScaleAbs(self._background)
+        difference = cv2.absdiff(gray, background_u8)
+        _threshold, foreground = cv2.threshold(
+            difference,
+            max(1.0, float(self._config.background_difference_threshold)),
+            255,
+            cv2.THRESH_BINARY,
+        )
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        foreground = cv2.morphologyEx(foreground, cv2.MORPH_OPEN, kernel)
+        foreground = cv2.morphologyEx(foreground, cv2.MORPH_CLOSE, kernel)
+
+        learning_rate = min(1.0, max(0.0, float(self._config.background_learning_rate)))
+        if learning_rate > 0.0:
+            cv2.accumulateWeighted(
+                gray.astype(np.float32),
+                self._background,
+                learning_rate,
+            )
+        return foreground
+
+    def _refine_contour_candidate(
+        self,
+        edges: np.ndarray,
+        candidate: Tuple[float, float, float],
+    ) -> Tuple[float, float, float]:
+        cx, cy, radius = candidate
+        margin = max(4, int(round(radius * 1.35)))
+        x0 = max(0, int(round(cx)) - margin)
+        x1 = min(edges.shape[1], int(round(cx)) + margin + 1)
+        y0 = max(0, int(round(cy)) - margin)
+        y1 = min(edges.shape[0], int(round(cy)) + margin + 1)
+        if x1 - x0 < 5 or y1 - y0 < 5:
+            return candidate
+        edge_y, edge_x = np.nonzero(edges[y0:y1, x0:x1])
+        if edge_x.size < 12:
+            return candidate
+        absolute_x = edge_x.astype(np.float32) + float(x0)
+        absolute_y = edge_y.astype(np.float32) + float(y0)
+        radial_distance = np.hypot(absolute_x - cx, absolute_y - cy)
+        annulus = (radial_distance >= radius * 0.65) & (radial_distance <= radius * 1.35)
+        if int(np.count_nonzero(annulus)) < 12:
+            return candidate
+        points = np.column_stack((absolute_x[annulus], absolute_y[annulus])).astype(np.float32)
+        (refined_cx, refined_cy), (axis_a, axis_b), _angle = cv2.fitEllipse(points.reshape(-1, 1, 2))
+        refined_radius = float(np.sqrt(max(0.5, axis_a * 0.5) * max(0.5, axis_b * 0.5)))
+        center_shift = float(np.hypot(refined_cx - cx, refined_cy - cy))
+        radius_ratio = refined_radius / max(1.0, radius)
+        if center_shift > max(3.0, radius * 0.35) or not 0.65 <= radius_ratio <= 1.35:
+            return candidate
+        return float(refined_cx), float(refined_cy), refined_radius
+
+    def _detect_local_hough_candidates(
+        self,
+        gray: np.ndarray,
+        cut_line: int,
+        regions: List[Tuple[int, int, int, int]],
+    ) -> Tuple[List[np.ndarray], List[float]]:
+        centers: List[np.ndarray] = []
+        radii: List[float] = []
+        padding = max(
+            3,
+            int(
+                round(
+                    self._runtime_preferred_radius
+                    * float(self._config.local_hough_padding_ratio)
+                )
+            ),
+        )
+        for x, y, width, height in regions[: max(1, int(self._config.local_hough_max_regions))]:
+            x0 = max(0, int(x) - padding)
+            y0 = max(0, int(y) - padding)
+            x1 = min(gray.shape[1], int(x + width) + padding)
+            y1 = min(gray.shape[0], int(y + height) + padding)
+            if x1 - x0 < 2 * self._hough_min_radius() or y1 - y0 < 2 * self._hough_min_radius():
+                continue
+            local_cut_line = min(y1 - y0, max(0, int(cut_line) - y0))
+            local_centers, local_radii = self._detect_hough_candidates(
+                gray[y0:y1, x0:x1],
+                local_cut_line,
+            )
+            centers.extend(
+                np.array([float(center[0]) + x0, float(center[1]) + y0], dtype=np.float32)
+                for center in local_centers
+            )
+            radii.extend(float(radius) for radius in local_radii)
+        return centers, radii
+
+    def _split_contour_watershed(
+        self,
+        gray: np.ndarray,
+        contour: np.ndarray,
+    ) -> List[np.ndarray]:
+        x, y, width, height = cv2.boundingRect(contour)
+        if width < 3 or height < 3:
+            return []
+        padding = 2
+        x0 = max(0, x - padding)
+        y0 = max(0, y - padding)
+        x1 = min(gray.shape[1], x + width + padding)
+        y1 = min(gray.shape[0], y + height + padding)
+        local_mask = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+        shifted = contour.astype(np.int32).copy()
+        shifted[:, 0, 0] -= x0
+        shifted[:, 0, 1] -= y0
+        cv2.drawContours(local_mask, [shifted], -1, 255, cv2.FILLED)
+
+        distance = cv2.distanceTransform(local_mask, cv2.DIST_L2, 5)
+        maximum = float(distance.max())
+        minimum_peak = self._runtime_min_radius * float(
+            self._config.watershed_min_peak_radius_ratio
+        )
+        if maximum < max(1.0, minimum_peak):
+            return []
+        threshold = max(
+            minimum_peak,
+            maximum * float(self._config.watershed_peak_ratio),
+        )
+        peaks = np.uint8(distance >= threshold) * 255
+        peaks = cv2.morphologyEx(
+            peaks,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        )
+        marker_count, seed_labels = cv2.connectedComponents(peaks)
+        foreground_markers = marker_count - 1
+        if foreground_markers < 2 or foreground_markers > max(
+            2,
+            int(self._config.watershed_max_markers),
+        ):
+            return []
+
+        markers = seed_labels.astype(np.int32) + 1
+        markers[local_mask == 0] = 1
+        markers[(local_mask > 0) & (seed_labels == 0)] = 0
+        local_gray = gray[y0:y1, x0:x1]
+        watershed_input = cv2.cvtColor(local_gray, cv2.COLOR_GRAY2BGR)
+        cv2.watershed(watershed_input, markers)
+
+        segments: List[np.ndarray] = []
+        for label in range(2, marker_count + 1):
+            region = np.uint8((markers == label) & (local_mask > 0)) * 255
+            region_contours, _hierarchy = cv2.findContours(
+                region,
+                cv2.RETR_EXTERNAL,
+                cv2.CHAIN_APPROX_NONE,
+            )
+            if not region_contours:
+                continue
+            segment = max(region_contours, key=cv2.contourArea).astype(np.int32)
+            segment[:, 0, 0] += x0
+            segment[:, 0, 1] += y0
+            segments.append(segment)
+        return segments
+
+    @staticmethod
+    def _contour_needs_split(contour: np.ndarray) -> bool:
+        area = abs(float(cv2.contourArea(contour)))
+        perimeter = float(cv2.arcLength(contour, True))
+        _x, _y, width, height = cv2.boundingRect(contour)
+        shorter = max(1.0, float(min(width, height)))
+        aspect_ratio = float(max(width, height)) / shorter
+        circularity = (
+            4.0 * np.pi * area / (perimeter * perimeter)
+            if perimeter > 1e-6
+            else 0.0
+        )
+        return aspect_ratio >= 1.35 or circularity < 0.78
+
+    def _fit_contour_candidate(
+        self,
+        contour: np.ndarray,
+    ) -> Tuple[float, float, float] | None:
+        if len(contour) >= 5:
+            (cx, cy), (axis_a, axis_b), _angle = cv2.fitEllipse(contour)
+            semi_a = max(0.5, float(axis_a) * 0.5)
+            semi_b = max(0.5, float(axis_b) * 0.5)
+            radius = float(np.sqrt(semi_a * semi_b))
+        else:
+            (cx, cy), radius = cv2.minEnclosingCircle(contour)
+        if not np.isfinite([cx, cy, radius]).all():
+            return None
+        return float(cx), float(cy), float(radius)
+
+    def _validate_contour_candidate(
+        self,
+        contour: np.ndarray,
+        candidate: Tuple[float, float, float],
+        support_edges: np.ndarray,
+        cut_line: int,
+    ) -> bool:
+        cx, cy, radius = candidate
+        if cy > float(cut_line):
+            return False
+        if radius < self._runtime_min_radius or radius > self._runtime_max_radius:
+            return False
+        area = abs(float(cv2.contourArea(contour)))
+        perimeter = float(cv2.arcLength(contour, True))
+        if area < max(float(self._config.min_contour_area), np.pi * radius * radius * 0.20):
+            return False
+        if perimeter <= 1e-6:
+            return False
+        circularity = 4.0 * np.pi * area / (perimeter * perimeter)
+        if circularity < float(self._config.contour_min_circularity):
+            return False
+
+        if len(contour) >= 5:
+            _center, (axis_a, axis_b), _angle = cv2.fitEllipse(contour)
+            major = max(float(axis_a), float(axis_b))
+            minor = min(float(axis_a), float(axis_b))
+            axis_ratio = minor / major if major > 1e-6 else 0.0
+            ellipse_area = np.pi * max(0.5, axis_a * 0.5) * max(0.5, axis_b * 0.5)
+            area_fill = area / ellipse_area if ellipse_area > 1e-6 else 0.0
+            if axis_ratio < float(self._config.contour_min_axis_ratio):
+                return False
+            if area_fill < float(self._config.contour_min_area_fill_ratio):
+                return False
+
+        points = contour.reshape(-1, 2)
+        height, width = support_edges.shape[:2]
+        valid = (
+            (points[:, 0] >= 0)
+            & (points[:, 0] < width)
+            & (points[:, 1] >= 0)
+            & (points[:, 1] < height)
+        )
+        if not np.any(valid):
+            return False
+        valid_points = points[valid]
+        edge_support = float(
+            np.count_nonzero(support_edges[valid_points[:, 1], valid_points[:, 0]])
+        ) / float(len(valid_points))
+        return edge_support >= float(self._config.contour_min_edge_support)
 
     def _detect_hough_candidates(
         self,
@@ -385,7 +870,10 @@ class DropletDetector:
         # interiors may be brighter or darker depending on exposure and chip.
         min_contrast = float(self._config.candidate_min_ring_contrast)
         min_center_contrast = float(self._config.candidate_min_center_contrast)
-        full_circle_ratio = max(0.0, float(self._config.candidate_full_circle_ratio))
+        minimum_visible = min(
+            1.0,
+            max(0.0, float(self._config.candidate_min_visible_circle_ratio)),
+        )
         height, width = normalized_gray.shape[:2]
         scored: List[_ScoredCandidate] = []
 
@@ -395,8 +883,7 @@ class DropletDetector:
                 continue
             cx = float(center[0])
             cy = float(center[1])
-            margin = radius * full_circle_ratio
-            if cx < margin or cy < margin or cx >= float(width) - margin or cy >= float(height) - margin:
+            if self._circle_visible_ratio((height, width), cx, cy, radius) < minimum_visible:
                 continue
 
             edge_support = self._circle_edge_support(support_edges, cx, cy, radius)
@@ -460,6 +947,37 @@ class DropletDetector:
         return (
             [item.center for item in kept],
             [float(item.radius) for item in kept],
+        )
+
+    def _circle_visible_ratio(
+        self,
+        shape: tuple[int, int],
+        cx: float,
+        cy: float,
+        radius: float,
+    ) -> float:
+        height, width = shape
+        xs, ys = self._circle_offsets(radius)
+        x = np.rint(float(cx) + xs).astype(np.int32)
+        y = np.rint(float(cy) + ys).astype(np.int32)
+        valid = (x >= 0) & (x < width) & (y >= 0) & (y < height)
+        return float(np.count_nonzero(valid)) / float(max(1, len(valid)))
+
+    def _candidate_diameter_valid(
+        self,
+        shape: tuple[int, int],
+        center: np.ndarray,
+        radius: float,
+    ) -> bool:
+        height, width = shape
+        margin = float(radius) * max(0.0, float(self._config.candidate_full_circle_ratio))
+        cx = float(center[0])
+        cy = float(center[1])
+        return (
+            cx >= margin
+            and cy >= margin
+            and cx < float(width) - margin
+            and cy < float(height) - margin
         )
 
     def _learn_preferred_radius(self, candidates: List[_ScoredCandidate]) -> None:

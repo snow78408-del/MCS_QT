@@ -73,6 +73,7 @@ class VisionPipeline:
             track
             for track in tracking.active_tracks
             if "detection_index" in track.metadata
+            and bool(track.is_confirmed)
             and int(track.age) >= int(self.config.metrics.min_track_age_for_count)
         ]
         beads = self.bead_counter.count(confirmed_observed_tracks, gray, detections.helper_mask)
@@ -205,9 +206,19 @@ class VisionPipeline:
             if detection_index is None:
                 track.metadata.pop("detection_index", None)
                 track.metadata.pop("observed_radius", None)
+                track.metadata.pop("diameter_valid", None)
                 continue
             if detection_index < 0 or detection_index >= len(detections.centers):
                 continue
             track.position = np.asarray(detections.centers[detection_index], dtype=np.float32)
             track.metadata["detection_index"] = float(detection_index)
-            track.metadata["observed_radius"] = float(detections.radii[detection_index])
+            diameter_valid = (
+                bool(detections.diameter_valid[detection_index])
+                if detection_index < len(detections.diameter_valid)
+                else True
+            )
+            track.metadata["diameter_valid"] = 1.0 if diameter_valid else 0.0
+            if diameter_valid:
+                track.metadata["observed_radius"] = float(detections.radii[detection_index])
+            else:
+                track.metadata.pop("observed_radius", None)

@@ -1,6 +1,6 @@
 ﻿from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -21,6 +21,8 @@ class _KalmanTrack:
     radius: float
     unmatched_frames: int = 0
     age: int = 1
+    is_confirmed: bool = False
+    observation_history: List[bool] = field(default_factory=list)
 
 
 class KalmanTracker(BaseTracker):
@@ -57,6 +59,14 @@ class KalmanTracker(BaseTracker):
         identity = np.eye(4, dtype=np.float32)
         track.covariance = (identity - (k @ self._h)) @ track.covariance
 
+    def _record_observation(self, track: _KalmanTrack, observed: bool) -> None:
+        window = max(1, int(self._config.confirmation_window))
+        minimum_hits = min(window, max(1, int(self._config.confirmation_min_hits)))
+        track.observation_history.append(bool(observed))
+        if len(track.observation_history) > window:
+            del track.observation_history[:-window]
+        track.is_confirmed = track.is_confirmed or sum(track.observation_history) >= minimum_hits
+
     def _to_public_track(self, track: _KalmanTrack, predicted_position: np.ndarray) -> DropletTrack:
         position = track.state[:2, 0].astype(np.float32)
         velocity = track.state[2:, 0].astype(np.float32)
@@ -69,6 +79,8 @@ class KalmanTracker(BaseTracker):
             unmatched_frames=track.unmatched_frames,
             age=track.age,
             is_active=True,
+            is_confirmed=track.is_confirmed,
+            observation_history=list(track.observation_history),
         )
 
     def update(
@@ -113,6 +125,7 @@ class KalmanTracker(BaseTracker):
             track.radius = (1.0 - alpha) * float(track.radius) + alpha * float(radius_values[det_idx])
             track.unmatched_frames = 0
             track.age += 1
+            self._record_observation(track, True)
             matched_pairs.append((track.id, det_idx))
 
         removed_track_ids: List[int] = []
@@ -120,6 +133,7 @@ class KalmanTracker(BaseTracker):
             track = self._tracks[track_idx]
             track.unmatched_frames += 1
             track.age += 1
+            self._record_observation(track, False)
             if track.unmatched_frames > self._config.max_unmatched_frames:
                 removed_track_ids.append(track.id)
 
@@ -136,6 +150,7 @@ class KalmanTracker(BaseTracker):
                 covariance=self._p0.copy(),
                 radius=float(radius_values[det_idx]),
             )
+            self._record_observation(track, True)
             self._tracks.append(track)
             new_track_ids.append(track.id)
             matched_pairs.append((track.id, det_idx))
