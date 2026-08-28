@@ -211,8 +211,15 @@ class _StageImage(QLabel):
 class StageCard(QGroupBox):
     parameter_changed = Signal(str, object)
     parameter_reset = Signal(str)
+    expanded_changed = Signal(bool)
 
-    def __init__(self, stage: PipelineStage, controls: list[dict[str, Any]], parent=None) -> None:
+    def __init__(
+        self,
+        stage: PipelineStage,
+        controls: list[dict[str, Any]],
+        parent=None,
+        expanded: bool = False,
+    ) -> None:
         super().__init__(stage.name, parent)
         self.stage = stage
         self.setMinimumWidth(390)
@@ -233,7 +240,25 @@ class StageCard(QGroupBox):
         layout.addWidget(description)
 
         if controls:
-            form = QFormLayout()
+            self.parameter_toggle = QPushButton()
+            self.parameter_toggle.setText("▾  收起参数" if expanded else "▸  展开参数")
+            self.parameter_toggle.setCheckable(True)
+            self.parameter_toggle.setChecked(expanded)
+            self.parameter_toggle.setFlat(True)
+            self.parameter_toggle.setCursor(Qt.PointingHandCursor)
+            self.parameter_toggle.setStyleSheet(
+                "QPushButton { color:#2563eb; border:none; padding:5px 4px; "
+                "text-align:left; font-weight:600; }"
+                "QPushButton:hover { color:#1d4ed8; background:#eff6ff; "
+                "border-radius:4px; }"
+            )
+            self.parameter_toggle.setAccessibleName(f"{stage.name} 参数调节")
+            self.parameter_toggle.toggled.connect(self._toggle_parameters)
+            layout.addWidget(self.parameter_toggle)
+
+            self.parameter_panel = QWidget()
+            self.parameter_panel.setVisible(expanded)
+            form = QFormLayout(self.parameter_panel)
             form.setContentsMargins(0, 4, 0, 0)
             for spec in controls:
                 widget = self._control_widget(spec)
@@ -266,7 +291,7 @@ class StageCard(QGroupBox):
                 label_layout.addWidget(label, 1)
                 label_layout.addWidget(reset)
                 form.addRow(label_row, widget)
-            layout.addLayout(form)
+            layout.addWidget(self.parameter_panel)
 
         if stage.parameters:
             parameters = QLabel("当前操作：" + stage.parameters)
@@ -278,6 +303,14 @@ class StageCard(QGroupBox):
             statistics.setWordWrap(True)
             statistics.setStyleSheet("font-weight:600;color:#166534")
             layout.addWidget(statistics)
+
+    def _toggle_parameters(self, expanded: bool) -> None:
+        self.parameter_panel.setVisible(expanded)
+        self.parameter_toggle.setText("▾  收起参数" if expanded else "▸  展开参数")
+        self.parameter_toggle.setAccessibleDescription(
+            "收起可调参数" if expanded else "展开可调参数"
+        )
+        self.expanded_changed.emit(expanded)
 
     def _control_widget(self, spec: dict[str, Any]) -> QWidget:
         key = str(spec["key"])
@@ -353,6 +386,7 @@ class TuningWindow(QWidget):
         self.frames: list[TuningFrame] = []
         self.frame_pos = 0
         self._on_sample_loaded = on_sample_loaded
+        self._expanded_stages: set[int] = set()
         self.original_config = DetectorConfig()
         self.current_config = DetectorConfig()
         self.original_channel_config = ChannelRegionConfig()
@@ -644,12 +678,26 @@ class TuningWindow(QWidget):
             if widget is not None:
                 widget.deleteLater()
         for index, stage in enumerate(stages):
-            card = StageCard(stage, self._controls_for_stage(index), self.stage_container)
+            card = StageCard(
+                stage,
+                self._controls_for_stage(index),
+                self.stage_container,
+                expanded=index in self._expanded_stages,
+            )
+            card.expanded_changed.connect(
+                lambda expanded, stage_index=index: self._set_stage_expanded(stage_index, expanded)
+            )
             card.parameter_changed.connect(self._parameter_changed)
             card.parameter_reset.connect(self._reset_parameter)
             self.stage_grid.addWidget(card, index // 2, index % 2)
         self.stage_grid.setRowStretch((len(stages) + 1) // 2, 1)
         QTimer.singleShot(0, lambda: self.stage_scroll.verticalScrollBar().setValue(scroll_position))
+
+    def _set_stage_expanded(self, index: int, expanded: bool) -> None:
+        if expanded:
+            self._expanded_stages.add(index)
+        else:
+            self._expanded_stages.discard(index)
 
     def _save(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
