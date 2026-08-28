@@ -4,20 +4,17 @@
 
 ## 归档文件
 
-- `droplet_tracking_and_counting(2)(1).py`
-- `droplet_tracking_and_counting(2).py`
 - `droplet_tracking_connected_40mum(1).py`
 - `rotate_video_90ccw(1).py`
 
 ## 归档原因
 
 - 旧脚本存在多职责耦合（检测、跟踪、磁珠统计、视频循环、输出打印耦合在单文件）。
-- 存在重复实现（`droplet_tracking_and_counting(2)(1).py` 与 `droplet_tracking_and_counting(2).py` 内容重复）。
 - 不利于后续扩展 Kalman 跟踪与统一输出接口。
 
 ## 新结构替代关系
 
-- 旧版液滴检测逻辑 -> `detector.py`
+- 液滴检测统一由 `detector.py` 中的 EdgeDrawing 实现提供
 - 旧版最近邻跟踪逻辑 -> `nearest_tracker.py`
 - 新增 Kalman 跟踪逻辑 -> `kalman_tracker.py`
 - 旧版磁珠/小黑点统计逻辑 -> `bead_counter.py`

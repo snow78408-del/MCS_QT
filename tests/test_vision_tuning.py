@@ -39,9 +39,9 @@ class VisionTuningTests(unittest.TestCase):
         self.assertEqual(len(stages), 8)
         self.assertEqual(stages[0].name, "1. 原始图像")
         self.assertEqual(stages[-1].name, "8. 简单过滤结果")
-        self.assertIn("Hough 输入预处理", stages[4].name)
-        self.assertIn("Hough 边缘支撑", stages[5].name)
-        self.assertIn("Hough 原始圆", stages[6].name)
+        self.assertIn("EdgeDrawing 输入预处理", stages[4].name)
+        self.assertIn("EdgeDrawing 边缘图", stages[5].name)
+        self.assertIn("EdgeDrawing 原始圆候选", stages[6].name)
         self.assertTrue(all(stage.image.size > 0 for stage in stages))
         self.assertEqual(len(result.centers), len(result.radii))
 
@@ -86,12 +86,12 @@ class VisionTuningTests(unittest.TestCase):
         results = grid_search(
             frames,
             base,
-            {"hough_param2": [20, 28], "hough_edge_support_threshold": [0.1, 0.2]},
+            {"edge_gradient_threshold": [16, 20], "edge_min_support_ratio": [0.1, 0.2]},
             expected_count=1,
         )
         self.assertEqual(len(results), 4)
         self.assertGreaterEqual(results[0].score, results[-1].score)
-        self.assertEqual(base.hough_param2, 28.0)
+        self.assertEqual(base.edge_gradient_threshold, 20)
 
     def test_unknown_search_field_is_rejected(self):
         with self.assertRaises(ValueError):

@@ -10,7 +10,7 @@ import numpy as np
 
 from .channel_region import ChannelRegionResult, detect_channel_region
 from .config import ChannelRegionConfig, DetectorConfig, DebugConfig
-from .detector import DetectionResult, DropletDetector
+from .detector import CircleDetection, DetectionResult, DropletDetector
 
 
 @dataclass(frozen=True)
@@ -49,18 +49,18 @@ SEARCHABLE_FIELDS = (
     "min_radius",
     "max_radius",
     "gaussian_blur_size",
-    "hough_dp",
-    "hough_min_distance",
-    "hough_param1",
-    "hough_param2",
-    "hough_min_radius",
-    "hough_max_radius",
-    "hough_edge_support_threshold",
-    "hough_edge_neighborhood",
+    "edge_gradient_threshold",
+    "edge_anchor_threshold",
+    "edge_scan_interval",
+    "edge_min_path_length",
+    "edge_sigma",
+    "edge_min_circle_ratio",
+    "edge_min_support_ratio",
+    "edge_support_neighborhood",
     "expected_radius",
     "expected_radius_tolerance_ratio",
-    "candidate_min_visible_circle_ratio",
-    "candidate_full_circle_ratio",
+    "edge_min_visible_ratio",
+    "diameter_min_visible_ratio",
 )
 
 
@@ -86,11 +86,15 @@ def read_video_frames(path: str | Path, max_frames: int = 80, stride: int = 1) -
     return frames
 
 
-def _candidate_overlay(frame: np.ndarray, centers: list[np.ndarray], radii: list[float], color=(0, 180, 255)) -> np.ndarray:
+def _circle_overlay(
+    frame: np.ndarray,
+    circles: list[CircleDetection],
+    color: tuple[int, int, int] = (0, 180, 255),
+) -> np.ndarray:
     output = frame.copy()
-    for center, radius in zip(centers, radii):
-        point = tuple(int(round(float(value))) for value in center)
-        cv2.circle(output, point, max(1, int(round(radius))), color, 2)
+    for item in circles:
+        center = tuple(int(round(float(value))) for value in item.center)
+        cv2.circle(output, center, max(1, int(round(item.radius))), color, 2)
     return output
 
 
@@ -101,7 +105,7 @@ def inspect_frame(
     channel_config: ChannelRegionConfig | None = None,
     channel_frames: Iterable[np.ndarray] | None = None,
 ) -> tuple[DetectionResult, list[PipelineStage]]:
-    """Inspect optional channel calibration followed by Hough droplet detection."""
+    """Inspect optional channel calibration followed by EdgeDrawing detection."""
     channel_stages: list[PipelineStage] = []
     detection_frame = frame
     if channel_config is not None:
@@ -163,23 +167,24 @@ def inspect_frame(
     smoothed = detector._smooth(normalized)
     cut_line = int(smoothed.shape[0] * config.cut_line_ratio)
     trace: dict[str, object] = {}
-    centers, radii = detector._detect_hough_candidates(smoothed, cut_line, trace)
+    circles = detector._detect_candidates(smoothed, cut_line, trace)
+    centers = [item.center.copy() for item in circles]
+    radii = [item.radius for item in circles]
     diameter_valid = [
-        detector._candidate_diameter_valid(normalized.shape[:2], center, radius)
-        for center, radius in zip(centers, radii)
+        detector._circle_fully_visible(normalized.shape[:2], item)
+        for item in circles
     ]
     result = DetectionResult(
-        centers,
-        radii,
-        np.empty((0, 0, 3), dtype=np.uint8),
-        detector._build_bead_helper_mask(normalized),
-        diameter_valid,
+        centers=centers,
+        radii=radii,
+        debug_image=np.empty((0, 0, 3), dtype=np.uint8),
+        helper_mask=detector._build_bead_helper_mask(normalized),
+        diameter_valid=diameter_valid,
     )
     work_gray = np.asarray(trace.get("work_gray", smoothed))
     enhanced = np.asarray(trace.get("enhanced", work_gray))
     edges = np.asarray(trace.get("edges", np.zeros_like(work_gray)))
-    raw_centers = list(trace.get("raw_centers", []))
-    raw_radii = list(trace.get("raw_radii", []))
+    raw_circles = list(trace.get("raw_circles", []))
     scale = float(trace.get("scale", 1.0))
     blur_size = detector._odd(config.gaussian_blur_size)
     stages = [
@@ -198,53 +203,53 @@ def inspect_frame(
         ),
         PipelineStage(
             "3. 对比度归一化",
-            "拉伸灰度范围，降低曝光变化对 Hough 梯度的影响。",
+            "拉伸灰度范围，降低曝光变化对 EdgeDrawing 的影响。",
             normalized,
             parameters="NORM_MINMAX: 0–255" if config.enable_intensity_normalization else "已跳过",
             statistics=f"均值 {float(normalized.mean()):.1f}",
         ),
         PipelineStage(
             "4. 高斯平滑",
-            "在 Hough 变换前抑制高频噪声。",
+            "在 EdgeDrawing 前抑制高频噪声。",
             smoothed,
             parameters=f"核大小 {blur_size}×{blur_size}" if config.enable_gaussian_blur else "已跳过",
         ),
         PipelineStage(
-            "5. Hough 输入预处理",
+            "5. EdgeDrawing 输入预处理",
             "按工作尺寸缩放，并可选执行 CLAHE 与中值滤波。",
             enhanced,
             parameters=(
-                f"缩放 {scale:.2f}；CLAHE {'开' if config.enable_hough_clahe else '关'}；"
-                f"中值滤波 {'开' if config.enable_hough_median_blur else '关'}"
+                f"缩放 {scale:.2f}；CLAHE {'开' if config.enable_edge_clahe else '关'}；"
+                f"中值滤波 {'开' if config.enable_edge_median_blur else '关'}"
             ),
         ),
         PipelineStage(
-            "6. Hough 边缘支撑",
-            "生成仅用于验证圆周边缘覆盖率的 Canny 边缘图。",
+            "6. EdgeDrawing 边缘图",
+            "生成 EdgeDrawing 提取的连接边缘，用于验证候选圆的边缘覆盖率。",
             edges,
             parameters=(
-                f"Canny {config.hough_param1 * 0.5:g}–{config.hough_param1:g}；"
-                f"邻域 {config.hough_edge_neighborhood}px"
+                f"梯度阈值 {config.edge_gradient_threshold}；"
+                f"边缘邻域 {config.edge_support_neighborhood}px"
             ),
         ),
         PipelineStage(
-            "7. Hough 原始圆",
-            "在整张工作图上执行一次 cv2.HoughCircles。",
-            _candidate_overlay(detection_frame, raw_centers, raw_radii, (255, 120, 0)),
+            "7. EdgeDrawing 原始圆候选",
+            "从 EdgeDrawing 闭合边缘结果中仅保留原生圆和达到圆度阈值的近圆记录。",
+            _circle_overlay(detection_frame, raw_circles, (255, 120, 0)),
             parameters=(
-                f"dp={config.hough_dp:g}；param2={config.hough_param2:g}；"
-                f"半径 {config.hough_min_radius:g}–{config.hough_max_radius:g}px"
+                f"近圆比 ≥ {config.edge_min_circle_ratio:g}；"
+                f"半径 {config.min_radius:g}–{config.max_radius:g}px"
             ),
-            statistics=f"原始圆 {len(raw_centers)} 个",
+            statistics=f"原始圆候选 {len(raw_circles)} 个",
         ),
         PipelineStage(
             "8. 简单过滤结果",
-            "仅按尺寸、截断线、可见圆周、边缘支撑和圆心距离过滤。",
+            "按半径、近圆比、截断线、可见圆周、边缘支撑和中心距离过滤。",
             annotate_frame(detection_frame, result),
             parameters=(
-                f"边缘支撑 ≥ {config.hough_edge_support_threshold:g}；"
-                f"可见圆周 ≥ {config.candidate_min_visible_circle_ratio:g}；"
-                f"直径完整度 ≥ {config.candidate_full_circle_ratio:g}"
+                f"边缘支撑 ≥ {config.edge_min_support_ratio:g}；"
+                f"可见圆周 ≥ {config.edge_min_visible_ratio:g}；"
+                f"直径完整度 ≥ {config.diameter_min_visible_ratio:g}"
             ),
             statistics=f"最终液滴 {len(centers)} 个",
         ),
@@ -273,9 +278,10 @@ def annotate_frame(frame: np.ndarray, result: DetectionResult) -> np.ndarray:
         point = tuple(int(round(float(value))) for value in center)
         cv2.circle(output, point, max(1, int(round(radius))), (0, 220, 80), 2)
         cv2.circle(output, point, 2, (0, 80, 255), -1)
+        label = f"r={radius:.1f}"
         cv2.putText(
             output,
-            f"r={radius:.1f}",
+            label,
             (point[0] + 4, point[1] - 4),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.42,

@@ -1,7 +1,7 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -12,52 +12,51 @@ except ImportError:
     from config import DebugConfig, DetectorConfig
 
 
+@dataclass(frozen=True)
+class CircleDetection:
+    """One circular droplet candidate in original-image coordinates."""
+
+    center: np.ndarray
+    radius: float
+
+
 @dataclass
 class DetectionResult:
-    centers: List[np.ndarray]
-    radii: List[float]
+    centers: list[np.ndarray]
+    radii: list[float]
     debug_image: np.ndarray
     helper_mask: np.ndarray
-    diameter_valid: List[bool] = field(default_factory=list)
+    diameter_valid: list[bool] = field(default_factory=list)
 
 
 class DropletDetector:
-    """Detect circular droplets with one full-frame Hough transform.
-
-    The detector intentionally has no contour, connected-component, background
-    subtraction, Watershed, candidate fusion, or intensity-scoring branch.
-    Hough results only pass inexpensive geometric filters: configured radius,
-    cut line, visible perimeter, edge support, optional calibrated-size gate,
-    and center-distance de-duplication.
-    """
+    """Detect circular droplets from EdgeDrawing closed-edge records."""
 
     def __init__(self, config: DetectorConfig, debug: DebugConfig) -> None:
         self._config = config
         self._debug = debug
-        self._circle_offset_cache: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
         self._runtime_min_radius = max(1.0, float(config.min_radius))
         self._runtime_max_radius = max(self._runtime_min_radius + 1.0, float(config.max_radius))
-        configured_preferred = float(config.expected_radius or config.hough_preferred_radius)
-        self._has_expected_size = configured_preferred > 0.0
+        self._has_expected_size = float(config.expected_radius) > 0.0
         self._runtime_preferred_radius = (
-            configured_preferred
-            if configured_preferred > 0.0
+            float(config.expected_radius)
+            if self._has_expected_size
             else float(np.sqrt(self._runtime_min_radius * self._runtime_max_radius))
         )
-        self._configured_preferred_radius = float(self._runtime_preferred_radius)
+        self._configured_preferred_radius = self._runtime_preferred_radius
 
     def configure_expected_diameter(self, diameter_um: float, pixel_to_micron: float) -> None:
-        """Keep the legacy hook without leaking the PID target into detection."""
+        """Keep the control-facing hook; PID targets must not alter detection gates."""
         _ = (diameter_um, pixel_to_micron)
 
     def reset_adaptive_size(self) -> None:
-        self._runtime_preferred_radius = float(self._configured_preferred_radius)
+        self._runtime_preferred_radius = self._configured_preferred_radius
 
     def runtime_radius_range(self) -> tuple[float, float, float]:
         return (
-            float(self._runtime_min_radius),
-            float(self._runtime_preferred_radius),
-            float(self._runtime_max_radius),
+            self._runtime_min_radius,
+            self._runtime_preferred_radius,
+            self._runtime_max_radius,
         )
 
     def calibrate_preferred_radius(self, radii: list[float]) -> float:
@@ -80,17 +79,15 @@ class DropletDetector:
         normalized = self._normalize(gray)
         smoothed = self._smooth(normalized)
         cut_line = int(smoothed.shape[0] * float(self._config.cut_line_ratio))
-        centers, radii = self._detect_hough_candidates(smoothed, cut_line)
-        diameter_valid = [
-            self._candidate_diameter_valid(normalized.shape[:2], center, radius)
-            for center, radius in zip(centers, radii)
-        ]
+        circles = self._detect_candidates(smoothed, cut_line)
         return DetectionResult(
-            centers=centers,
-            radii=radii,
+            centers=[item.center.copy() for item in circles],
+            radii=[item.radius for item in circles],
             debug_image=np.empty((0, 0, 3), dtype=np.uint8),
             helper_mask=self._build_bead_helper_mask(normalized),
-            diameter_valid=diameter_valid,
+            diameter_valid=[
+                self._circle_fully_visible(normalized.shape[:2], item) for item in circles
+            ],
         )
 
     def _ensure_gray(self, frame: np.ndarray) -> np.ndarray:
@@ -110,277 +107,216 @@ class DropletDetector:
         return cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
 
     def _smooth(self, gray: np.ndarray) -> np.ndarray:
-        blur_size = self._odd(self._config.gaussian_blur_size)
-        if not self._config.enable_gaussian_blur or blur_size <= 1:
+        size = self._odd(self._config.gaussian_blur_size)
+        if not self._config.enable_gaussian_blur or size <= 1:
             return gray.copy()
-        return cv2.GaussianBlur(gray, (blur_size, blur_size), 0)
+        return cv2.GaussianBlur(gray, (size, size), 0)
 
-    def _detect_hough_candidates(
+    def _detect_candidates(
         self,
         gray: np.ndarray,
         cut_line: int,
         trace: dict[str, object] | None = None,
-    ) -> Tuple[List[np.ndarray], List[float]]:
-        work_gray, scale = self._prepare_hough_frame(gray)
-        enhanced = self._hough_preprocess(work_gray)
-        edges = cv2.Canny(
-            enhanced,
-            max(1.0, float(self._config.hough_param1) * 0.5),
-            max(2.0, float(self._config.hough_param1)),
-        )
-        support_edges = self._build_support_edges(edges)
+    ) -> list[CircleDetection]:
+        work_gray, scale = self._prepare_frame(gray)
+        enhanced = self._preprocess(work_gray)
+        edge_image, work_circles = self._run_edge_drawing(enhanced)
+        support_edges = self._expand_edges(edge_image)
+        raw_circles = [self._rescale_circle(item, 1.0 / scale) for item in work_circles]
+
+        minimum_support = max(0.0, min(1.0, float(self._config.edge_min_support_ratio)))
+        minimum_visible = max(0.0, min(1.0, float(self._config.edge_min_visible_ratio)))
+        candidates: list[CircleDetection] = []
+        for original, working in zip(raw_circles, work_circles):
+            if float(original.center[1]) > float(cut_line):
+                continue
+            if not self._runtime_min_radius <= original.radius <= self._runtime_max_radius:
+                continue
+            if self._circle_visible_ratio(gray.shape[:2], original) < minimum_visible:
+                continue
+            if self._circle_edge_support(support_edges, working) < minimum_support:
+                continue
+            if not self._expected_size_valid(original.radius):
+                continue
+            candidates.append(original)
+
+        if self._has_expected_size:
+            candidates.sort(key=lambda item: abs(item.radius - self._runtime_preferred_radius))
+        else:
+            candidates.sort(key=lambda item: item.radius, reverse=True)
+        candidates = self._deduplicate(candidates)
+        candidates = candidates[: max(1, int(self._config.edge_max_candidates))]
+
         if trace is not None:
             trace.update(
                 {
                     "work_gray": work_gray,
                     "scale": scale,
                     "enhanced": enhanced,
-                    "edges": edges,
+                    "edges": edge_image,
                     "support_edges": support_edges,
-                    "raw_centers": [],
-                    "raw_radii": [],
-                    "filtered_centers": [],
-                    "filtered_radii": [],
+                    "raw_circles": raw_circles,
+                    "filtered_circles": candidates,
                 }
             )
+        return candidates
 
-        if not bool(self._config.enable_hough_candidates):
-            return [], []
+    def _run_edge_drawing(self, gray: np.ndarray) -> tuple[np.ndarray, list[CircleDetection]]:
+        ximgproc = getattr(cv2, "ximgproc", None)
+        create = getattr(ximgproc, "createEdgeDrawing", None)
+        params_type = getattr(getattr(ximgproc, "EdgeDrawing", None), "Params", None)
+        if not callable(create) or params_type is None:
+            raise RuntimeError("当前 OpenCV 不包含 EdgeDrawing，请安装 opencv-contrib-python")
 
-        circles = cv2.HoughCircles(
-            enhanced,
-            cv2.HOUGH_GRADIENT,
-            dp=max(1.0, float(self._config.hough_dp)),
-            minDist=max(1.0, self._hough_min_distance() * scale),
-            param1=max(1.0, float(self._config.hough_param1)),
-            param2=max(1.0, float(self._config.hough_param2)),
-            minRadius=max(1, int(round(self._hough_min_radius() * scale))),
-            maxRadius=max(1, int(round(self._hough_max_radius() * scale))),
+        params = params_type()
+        params.EdgeDetectionOperator = max(0, min(3, int(self._config.edge_operator)))
+        params.GradientThresholdValue = max(1, int(self._config.edge_gradient_threshold))
+        params.AnchorThresholdValue = max(0, int(self._config.edge_anchor_threshold))
+        params.ScanInterval = max(1, int(self._config.edge_scan_interval))
+        params.MinPathLength = max(2, int(self._config.edge_min_path_length))
+        params.MinLineLength = int(self._config.edge_min_line_length)
+        params.Sigma = max(0.01, float(self._config.edge_sigma))
+        params.LineFitErrorThreshold = max(0.01, float(self._config.edge_line_fit_error))
+        params.MaxDistanceBetweenTwoLines = max(0.0, float(self._config.edge_max_line_gap))
+        params.MaxErrorThreshold = max(0.01, float(self._config.edge_max_error))
+        params.NFAValidation = bool(self._config.edge_nfa_validation)
+        params.PFmode = bool(self._config.edge_pf_mode)
+
+        detector = create()
+        detector.setParams(params)
+        detector.detectEdges(gray)
+        edge_image = np.asarray(detector.getEdgeImage(), dtype=np.uint8)
+        # EdgeDrawing exposes circles and other closed conics through this one API.
+        records = detector.detectEllipses()
+        return edge_image, self._parse_circle_records(records)
+
+    def _parse_circle_records(self, records: np.ndarray | None) -> list[CircleDetection]:
+        output: list[CircleDetection] = []
+        minimum_circle_ratio = max(
+            0.0,
+            min(1.0, float(self._config.edge_min_circle_ratio)),
         )
-        if circles is None:
-            return [], []
-
-        raw = np.asarray(circles[0], dtype=np.float32)
-        raw_candidates = [
-            (float(cx) / scale, float(cy) / scale, float(radius) / scale)
-            for cx, cy, radius in raw
-        ]
-        if trace is not None:
-            trace["raw_centers"] = [
-                np.array([cx, cy], dtype=np.float32) for cx, cy, _radius in raw_candidates
-            ]
-            trace["raw_radii"] = [radius for _cx, _cy, radius in raw_candidates]
-
-        minimum_visible = min(
-            1.0,
-            max(0.0, float(self._config.candidate_min_visible_circle_ratio)),
-        )
-        minimum_edge_support = max(0.0, float(self._config.hough_edge_support_threshold))
-        scaled_cut_line = float(cut_line) * scale
-        candidates: list[tuple[float, float, float]] = []
-        for cx, cy, radius in raw:
-            original = (float(cx) / scale, float(cy) / scale, float(radius) / scale)
-            original_cx, original_cy, original_radius = original
-            if float(cy) > scaled_cut_line:
+        for record in np.asarray(records if records is not None else []):
+            values = np.asarray(record, dtype=np.float64).reshape(-1)
+            if values.size < 3 or not np.isfinite(values).all():
                 continue
-            if not self._hough_min_radius() <= original_radius <= self._hough_max_radius():
+            cx, cy = float(values[0]), float(values[1])
+            if values.size >= 5 and values[3] > 0.0 and values[4] > 0.0:
+                first_radius, second_radius = float(values[3]), float(values[4])
+                larger = max(first_radius, second_radius)
+                smaller = min(first_radius, second_radius)
+                if smaller / larger < minimum_circle_ratio:
+                    continue
+                radius = (first_radius + second_radius) * 0.5
+            else:
+                radius = float(values[2])
+            if radius <= 0.0:
                 continue
-            if self._circle_visible_ratio(gray.shape[:2], original_cx, original_cy, original_radius) < minimum_visible:
-                continue
-            if self._circle_edge_support(support_edges, float(cx), float(cy), float(radius)) < minimum_edge_support:
-                continue
-            candidates.append(original)
+            output.append(
+                CircleDetection(
+                    center=np.array([cx, cy], dtype=np.float32),
+                    radius=radius,
+                )
+            )
+        return output
 
-        candidates = self._filter_expected_size(candidates)
-        if self._has_expected_size:
-            candidates.sort(key=lambda item: self._candidate_priority(item[2]))
-        centers = [np.array([cx, cy], dtype=np.float32) for cx, cy, _radius in candidates]
-        radii = [float(radius) for _cx, _cy, radius in candidates]
-        centers, radii = self._deduplicate(centers, radii)
-        maximum = max(1, int(self._config.hough_max_candidates))
-        centers, radii = centers[:maximum], radii[:maximum]
-        if trace is not None:
-            trace["filtered_centers"] = list(centers)
-            trace["filtered_radii"] = list(radii)
-        return centers, radii
-
-    def _prepare_hough_frame(self, gray: np.ndarray) -> Tuple[np.ndarray, float]:
+    def _prepare_frame(self, gray: np.ndarray) -> tuple[np.ndarray, float]:
         height, width = gray.shape[:2]
-        max_width = max(1, int(self._config.hough_work_max_width))
-        max_height = max(1, int(self._config.hough_work_max_height))
         scale = min(
             1.0,
-            float(max_width) / float(max(1, width)),
-            float(max_height) / float(max(1, height)),
+            float(max(1, int(self._config.edge_work_max_width))) / max(1, width),
+            float(max(1, int(self._config.edge_work_max_height))) / max(1, height),
         )
         if scale >= 0.999:
             return gray, 1.0
-        target = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
-        return cv2.resize(gray, target, interpolation=cv2.INTER_AREA), float(scale)
+        size = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
+        return cv2.resize(gray, size, interpolation=cv2.INTER_AREA), scale
 
-    def _hough_preprocess(self, gray: np.ndarray) -> np.ndarray:
+    def _preprocess(self, gray: np.ndarray) -> np.ndarray:
         output = gray
-        if self._config.enable_hough_clahe:
+        if self._config.enable_edge_clahe:
             output = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(output)
-        if self._config.enable_hough_median_blur:
+        if self._config.enable_edge_median_blur:
             output = cv2.medianBlur(output, 5)
         return output
 
-    def _hough_min_radius(self) -> float:
-        return max(1.0, float(self._config.hough_min_radius), self._runtime_min_radius)
-
-    def _hough_max_radius(self) -> float:
-        configured = max(self._hough_min_radius(), float(self._config.hough_max_radius))
-        return min(configured, self._runtime_max_radius)
-
-    def _hough_min_distance(self) -> float:
-        configured = float(self._config.hough_min_distance)
-        if configured > 0.0:
-            return configured
-        return max(
-            2.0,
-            self._runtime_preferred_radius * float(self._config.min_center_distance_radius_ratio),
+    @staticmethod
+    def _rescale_circle(item: CircleDetection, factor: float) -> CircleDetection:
+        return CircleDetection(
+            center=np.asarray(item.center * factor, dtype=np.float32),
+            radius=float(item.radius * factor),
         )
 
-    def _filter_expected_size(
-        self,
-        candidates: list[tuple[float, float, float]],
-    ) -> list[tuple[float, float, float]]:
-        if (
-            not self._config.enable_expected_size_filter
-            or not self._has_expected_size
-            or not bool(self._config.expected_size_hard_gate)
+    def _expected_size_valid(self, radius: float) -> bool:
+        if not (
+            self._config.enable_expected_size_filter
+            and self._config.expected_size_hard_gate
+            and self._has_expected_size
         ):
-            return candidates
+            return True
         tolerance = max(0.0, float(self._config.expected_radius_tolerance_ratio))
-        preferred = float(self._runtime_preferred_radius)
-        minimum = preferred * max(0.0, 1.0 - tolerance)
-        maximum = preferred * (1.0 + tolerance)
-        return [item for item in candidates if minimum <= float(item[2]) <= maximum]
+        preferred = self._runtime_preferred_radius
+        return preferred * max(0.0, 1.0 - tolerance) <= radius <= preferred * (1.0 + tolerance)
 
-    def _build_support_edges(self, edges: np.ndarray) -> np.ndarray:
-        neighborhood = max(0, int(self._config.hough_edge_neighborhood))
-        if neighborhood <= 0:
+    def _expand_edges(self, edges: np.ndarray) -> np.ndarray:
+        neighborhood = max(0, int(self._config.edge_support_neighborhood))
+        if neighborhood == 0:
             return edges
         size = neighborhood * 2 + 1
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
         return cv2.dilate(edges, kernel)
 
-    def _circle_edge_support(self, edges: np.ndarray, cx: float, cy: float, radius: float) -> float:
+    @staticmethod
+    def _circle_points(item: CircleDetection) -> tuple[np.ndarray, np.ndarray]:
+        samples = max(48, int(round(2.0 * np.pi * item.radius)))
+        theta = np.linspace(0.0, 2.0 * np.pi, samples, endpoint=False, dtype=np.float32)
+        xs = item.center[0] + item.radius * np.cos(theta)
+        ys = item.center[1] + item.radius * np.sin(theta)
+        return xs, ys
+
+    def _circle_edge_support(self, edges: np.ndarray, item: CircleDetection) -> float:
+        xs, ys = self._circle_points(item)
+        x = np.rint(xs).astype(np.int32)
+        y = np.rint(ys).astype(np.int32)
         height, width = edges.shape[:2]
-        xs, ys = self._circle_offsets(radius)
-        x = np.rint(cx + xs).astype(np.int32)
-        y = np.rint(cy + ys).astype(np.int32)
         valid = (x >= 0) & (x < width) & (y >= 0) & (y < height)
         count = int(np.count_nonzero(valid))
         if count == 0:
             return 0.0
-        return float(np.count_nonzero(edges[y[valid], x[valid]] > 0)) / float(count)
+        return float(np.count_nonzero(edges[y[valid], x[valid]] > 0)) / count
 
-    def _circle_visible_ratio(
-        self,
-        shape: tuple[int, int],
-        cx: float,
-        cy: float,
-        radius: float,
-    ) -> float:
+    def _circle_visible_ratio(self, shape: tuple[int, int], item: CircleDetection) -> float:
+        xs, ys = self._circle_points(item)
         height, width = shape
-        xs, ys = self._circle_offsets(radius)
-        x = np.rint(cx + xs).astype(np.int32)
-        y = np.rint(cy + ys).astype(np.int32)
-        valid = (x >= 0) & (x < width) & (y >= 0) & (y < height)
-        return float(np.count_nonzero(valid)) / float(max(1, len(valid)))
+        valid = (xs >= 0) & (xs < width) & (ys >= 0) & (ys < height)
+        return float(np.count_nonzero(valid)) / max(1, len(valid))
 
-    def _circle_offsets(self, radius: float) -> tuple[np.ndarray, np.ndarray]:
-        rounded_radius = max(1, int(round(radius)))
-        samples = max(48, int(rounded_radius * 4.0))
-        key = (rounded_radius, samples)
-        cached = self._circle_offset_cache.get(key)
-        if cached is not None:
-            return cached
-        theta = np.linspace(0.0, 2.0 * np.pi, samples, endpoint=False, dtype=np.float32)
-        offsets = (np.cos(theta) * rounded_radius, np.sin(theta) * rounded_radius)
-        self._circle_offset_cache[key] = offsets
-        return offsets
+    def _circle_fully_visible(self, shape: tuple[int, int], item: CircleDetection) -> bool:
+        required = max(0.0, min(1.0, float(self._config.diameter_min_visible_ratio)))
+        return self._circle_visible_ratio(shape, item) >= required
 
-    def _deduplicate(
-        self,
-        centers: List[np.ndarray],
-        radii: List[float],
-    ) -> Tuple[List[np.ndarray], List[float]]:
-        kept_centers: List[np.ndarray] = []
-        kept_radii: List[float] = []
-        for center, radius in zip(centers, radii):
-            if any(
-                float(np.linalg.norm(center - existing))
-                < self._duplicate_distance(float(radius), existing_radius)
-                for existing, existing_radius in zip(kept_centers, kept_radii)
-            ):
-                continue
-            kept_centers.append(center)
-            kept_radii.append(float(radius))
-        return kept_centers, kept_radii
+    def _deduplicate(self, candidates: list[CircleDetection]) -> list[CircleDetection]:
+        kept: list[CircleDetection] = []
+        for candidate in candidates:
+            duplicate = False
+            for existing in kept:
+                threshold = max(
+                    float(self._config.min_center_distance),
+                    float(self._config.deduplicate_min_distance),
+                    min(candidate.radius, existing.radius)
+                    * float(self._config.deduplicate_distance_ratio),
+                    (candidate.radius + existing.radius)
+                    * float(self._config.deduplicate_overlap_ratio),
+                )
+                if float(np.linalg.norm(candidate.center - existing.center)) < threshold:
+                    duplicate = True
+                    break
+            if not duplicate:
+                kept.append(candidate)
+        return kept
 
-    def _candidate_priority(self, radius: float) -> Tuple[float, float]:
-        return (abs(float(radius) - self._runtime_preferred_radius), -float(radius))
-
-    def _duplicate_distance(self, radius_a: float, radius_b: float) -> float:
-        smaller = min(float(radius_a), float(radius_b))
-        ratio_distance = smaller * float(self._config.deduplicate_distance_ratio)
-        overlap_distance = (float(radius_a) + float(radius_b)) * float(
-            self._config.candidate_nms_overlap_ratio
-        )
-        return max(
-            float(self._config.deduplicate_min_distance),
-            ratio_distance,
-            overlap_distance,
-        )
-
-    def _candidate_diameter_valid(
-        self,
-        shape: tuple[int, int],
-        center: np.ndarray,
-        radius: float,
-    ) -> bool:
-        height, width = shape
-        margin = float(radius) * max(0.0, float(self._config.candidate_full_circle_ratio))
-        cx, cy = float(center[0]), float(center[1])
-        return cx >= margin and cy >= margin and cx < width - margin and cy < height - margin
-
-    # These two measurements are retained for camera auto-calibration reports;
-    # they do not accept or reject Hough detections.
-    def _ring_contrast(self, image: np.ndarray, cx: float, cy: float, radius: float) -> float:
-        edge = self._circle_sample_mean(image, cx, cy, radius)
-        inner = self._circle_sample_mean(image, cx, cy, radius * 0.70)
-        outer = self._circle_sample_mean(image, cx, cy, radius * 1.22)
-        if edge is None or inner is None or outer is None:
-            return 0.0
-        return float(((inner + outer) * 0.5 - edge) / 255.0)
-
-    def _center_contrast(self, image: np.ndarray, cx: float, cy: float, radius: float) -> float:
-        edge = self._circle_sample_mean(image, cx, cy, radius)
-        center = self._circle_sample_mean(image, cx, cy, radius * 0.25)
-        if edge is None or center is None:
-            return 0.0
-        return float((center - edge) / 255.0)
-
-    def _circle_sample_mean(
-        self,
-        image: np.ndarray,
-        cx: float,
-        cy: float,
-        radius: float,
-    ) -> float | None:
-        xs, ys = self._circle_offsets(max(1.0, radius))
-        x = np.rint(cx + xs).astype(np.int32)
-        y = np.rint(cy + ys).astype(np.int32)
-        height, width = image.shape[:2]
-        valid = (x >= 0) & (x < width) & (y >= 0) & (y < height)
-        if int(np.count_nonzero(valid)) < max(12, int(len(x) * 0.75)):
-            return None
-        return float(np.mean(image[y[valid], x[valid]]))
-
-    def _build_bead_helper_mask(self, normalized_gray: np.ndarray) -> np.ndarray:
+    @staticmethod
+    def _build_bead_helper_mask(normalized_gray: np.ndarray) -> np.ndarray:
         threshold_value = float(np.percentile(normalized_gray, 15.0))
         _, helper = cv2.threshold(normalized_gray, threshold_value, 255, cv2.THRESH_BINARY_INV)
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))

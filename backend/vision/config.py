@@ -4,8 +4,6 @@ from typing import Any, Literal, Tuple
 import os
 
 TrackerType = Literal["nearest", "kalman"]
-DetectionMode = Literal["split_connected", "no_split"]
-ThresholdMode = Literal["adaptive_gaussian", "otsu"]
 BeadMode = Literal["intensity", "connected"]
 
 
@@ -74,122 +72,51 @@ class ChannelRegionConfig:
 
 @dataclass
 class DetectorConfig:
-    # Image-domain measurement bounds. These are independent of the PID target.
+    """Configuration for the EdgeDrawing-only droplet detector."""
+
+    # Circle-radius bounds in original-image pixels.
     min_radius: float = 8.0
     max_radius: float = 80.0
     expected_radius: float = 0.0
-    # Retained for settings compatibility; PID targets never change this gate.
+    enable_expected_size_filter: bool = True
     expected_size_hard_gate: bool = False
-    adaptive_min_radius_ratio: float = 0.50
-    adaptive_max_radius_ratio: float = 1.60
-    adaptive_radius_learning_rate: float = 0.12
-    adaptive_radius_min_candidates: int = 4
-    min_center_distance: float = 0.0
-    min_center_distance_radius_ratio: float = 0.75
-    deduplicate_distance_ratio: float = 0.60
-    deduplicate_min_distance: float = 6.0
-    deduplicate_contained_ratio: float = 0.88
-    # Deprecated compatibility fields from the former contour/background/
-    # Watershed detector. Saved JSON profiles may still contain them, but the
-    # Hough-only detector does not read them.
-    enable_contour_candidates: bool = True
-    contour_work_scale: float = 0.50
-    enable_background_subtraction: bool = True
-    background_difference_threshold: float = 12.0
-    background_learning_rate: float = 0.02
-    contour_canny_low: float = 40.0
-    contour_canny_high: float = 120.0
-    contour_close_kernel: int = 3
-    contour_min_circularity: float = 0.58
-    contour_min_axis_ratio: float = 0.52
-    contour_min_edge_support: float = 0.18
-    contour_min_area_fill_ratio: float = 0.45
-    contour_max_candidates: int = 160
-    enable_watershed_split: bool = True
-    watershed_peak_ratio: float = 0.70
-    watershed_min_peak_radius_ratio: float = 0.45
-    watershed_max_markers: int = 12
-    local_hough_padding_ratio: float = 0.45
-    local_hough_max_regions: int = 12
-    # Saved-profile compatibility aliases from the former contour detector.
-    circularity_threshold: float = 0.12
-    min_contour_area: float = 40.0
+    expected_radius_tolerance_ratio: float = 0.30
+
+    # Generic image preparation.
     enable_intensity_normalization: bool = True
     enable_gaussian_blur: bool = True
     gaussian_blur_size: int = 5
-    # Deprecated JSON compatibility fields from the removed binary,
-    # morphology, and connected-component pipeline. They are not executed.
-    threshold_mode: ThresholdMode = "adaptive_gaussian"
-    adaptive_threshold_block_size: int = 31
-    adaptive_threshold_c: float = 5.0
-    enable_morphology: bool = True
-    morphology_open_kernel: int = 3
-    morphology_close_kernel: int = 5
-    split_peak_threshold_ratio: float = 0.55
-    split_min_radius_ratio: float = 0.65
-    split_large_area_ratio: float = 1.15
-    # Active detector path: one full-frame HoughCircles call per frame.
-    enable_hough_candidates: bool = True
-    # Deprecated hybrid-detector compatibility fields.
-    hough_fallback_only: bool = False
-    hough_refresh_interval: int = 0
-    enable_hough_clahe: bool = True
-    enable_hough_median_blur: bool = True
-    hough_dp: float = 1.2
-    hough_min_distance: float = 0.0
-    hough_param1: float = 100.0
-    hough_param2: float = 28.0
-    hough_min_radius: float = 8.0
-    hough_max_radius: float = 80.0
-    hough_preferred_radius: float = 0.0
-    hough_edge_support_threshold: float = 0.15
-    hough_edge_neighborhood: int = 2
-    # Optional calibrated-size hard gate. Edge-ownership fields below are kept
-    # only for settings compatibility and are not used by the simple detector.
-    enable_expected_size_filter: bool = True
-    expected_radius_tolerance_ratio: float = 0.30
-    enable_edge_ownership_filter: bool = True
-    edge_ownership_search_radius: int = 2
-    edge_ownership_margin: float = 0.75
-    edge_ownership_min_ratio: float = 0.55
-    hough_work_max_width: int = 760
-    hough_work_max_height: int = 560
-    hough_max_candidates: int = 120
-    # Deprecated JSON compatibility fields from the removed intensity-peak
-    # candidate path. They remain inactive in the hybrid detector.
-    enable_intensity_peak_candidates: bool = False
-    enable_intensity_peak_fallback: bool = True
-    intensity_peak_kernel_radius_ratio: float = 1.25
-    intensity_peak_percentile: float = 55.0
-    intensity_peak_min_radius_ratio: float = 0.80
-    intensity_peak_max_radius_ratio: float = 1.20
-    intensity_peak_min_edge_support: float = 0.18
-    intensity_peak_max_candidates: int = 120
-    # Disabled by default: without an independently calibrated size prior this
-    # heuristic can misclassify one large droplet as several smaller circles.
-    reject_multi_droplet_circles: bool = False
-    multi_droplet_child_radius_ratio: float = 0.82
-    multi_droplet_child_distance_ratio: float = 0.90
-    multi_droplet_child_count: int = 2
-    # Deprecated scoring-pipeline fields; Hough edge support is controlled by
-    # hough_edge_support_threshold.
-    candidate_min_edge_support: float = 0.15
-    candidate_min_ring_contrast: float = -1.0
-    # In the current bright-field setup, a real droplet has a brighter inner
-    # region and a darker circular boundary. Requiring this contrast rejects
-    # dark junctions between neighbouring droplets that Hough may fit as
-    # small circles.
-    candidate_min_center_contrast: float = -1.0
-    # Partial candidates may still be tracked, but only sufficiently complete
-    # geometry contributes a diameter sample to metrics/PID.
-    candidate_min_visible_circle_ratio: float = 0.50
-    # Diameter validity gate. Partial circles remain available to the tracker,
-    # but do not contribute biased diameter samples to metrics/PID.
-    candidate_full_circle_ratio: float = 0.85
-    candidate_nms_overlap_ratio: float = 0.42
+    enable_edge_clahe: bool = True
+    enable_edge_median_blur: bool = True
+    edge_work_max_width: int = 760
+    edge_work_max_height: int = 560
+
+    # cv2.ximgproc.EdgeDrawing parameters.
+    edge_operator: int = 0
+    edge_gradient_threshold: int = 20
+    edge_anchor_threshold: int = 0
+    edge_scan_interval: int = 1
+    edge_min_path_length: int = 10
+    edge_min_line_length: int = -1
+    edge_sigma: float = 1.0
+    edge_line_fit_error: float = 1.0
+    edge_max_line_gap: float = 6.0
+    edge_max_error: float = 1.3
+    edge_nfa_validation: bool = True
+    edge_pf_mode: bool = False
+
+    # Circle acceptance and output limits. Near-circular records may differ by 10%.
+    edge_min_circle_ratio: float = 0.90
+    edge_min_support_ratio: float = 0.15
+    edge_support_neighborhood: int = 2
+    edge_min_visible_ratio: float = 0.50
+    edge_max_candidates: int = 120
+    min_center_distance: float = 0.0
+    deduplicate_distance_ratio: float = 0.60
+    deduplicate_min_distance: float = 6.0
+    deduplicate_overlap_ratio: float = 0.42
+    diameter_min_visible_ratio: float = 0.85
     cut_line_ratio: float = 1.0
-    # Deprecated JSON compatibility field from the removed contour detector.
-    detection_mode: DetectionMode = "no_split"
 
 
 @dataclass

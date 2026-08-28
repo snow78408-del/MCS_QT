@@ -326,15 +326,14 @@ class PipelineVisionService:
         # The control target is deliberately stored only for display/control.
         # It must not influence detector gates, candidate scores, or tracking.
         pipeline.config.detector.expected_size_hard_gate = False
-        pipeline.config.detector.hough_work_max_width = 480
-        pipeline.config.detector.hough_work_max_height = 360
-        pipeline.config.detector.hough_max_candidates = 40
-        # Recover weaker, partially illuminated droplets, then let geometric
-        # scoring and temporal tracking reject isolated false candidates.
-        pipeline.config.detector.hough_param2 = 22.0
-        pipeline.config.detector.hough_edge_support_threshold = 0.12
-        pipeline.config.detector.candidate_min_edge_support = 0.12
-        pipeline.config.detector.candidate_full_circle_ratio = 0.75
+        pipeline.config.detector.edge_work_max_width = 480
+        pipeline.config.detector.edge_work_max_height = 360
+        pipeline.config.detector.edge_max_candidates = 40
+        # Recover weaker, partially illuminated boundaries while retaining an
+        # EdgeDrawing perimeter-support check against isolated false circles.
+        pipeline.config.detector.edge_gradient_threshold = 16
+        pipeline.config.detector.edge_min_support_ratio = 0.12
+        pipeline.config.detector.diameter_min_visible_ratio = 0.75
         # Recognition may run much slower than camera acquisition.  A droplet
         # can move farther than the old 120 px gate between processed frames.
         pipeline.config.tracker.match_distance = 180.0
@@ -534,11 +533,6 @@ class PipelineVisionService:
         center_median = median(center_contrasts)
         ring_median = median(ring_contrasts)
         polarity = "亮心暗边" if center_median >= 0.0 else "暗心亮边"
-        detector_config = self._ensure_pipeline().config.detector
-        # Only enable a polarity threshold when the measured separation is
-        # strong; otherwise retain polarity-neutral detection.
-        detector_config.candidate_min_center_contrast = max(0.01, center_median * 0.35) if center_median >= 0.04 else -1.0
-        detector_config.candidate_min_ring_contrast = max(0.005, ring_median * 0.30) if ring_median >= 0.025 else -1.0
         result = {
             "ok": True,
             "sample_count": len(radii),
@@ -549,8 +543,6 @@ class PipelineVisionService:
             "background_brightness": median(brightness),
             "noise_sigma": median(noise),
             "polarity": polarity,
-            "center_contrast_threshold": detector_config.candidate_min_center_contrast,
-            "ring_contrast_threshold": detector_config.candidate_min_ring_contrast,
         }
         self._log(f"[VISION][CALIBRATION] {result}")
         return result

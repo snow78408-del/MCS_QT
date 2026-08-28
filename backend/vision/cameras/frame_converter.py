@@ -54,13 +54,13 @@ def convert_image(raw: Any, width: int, height: int, pixel_format: str) -> np.nd
     }
     if normalized in bayer_codes:
         if cv2 is None or bayer_codes[normalized] is None:
-            raise ValueError("Bayer图像转换需要安装 opencv-python")
+            raise ValueError("Bayer图像转换需要安装 opencv-contrib-python")
         bayer = arr.reshape((height, width)).astype(np.uint8, copy=False)
         return cv2.cvtColor(bayer, bayer_codes[normalized])
 
     if normalized.startswith("YUV") or normalized in {"YUYV", "YUY2"}:
         if cv2 is None:
-            raise ValueError("YUV图像转换需要安装 opencv-python")
+            raise ValueError("YUV图像转换需要安装 opencv-contrib-python")
         yuv = arr.reshape((height, width, 2)).astype(np.uint8, copy=False)
         return cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_YUY2)
 

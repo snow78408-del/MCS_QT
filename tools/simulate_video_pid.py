@@ -47,12 +47,10 @@ def main() -> int:
     parser.add_argument("--min-radius", type=float, default=None)
     parser.add_argument("--max-radius", type=float, default=None)
     parser.add_argument("--min-center-distance", type=float, default=None)
-    parser.add_argument("--split-peak-threshold-ratio", type=float, default=None)
-    parser.add_argument("--split-large-area-ratio", type=float, default=None)
-    parser.add_argument("--hough-param2", type=float, default=None)
-    parser.add_argument("--hough-min-distance", type=float, default=None)
-    parser.add_argument("--hough-min-radius", type=float, default=None)
-    parser.add_argument("--hough-max-radius", type=float, default=None)
+    parser.add_argument("--edge-gradient-threshold", type=int, default=None)
+    parser.add_argument("--edge-anchor-threshold", type=int, default=None)
+    parser.add_argument("--edge-min-circle-ratio", type=float, default=None)
+    parser.add_argument("--edge-min-support-ratio", type=float, default=None)
     args = parser.parse_args()
 
     video_path = Path(args.video)
@@ -77,18 +75,14 @@ def main() -> int:
         cfg.detector.max_radius = float(args.max_radius)
     if args.min_center_distance is not None:
         cfg.detector.min_center_distance = float(args.min_center_distance)
-    if args.split_peak_threshold_ratio is not None:
-        cfg.detector.split_peak_threshold_ratio = float(args.split_peak_threshold_ratio)
-    if args.split_large_area_ratio is not None:
-        cfg.detector.split_large_area_ratio = float(args.split_large_area_ratio)
-    if args.hough_param2 is not None:
-        cfg.detector.hough_param2 = float(args.hough_param2)
-    if args.hough_min_distance is not None:
-        cfg.detector.hough_min_distance = float(args.hough_min_distance)
-    if args.hough_min_radius is not None:
-        cfg.detector.hough_min_radius = float(args.hough_min_radius)
-    if args.hough_max_radius is not None:
-        cfg.detector.hough_max_radius = float(args.hough_max_radius)
+    if args.edge_gradient_threshold is not None:
+        cfg.detector.edge_gradient_threshold = int(args.edge_gradient_threshold)
+    if args.edge_anchor_threshold is not None:
+        cfg.detector.edge_anchor_threshold = int(args.edge_anchor_threshold)
+    if args.edge_min_circle_ratio is not None:
+        cfg.detector.edge_min_circle_ratio = float(args.edge_min_circle_ratio)
+    if args.edge_min_support_ratio is not None:
+        cfg.detector.edge_min_support_ratio = float(args.edge_min_support_ratio)
     if args.roi is not None:
         x0, x1, y0, y1 = args.roi
         cfg.roi.enabled = True

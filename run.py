@@ -10,13 +10,13 @@ from collections.abc import Sequence
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent
 
 FRONTEND_REQUIRED_MODULES = {
-    "cv2": "opencv-python",
+    "cv2": "opencv-contrib-python",
     "numpy": "numpy",
     "PySide6": "PySide6",
     "serial": "pyserial",
 }
 VISION_REQUIRED_MODULES = {
-    "cv2": "opencv-python",
+    "cv2": "opencv-contrib-python",
     "numpy": "numpy",
 }
 
