@@ -1278,9 +1278,11 @@ class TuningPage(Page):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 12, 16, 12)
         layout.addWidget(app.title("液滴识别算法调参", "只处理本地视频或图像，不连接相机、泵机、跟踪或 PID"))
-        video = str(app.frontend_config.get("video_source", ""))
-        initial_video = video if app.frontend_config.get("video_source_type") == "file" else ""
-        self.workbench = TuningWindow(initial_video, self)
+        tuning_sample = str(app.frontend_config.get("tuning_sample", ""))
+        if not tuning_sample:
+            video = str(app.frontend_config.get("video_source", ""))
+            tuning_sample = video if app.frontend_config.get("video_source_type") == "file" else ""
+        self.workbench = TuningWindow(tuning_sample, self, app.save_tuning_sample)
         layout.addWidget(self.workbench, 1)
 
 
@@ -1325,6 +1327,9 @@ class FrontendApp(QMainWindow):
         page=self.pages[key]; self.stack.setCurrentWidget(page); self.current=page; page.on_show()
         for i in range(self.nav.count()):
             if self.nav.item(i).data(Qt.UserRole)==key: self.nav.blockSignals(True); self.nav.setCurrentRow(i); self.nav.blockSignals(False); break
+    def save_tuning_sample(self, path: str):
+        self.save(tuning_sample=path)
+
     def save(self,**values):
         self.frontend_config.update(values)
         try: self.settings_store.save(self.frontend_config)

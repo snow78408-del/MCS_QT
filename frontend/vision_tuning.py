@@ -322,12 +322,18 @@ class StageCard(QGroupBox):
 
 
 class TuningWindow(QWidget):
-    def __init__(self, initial_video: str = "", parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        initial_video: str = "",
+        parent: QWidget | None = None,
+        on_sample_loaded: Callable[[str], None] | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("液滴识别算法调参工作台")
         self.resize(1280, 820)
         self.frames: list[TuningFrame] = []
         self.frame_pos = 0
+        self._on_sample_loaded = on_sample_loaded
         self.original_config = DetectorConfig()
         self.current_config = DetectorConfig()
         self._refresh_timer = QTimer(self)
@@ -418,6 +424,8 @@ class TuningWindow(QWidget):
             self.slider.setValue(0)
             self.slider.blockSignals(False)
             self.frame_pos = 0
+            if self._on_sample_loaded is not None:
+                self._on_sample_loaded(path)
             self._redraw()
         except Exception as exc:
             self.frames = []
