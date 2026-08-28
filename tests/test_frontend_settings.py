@@ -2,7 +2,23 @@ from __future__ import annotations
 
 import json
 
+from frontend.config import (
+    DEFAULT_BO_Q1_RANGE,
+    DEFAULT_BO_Q2_RANGE,
+    DEFAULT_CONTROL_INTERVAL_MS,
+    MIN_CONTROL_INTERVAL_MS,
+)
 from frontend.settings_store import FrontendSettingsStore
+
+
+def test_bo_defaults_match_commissioning_flow_envelope() -> None:
+    assert DEFAULT_BO_Q1_RANGE == (15.0, 100.0)
+    assert DEFAULT_BO_Q2_RANGE == (5.0, 25.0)
+
+
+def test_realtime_control_period_matches_verified_pump_transaction_budget() -> None:
+    assert DEFAULT_CONTROL_INTERVAL_MS == 7500
+    assert MIN_CONTROL_INTERVAL_MS == 7500
 
 
 def test_settings_round_trip(tmp_path) -> None:

@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 import math
 
+from .invariants import STRICT_Q1_Q2_GAP_UL_MIN
+
 
 DEFAULT_BAUDRATE = 1200
 DEFAULT_PARITY = "N"
@@ -52,7 +54,7 @@ class PumpHardwareConfig:
     q2_update_retry_interval: float = 0.25
     wss_swap_fallback: bool = True
     # CH1 is oil and CH2 is water in this system.
-    min_q1_q2_gap: float = 0.2
+    min_q1_q2_gap: float = STRICT_Q1_Q2_GAP_UL_MIN
 
     def __post_init__(self) -> None:
         positive = (
@@ -72,6 +74,11 @@ class PumpHardwareConfig:
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be finite and positive")
+        if self.min_q1_q2_gap < STRICT_Q1_Q2_GAP_UL_MIN:
+            raise ValueError(
+                f"min_q1_q2_gap cannot be below fixed hardware invariant "
+                f"{STRICT_Q1_Q2_GAP_UL_MIN}"
+            )
         for name in non_negative:
             value = float(getattr(self, name))
             if not math.isfinite(value) or value < 0.0:

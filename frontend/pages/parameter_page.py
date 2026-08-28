@@ -3,6 +3,12 @@
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+from frontend.config import (
+    DEFAULT_CONTROL_INTERVAL_MS,
+    MAX_CONTROL_INTERVAL_MS,
+    MIN_CONTROL_INTERVAL_MS,
+)
+
 
 DEFAULT_CAMERA_PIXEL_SIZE_UM = 6.9
 DEFAULT_MAGNIFICATION = 10.0
@@ -18,7 +24,9 @@ class ParameterPage(ttk.Frame):
         self.camera_pixel_size_var = tk.StringVar(
             value=str(saved.get("camera_pixel_size_um", f"{DEFAULT_CAMERA_PIXEL_SIZE_UM:g}"))
         )
-        self.interval_var = tk.StringVar(value=str(saved.get("control_interval_ms", 300)))
+        self.interval_var = tk.StringVar(
+            value=str(int(saved.get("control_interval_ms", DEFAULT_CONTROL_INTERVAL_MS)))
+        )
         self._build()
 
     def _build(self) -> None:
@@ -38,7 +46,9 @@ class ParameterPage(ttk.Frame):
             row=2, column=1, padx=8, pady=8, sticky="w"
         )
 
-        ttk.Label(card, text="控制周期(ms)").grid(row=3, column=0, padx=8, pady=8, sticky="w")
+        ttk.Label(card, text=f"控制周期(ms，最低 {MIN_CONTROL_INTERVAL_MS})").grid(
+            row=3, column=0, padx=8, pady=8, sticky="w"
+        )
         ttk.Entry(card, textvariable=self.interval_var, width=24).grid(row=3, column=1, padx=8, pady=8, sticky="w")
 
         test_buttons = ttk.Frame(card)
@@ -63,8 +73,10 @@ class ParameterPage(ttk.Frame):
                 raise ValueError("总放大倍率必须大于 0")
             if camera_pixel_size_um <= 0:
                 raise ValueError("相机像元尺寸必须大于 0")
-            if interval <= 0:
-                raise ValueError("控制周期必须大于 0")
+            if not MIN_CONTROL_INTERVAL_MS <= interval <= MAX_CONTROL_INTERVAL_MS:
+                raise ValueError(
+                    f"实时控制周期必须为 {MIN_CONTROL_INTERVAL_MS}–{MAX_CONTROL_INTERVAL_MS} ms"
+                )
         except Exception as e:
             messagebox.showerror("参数错误", str(e))
             return

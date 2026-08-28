@@ -252,7 +252,7 @@ class VideoSourcePage(ttk.Frame):
                 result = self.app.orchestrator.discover_cameras()
                 self.after(0, lambda: self._apply_discovery_result(result))
             except Exception as exc:
-                self.after(0, lambda: self._scan_failed(exc))
+                self.after(0, lambda error=exc: self._scan_failed(error))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -514,7 +514,7 @@ class VideoSourcePage(ttk.Frame):
                 result["_requested_parameters"] = parameters
                 self.after(0, lambda: self._apply_test_result(result))
             except Exception as exc:
-                self.after(0, lambda: self._test_failed(exc))
+                self.after(0, lambda error=exc: self._test_failed(error))
 
         threading.Thread(target=worker, daemon=True).start()
 

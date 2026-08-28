@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import math
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from .feature_builder import FEATURE_NAMES, NONLINEAR_FEATURE_NAMES, TARGET_NAMES, build_features, build_nonlinear_features
@@ -66,6 +66,42 @@ class LinearDisturbanceModel:
             model_version=self.version,
             reason="model prediction",
         )
+
+    def recommend_feedforward(
+        self,
+        sample: DisturbanceSample,
+        *,
+        predicted_change_um: float,
+        probe_output: float,
+        min_sensitivity: float,
+        max_output: float,
+        q1_control_sign: float,
+        q2_control_sign: float,
+        q1_output_gain: float,
+        q2_output_gain: float,
+    ) -> float | None:
+        """Invert the learned local response along the PID actuator direction."""
+        probe = max(1e-6, abs(float(probe_output)))
+        q1_delta = float(q1_control_sign) * float(q1_output_gain) * probe
+        q2_delta = float(q2_control_sign) * float(q2_output_gain) * probe
+        probed = replace(
+            sample,
+            q1_set=float(sample.q1_set) + q1_delta,
+            q2_set=float(sample.q2_set) + q2_delta,
+            q1_feedback=float(sample.q1_feedback) + q1_delta,
+            q2_feedback=float(sample.q2_feedback) + q2_delta,
+        )
+        values = self.predict_values(build_features(probed))
+        mapping = dict(zip(self.target_names, values))
+        probed_change = float(mapping.get("future_diameter_change_um", predicted_change_um))
+        sensitivity = (probed_change - float(predicted_change_um)) / probe
+        if not math.isfinite(sensitivity) or abs(sensitivity) < max(1e-9, float(min_sensitivity)):
+            return None
+        command = -float(predicted_change_um) / sensitivity
+        if not math.isfinite(command):
+            return None
+        limit = max(0.0, float(max_output))
+        return max(-limit, min(limit, command))
 
     def save(self, path: str) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)

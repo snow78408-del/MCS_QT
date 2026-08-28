@@ -9,6 +9,7 @@ import numpy as np
 
 try:
     from .bead_counter import BeadCounter, BeadResult
+    from .channel_region import ChannelRegionDetector, ChannelRegionResult
     from .config import PipelineConfig
     from .detector import DetectionResult, DropletDetector
     from .kalman_tracker import KalmanTracker
@@ -17,6 +18,7 @@ try:
     from .tracker import BaseTracker, TrackingResult
 except ImportError:
     from bead_counter import BeadCounter, BeadResult
+    from channel_region import ChannelRegionDetector, ChannelRegionResult
     from config import PipelineConfig
     from detector import DetectionResult, DropletDetector
     from kalman_tracker import KalmanTracker
@@ -35,12 +37,14 @@ class VisionResult:
     metrics: MetricsResult
     annotated_frame: np.ndarray
     analysis_frame: np.ndarray
+    channel_region: ChannelRegionResult
 
 
 class VisionPipeline:
     def __init__(self, config: PipelineConfig, logger: Callable[[str], None] | None = None) -> None:
         self.config = config
         self._log = logger or (lambda _msg: None)
+        self.channel_region_detector = ChannelRegionDetector(config.channel_region)
         self.detector = DropletDetector(config.detector, config.debug)
         self.bead_counter = BeadCounter(config.beads, config.debug)
         self.metrics = MetricsCalculator(config.metrics, logger=self._log)
@@ -56,6 +60,7 @@ class VisionPipeline:
         return NearestTracker(config.tracker)
 
     def reset(self) -> None:
+        self.channel_region_detector.reset()
         self.detector.reset_adaptive_size()
         self.tracker.reset()
         self.metrics.reset()
@@ -63,10 +68,23 @@ class VisionPipeline:
 
     def process_frame(self, frame: np.ndarray, *, timestamp: float | None = None) -> VisionResult:
         self._frame_index += 1
+        channel_region = self._update_channel_region(frame)
         roi_frame, roi_offset = self._apply_roi(frame)
 
         gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY) if roi_frame.ndim == 3 else roi_frame
-        detections = self.detector.detect(gray)
+        if channel_region.status == "collecting":
+            # The channel-region check is a true prerequisite: startup samples
+            # must not produce full-frame detections or PID-valid measurements
+            # before the effective channel has been established.
+            detections = DetectionResult(
+                centers=[],
+                radii=[],
+                debug_image=np.empty((0, 0, 3), dtype=np.uint8),
+                helper_mask=np.zeros(gray.shape[:2], dtype=np.uint8),
+                diameter_valid=[],
+            )
+        else:
+            detections = self.detector.detect(gray)
         tracking = self.tracker.update(detections.centers, detections.radii, timestamp=timestamp)
         self._align_tracks_to_current_detections(tracking, detections)
         confirmed_observed_tracks = [
@@ -97,6 +115,7 @@ class VisionPipeline:
             metrics=metrics,
             annotated_frame=annotated,
             analysis_frame=roi_frame,
+            channel_region=channel_region,
         )
 
     def process_video(
@@ -168,11 +187,45 @@ class VisionPipeline:
 
         return results
 
+    def current_channel_region(self) -> ChannelRegionResult:
+        manual_lines = list(getattr(self.config.roi, "wall_lines", []) or [])
+        if len(manual_lines) == 2:
+            return ChannelRegionResult("manual", 1.0, "采用用户选择的两条管壁", manual_lines)
+        if self.config.roi.enabled and bool(getattr(self.config.roi, "user_defined", True)):
+            return ChannelRegionResult("manual", 1.0, "采用用户设置的矩形 ROI")
+        return self.channel_region_detector.result
+
+    def _update_channel_region(self, frame: np.ndarray) -> ChannelRegionResult:
+        current = self.current_channel_region()
+        if current.status == "manual":
+            return current
+        previous_status = self.channel_region_detector.result.status
+        result = self.channel_region_detector.add_frame(frame)
+        if result.status != previous_status and result.status in {"calibrated", "fallback"}:
+            self._log(
+                "[VISION][CHANNEL_REGION] "
+                f"status={result.status} confidence={result.confidence:.3f} reason={result.reason}"
+            )
+            if result.status == "calibrated":
+                # The coordinate system changes from full-frame to rectified
+                # ROI once startup calibration completes. Old tracks must not
+                # be matched across that boundary.
+                self.tracker.reset()
+                self.metrics.reset()
+        return result
+
+    def _effective_wall_lines(self) -> list[dict[str, object]]:
+        manual_lines = list(getattr(self.config.roi, "wall_lines", []) or [])
+        if len(manual_lines) == 2:
+            return manual_lines
+        result = self.channel_region_detector.result
+        return list(result.wall_lines) if result.status == "calibrated" else []
+
     def _apply_roi(self, frame: np.ndarray) -> Tuple[np.ndarray, Tuple[int, int]]:
         rectified = self.rectify_selected_channel(frame)
         if rectified is not None:
             return rectified, (0, 0)
-        if not self.config.roi.enabled:
+        if not self.config.roi.enabled or not bool(getattr(self.config.roi, "user_defined", True)):
             return frame.copy(), (0, 0)
 
         h, w = frame.shape[:2]
@@ -183,7 +236,7 @@ class VisionPipeline:
         return cropped, (x0, y0 + crop_top)
 
     def rectify_selected_channel(self, frame: np.ndarray) -> np.ndarray | None:
-        wall_lines = list(getattr(self.config.roi, "wall_lines", []) or [])
+        wall_lines = self._effective_wall_lines()
         if len(wall_lines) != 2:
             return None
         try:

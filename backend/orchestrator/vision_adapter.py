@@ -33,6 +33,65 @@ GENERATION_RATE_WINDOW_S = 1.0
 # between two five-frame batches.
 ANALYSIS_BATCH_INTERVAL_S = 0.05
 ANALYSIS_BUSY_RETRY_S = 0.02
+
+
+def _include_fitted_wall_candidates(
+    candidates: list[dict[str, float | int]],
+    measurement: Any,
+    *,
+    frame_width: int,
+    frame_height: int,
+    roi_x0: int,
+    roi_x1: int,
+    roi_y0: int,
+    merge_distance_px: float,
+) -> list[dict[str, float | int]]:
+    """Make the two fitted walls shown in the overlay selectable in the UI."""
+    result = [dict(line) for line in candidates]
+    roi_width = max(1, int(roi_x1) - int(roi_x0))
+    local_center_x = (roi_width - 1) * 0.5
+    for center, slope in (
+        (getattr(measurement, "upper_center_px", None), getattr(measurement, "upper_slope", None)),
+        (getattr(measurement, "lower_center_px", None), getattr(measurement, "lower_slope", None)),
+    ):
+        if center is None:
+            continue
+        line_slope = float(slope or 0.0)
+        left_y = float(roi_y0) + float(center) - line_slope * local_center_x
+        right_y = float(roi_y0) + float(center) + line_slope * local_center_x
+        fitted_center = 0.5 * (left_y + right_y)
+        duplicate = False
+        for line in result:
+            existing_center = 0.5 * (
+                float(line.get("y1", 0.0)) + float(line.get("y2", 0.0))
+            ) * float(frame_height)
+            existing_slope = float(line.get("slope", 0.0))
+            if (
+                abs(existing_center - fitted_center) <= max(6.0, float(merge_distance_px) * 1.5)
+                and abs(existing_slope - line_slope) <= 0.06
+            ):
+                duplicate = True
+                break
+        if duplicate:
+            continue
+        result.append(
+            {
+                "id": 0,
+                "x1": max(0.0, min(1.0, float(roi_x0) / float(frame_width))),
+                "y1": max(0.0, min(1.0, left_y / float(frame_height))),
+                "x2": max(0.0, min(1.0, float(roi_x1 - 1) / float(frame_width))),
+                "y2": max(0.0, min(1.0, right_y / float(frame_height))),
+                "length_ratio": float(roi_width) / float(frame_width),
+                "slope": line_slope,
+                "source": "fitted_wall",
+            }
+        )
+    result.sort(key=lambda line: 0.5 * (float(line.get("y1", 0.0)) + float(line.get("y2", 0.0))))
+    for index, line in enumerate(result, start=1):
+        line["id"] = index
+    return result
+
+
 # The detector intentionally prioritizes well-scored, de-duplicated candidates.
 # Matching its measured throughput keeps the queue near-empty and prevents PID
 # decisions from using stale frames, while the independent preview stays 30 FPS.
@@ -264,6 +323,9 @@ class PipelineVisionService:
             channel_calibration_status=self._channel_calibration_status,
             channel_calibration_confidence=self._channel_calibration_confidence,
             channel_calibration_reason=self._channel_calibration_reason,
+            channel_region_status=self._ensure_pipeline().current_channel_region().status,
+            channel_region_confidence=self._ensure_pipeline().current_channel_region().confidence,
+            channel_region_reason=self._ensure_pipeline().current_channel_region().reason,
         )
 
     def _snapshot_with_error(self, reason: str) -> RecognitionSnapshot:
@@ -321,17 +383,7 @@ class PipelineVisionService:
         self._configured_pixel_to_micron = self._pixel_to_micron
         pipeline = self._ensure_pipeline()
         # The control target is deliberately stored only for display/control.
-        # It must not influence detector gates, candidate scores, or tracking.
-        pipeline.config.detector.expected_size_hard_gate = False
-        pipeline.config.detector.hough_work_max_width = 480
-        pipeline.config.detector.hough_work_max_height = 360
-        pipeline.config.detector.hough_max_candidates = 40
-        # Recover weaker, partially illuminated droplets, then let geometric
-        # scoring and temporal tracking reject isolated false candidates.
-        pipeline.config.detector.hough_param2 = 22.0
-        pipeline.config.detector.hough_edge_support_threshold = 0.12
-        pipeline.config.detector.candidate_min_edge_support = 0.12
-        pipeline.config.detector.candidate_full_circle_ratio = 0.75
+        # It must not influence the image-domain Hough detector or tracking.
         # Recognition may run much slower than camera acquisition.  A droplet
         # can move farther than the old 120 px gate between processed frames.
         pipeline.config.tracker.match_distance = 180.0
@@ -356,9 +408,18 @@ class PipelineVisionService:
         )
 
     def set_recognition_roi(self, roi: dict[str, Any] | None) -> None:
-        config = self._ensure_pipeline().config.roi
+        pipeline = self._ensure_pipeline()
+        config = pipeline.config.roi
         values = dict(roi or {})
         config.enabled = bool(values.get("enabled", False))
+        config.user_defined = bool(values.get("user_defined", config.enabled))
+        channel_region = pipeline.config.channel_region
+        channel_region.enabled = bool(values.get("channel_region_enabled", True))
+        channel_region.sample_frames = max(1, min(48, int(values.get("channel_region_sample_frames", 12))))
+        channel_region.min_confidence = max(
+            0.0,
+            min(1.0, float(values.get("channel_region_min_confidence", channel_region.min_confidence))),
+        )
         config.x_start_ratio = max(0.0, min(1.0, float(values.get("x_start_ratio", 0.0))))
         config.x_end_ratio = max(0.0, min(1.0, float(values.get("x_end_ratio", 1.0))))
         config.y_start_ratio = max(0.0, min(1.0, float(values.get("y_start_ratio", 0.0))))
@@ -386,7 +447,14 @@ class PipelineVisionService:
             raise ValueError("管道内宽必须大于 0 μm")
         if self._channel_calibration_enabled and not config.enabled:
             raise ValueError("启用 430 μm 管道标定前必须先启用并框选 ROI")
-        self._log(f"[VISION][ROI] enabled={config.enabled} x={config.x_start_ratio:.3f}-{config.x_end_ratio:.3f} y={config.y_start_ratio:.3f}-{config.y_end_ratio:.3f}")
+        pipeline.channel_region_detector.reset()
+        self._log(
+            f"[VISION][ROI] enabled={config.enabled} "
+            f"channel_region_enabled={channel_region.enabled} "
+            f"channel_region_samples={channel_region.sample_frames} "
+            f"x={config.x_start_ratio:.3f}-{config.x_end_ratio:.3f} "
+            f"y={config.y_start_ratio:.3f}-{config.y_end_ratio:.3f}"
+        )
 
     def _reset_channel_calibration(self) -> None:
         self._channel_width_px = None
@@ -681,6 +749,17 @@ class PipelineVisionService:
             frame,
             hough_parameters=applied_hough_parameters,
         )
+        if ok and measurement is not None and not selected_wall_lines:
+            hough_lines = _include_fitted_wall_candidates(
+                hough_lines,
+                measurement,
+                frame_width=width,
+                frame_height=height,
+                roi_x0=x0,
+                roi_x1=x1,
+                roi_y0=y0,
+                merge_distance_px=float(applied_hough_parameters["merge_distance_px"]),
+            )
         for candidate in hough_lines:
             p1 = (int(round(float(candidate["x1"]) * width)), int(round(float(candidate["y1"]) * height)))
             p2 = (int(round(float(candidate["x2"]) * width)), int(round(float(candidate["y2"]) * height)))
@@ -1135,6 +1214,9 @@ class PipelineVisionService:
             channel_calibration_status=self._channel_calibration_status,
             channel_calibration_confidence=self._channel_calibration_confidence,
             channel_calibration_reason=self._channel_calibration_reason,
+            channel_region_status=result.channel_region.status,
+            channel_region_confidence=result.channel_region.confidence,
+            channel_region_reason=result.channel_region.reason,
             calibration_id=str(self._calibration_metadata.get("calibration_id", "") or ""),
             calibration_uncertainty_um_per_px=(
                 None

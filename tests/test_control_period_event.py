@@ -7,6 +7,16 @@ from backend.orchestrator.service import OrchestratorService
 
 
 class ControlPeriodEventTests(unittest.TestCase):
+    def test_periodic_deadline_skips_missed_slots_without_catch_up(self) -> None:
+        deadline, skipped = OrchestratorService._advance_control_deadline(
+            deadline=10.0,
+            interval_s=1.5,
+            completed_at=15.2,
+        )
+
+        self.assertEqual(deadline, 16.0)
+        self.assertEqual(skipped, 3)
+
     def test_rejected_period_is_still_marked_as_seen(self) -> None:
         service = OrchestratorService.__new__(OrchestratorService)
         service._read_recognition = lambda: SimpleNamespace(control_period_id=12)

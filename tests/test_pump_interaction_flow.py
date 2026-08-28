@@ -49,6 +49,104 @@ class _PumpStub:
 
 
 class PumpInteractionFlowTests(unittest.TestCase):
+    def test_hardware_rejects_q1_not_above_q2_even_if_runtime_gap_is_mutated(self) -> None:
+        from backend.pump_hardware.service import PumpHardwareService
+
+        pump = PumpHardwareService()
+        pump.runtime_config.min_q1_q2_gap = -100.0
+
+        result = pump.update_flow_while_running(20.0, 20.0)
+
+        self.assertFalse(result.ok)
+        self.assertIn("Q1", result.reason)
+
+    @staticmethod
+    def _local_system_config(control_interval_ms: int) -> SystemConfig:
+        return SystemConfig(
+            target_diameter=50.0,
+            pixel_to_micron=1.0,
+            video_source_type="video",
+            video_source="sample.avi",
+            initial_q1=50.0,
+            initial_q2=20.0,
+            control_interval_ms=control_interval_ms,
+            calibration={},
+        )
+
+    def test_configure_preserves_user_control_interval_exactly(self) -> None:
+        service = OrchestratorService(vision_service=SimpleNamespace())
+        config = self._local_system_config(12_345)
+
+        service.configure(config)
+
+        self.assertEqual(config.control_interval_ms, 12_345)
+        self.assertEqual(service._cfg.control_interval_ms, 12_345)
+
+    def test_configure_rejects_control_interval_below_hardware_minimum(self) -> None:
+        service = OrchestratorService(vision_service=SimpleNamespace())
+
+        with self.assertRaisesRegex(ValueError, r"\[7500, 30000\]"):
+            service.configure(self._local_system_config(7_499))
+
+    def _realtime_preflight_service(self, calibration_snapshot) -> OrchestratorService:
+        adapter = SimpleNamespace(get_snapshot=lambda: calibration_snapshot)
+        service = OrchestratorService(
+            vision_service=SimpleNamespace(),
+            vision_adapter=adapter,
+            pump_service=_PumpStub(),
+        )
+        service._cfg = SystemConfig(
+            target_diameter=50.0,
+            pixel_to_micron=1.0,
+            video_source_type="camera",
+            video_source="",
+            initial_q1=50.0,
+            initial_q2=20.0,
+            control_interval_ms=500,
+            calibration={},
+        )
+        service._state = SystemState.INITIALIZED
+        service._pump_control_enabled = True
+        service._pump_state.connected = True
+        service._pump_state.comm_established = True
+        service._safety.confirm_stopped()
+        return service
+
+    def test_preflight_accepts_successful_runtime_channel_calibration(self) -> None:
+        service = self._realtime_preflight_service(
+            {
+                "channel_calibration_status": "calibrated",
+                "channel_calibration_confidence": 1.0,
+                "scale_source": "channel_430um",
+                "pixel_to_micron": 1.6475,
+                "channel_width_um": 430.0,
+                "channel_width_px": 261.0,
+            }
+        )
+
+        result = service.run_preflight_check()
+
+        self.assertTrue(result["ok"], result["issues"])
+        self.assertEqual(result["calibration_source"], "runtime_channel")
+
+    def test_preflight_rejects_unverified_configured_scale_without_json(self) -> None:
+        service = self._realtime_preflight_service(
+            {
+                "channel_calibration_status": "user_config",
+                "channel_calibration_confidence": 0.0,
+                "scale_source": "configured_unverified",
+                "pixel_to_micron": 1.6475,
+                "channel_width_um": 430.0,
+                "channel_width_px": None,
+            }
+        )
+
+        result = service.run_preflight_check()
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["calibration_source"], "none")
+        self.assertTrue(any("runtime channel calibration" in issue for issue in result["issues"]))
+
     def test_interaction_test_rejects_q1_not_above_q2_before_connect(self) -> None:
         service = OrchestratorService.__new__(OrchestratorService)
         service.pump_service = _PumpStub()
@@ -430,6 +528,30 @@ class PumpInteractionFlowTests(unittest.TestCase):
         self.assertFalse(service._pump_control_enabled)
         self.assertFalse(service._pump_state.running)
         self.assertIn("stop", pump.calls)
+
+    def test_flow_update_extends_watchdog_for_verified_serial_transaction(self) -> None:
+        pump = _PumpStub()
+        pump.update_flow_while_running = lambda _q1, _q2: FlowUpdateResult(
+            ok=True,
+            q1_ok=True,
+            q2_ok=True,
+            still_running=True,
+        )
+        service = OrchestratorService(vision_service=SimpleNamespace(), pump_service=pump)
+        service._cfg = SimpleNamespace(control_interval_ms=1500, video_source_type="camera")
+        service._state = SystemState.RUNNING
+        service._pump_control_enabled = True
+        heartbeat_timeouts: list[float] = []
+        service._safety = SimpleNamespace(
+            heartbeat=lambda _token, *, timeout_s: heartbeat_timeouts.append(timeout_s) or True,
+        )
+        token = object()
+        service._run_token = token
+
+        result = service._update_flow_with_lifecycle_guard(48.0, 21.0, service._lifecycle_generation)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(heartbeat_timeouts, [15.0])
 
     def test_pause_invalidates_inflight_automatic_recovery(self) -> None:
         pump = _PumpStub()

@@ -14,9 +14,46 @@ from backend.vision.channel_calibration import (
 )
 from backend.vision.channel_calibration import ChannelWidthMeasurement
 from backend.orchestrator.vision_adapter import PipelineVisionService
+from backend.orchestrator.vision_adapter import _include_fitted_wall_candidates
 
 
 class ChannelCalibrationTests(unittest.TestCase):
+    def test_fitted_lower_wall_is_added_to_clickable_candidates(self) -> None:
+        measurement = ChannelWidthMeasurement(
+            180.0,
+            0.9,
+            "ok",
+            upper_center_px=10.0,
+            lower_center_px=190.0,
+            upper_slope=0.0,
+            lower_slope=0.0,
+        )
+        candidates = [
+            {
+                "id": 1,
+                "x1": 0.0,
+                "y1": 30 / 240,
+                "x2": 0.998,
+                "y2": 30 / 240,
+                "slope": 0.0,
+            }
+        ]
+
+        result = _include_fitted_wall_candidates(
+            candidates,
+            measurement,
+            frame_width=640,
+            frame_height=240,
+            roi_x0=0,
+            roi_x1=640,
+            roi_y0=20,
+            merge_distance_px=4.0,
+        )
+
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[-1]["source"], "fitted_wall")
+        self.assertAlmostEqual(float(result[-1]["y1"]), 210 / 240)
+
     def test_custom_hough_parameters_are_applied_to_line_transform(self) -> None:
         image = np.full((240, 640), 180, dtype=np.uint8)
         with patch(

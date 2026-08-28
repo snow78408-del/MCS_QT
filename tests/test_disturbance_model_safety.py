@@ -193,6 +193,41 @@ def test_model_does_not_invent_an_uncalibrated_feedforward_command() -> None:
     assert prediction.recommended_feedforward is None
 
 
+def test_model_inverse_uses_learned_local_actuator_sensitivity() -> None:
+    coefficients = [[0.0] * len(FEATURE_NAMES) for _ in TARGET_NAMES]
+    change_index = TARGET_NAMES.index("future_diameter_change_um")
+    coefficients[change_index][FEATURE_NAMES.index("q2_feedback")] = 2.0
+    intercepts = [0.0] * len(TARGET_NAMES)
+    intercepts[change_index] = -36.0
+    model = LinearDisturbanceModel(
+        version="linear-test",
+        feature_names=list(FEATURE_NAMES),
+        target_names=list(TARGET_NAMES),
+        coefficients=coefficients,
+        intercepts=intercepts,
+        confidence=0.9,
+        model_type="linear",
+        feature_means=[0.0] * len(FEATURE_NAMES),
+        feature_scales=[1.0] * len(FEATURE_NAMES),
+        training_data_hash="1" * 64,
+    )
+    sample = _sample(1.0, 100.0, q1_set=50.0, q2_set=20.0, q1_feedback=50.0, q2_feedback=20.0)
+
+    recommendation = model.recommend_feedforward(
+        sample,
+        predicted_change_um=4.0,
+        probe_output=1.0,
+        min_sensitivity=0.02,
+        max_output=50.0,
+        q1_control_sign=-1.0,
+        q2_control_sign=1.0,
+        q1_output_gain=2.0,
+        q2_output_gain=1.0,
+    )
+
+    assert recommendation == pytest.approx(-2.0)
+
+
 def test_feedforward_is_fail_closed_until_plant_gain_is_calibrated() -> None:
     prediction = _prediction()
     uncalibrated = FeedforwardCompensator(PIDConfig(feedforward_enabled=True, feedforward_calibrated=False))
@@ -207,6 +242,21 @@ def test_feedforward_is_fail_closed_until_plant_gain_is_calibrated() -> None:
     assert "not calibrated" in blocked.reason
     assert active.active
     assert active.u_ff == -2.0  # -gain * delta-D * stage weight
+
+
+def test_validated_model_inverse_can_assist_without_static_gain_or_leading_signal() -> None:
+    prediction = _prediction(
+        recommended_feedforward=-1.5,
+        leading_signal_available=False,
+    )
+    compensator = FeedforwardCompensator(
+        PIDConfig(feedforward_enabled=True, feedforward_calibrated=False)
+    )
+
+    result = compensator.compute(_pid_input(prediction))
+
+    assert result.active
+    assert result.u_ff == pytest.approx(-1.5)
 
 
 def test_feedforward_requires_a_signal_that_leads_the_measured_pump_delay() -> None:
@@ -254,7 +304,10 @@ def test_shadow_does_not_match_a_late_observation_to_expired_predictions() -> No
 
 
 def test_feedforward_stage_requires_shadow_window_and_explicit_authorization() -> None:
-    config = DisturbanceModelConfig(shadow_min_comparisons=1)
+    config = DisturbanceModelConfig(
+        shadow_min_comparisons=1,
+        allow_low_weight_feedforward=False,
+    )
     service = object.__new__(DisturbanceModelService)
     service.config = config
     service._shadow_errors = deque(maxlen=40)

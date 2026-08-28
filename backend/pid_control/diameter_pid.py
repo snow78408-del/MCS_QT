@@ -3,6 +3,7 @@
 from .adaptive import AdaptivePIDManager
 from .base import BaseDiameterController
 from .config import PIDConfig, PIDControlMode
+from ..pump_hardware.invariants import effective_q1_q2_gap
 from .feedforward import FeedforwardCompensator
 from .models import PIDCommand, PIDInput, PumpState, TargetParams, VisionMetrics
 from .parameter_manager import PIDParameterManager
@@ -50,7 +51,7 @@ class DiameterPIDController(BaseDiameterController):
             raise ValueError("operating point must be finite")
         if q1_value <= 0.0 or q2_value <= 0.0:
             raise ValueError("operating point flows must be positive")
-        if q1_value < q2_value + float(self.config.min_q1_q2_gap):
+        if q1_value < q2_value + effective_q1_q2_gap(self.config.min_q1_q2_gap):
             raise ValueError("operating point violates Q1/Q2 phase gap")
         self.reset()
         self._q1_bias = q1_value
@@ -182,7 +183,7 @@ class DiameterPIDController(BaseDiameterController):
 
         # Enforce Q1 >= Q2 + gap in the PID-output feasible interval. The
         # controller saturates at this boundary instead of crossing it.
-        min_phase_gap = float(self.config.min_q1_q2_gap)
+        min_phase_gap = effective_q1_q2_gap(self.config.min_q1_q2_gap)
         phase_gap_at_zero = q1_base - q2_base
         phase_gap_slope = q1_coefficient - q2_coefficient
         required_gap_delta = min_phase_gap - phase_gap_at_zero

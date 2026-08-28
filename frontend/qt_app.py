@@ -22,10 +22,19 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFil
 from backend.orchestrator import BayesianOptimizationConfig, OrchestratorService
 from backend.orchestrator.models import SystemConfig
 from backend.vision.calibration import load_calibration
-from .config import APP_TITLE, DEFAULT_REFRESH_INTERVAL_MS
+from .config import (
+    APP_TITLE,
+    DEFAULT_BO_Q1_RANGE,
+    DEFAULT_BO_Q2_RANGE,
+    DEFAULT_CONTROL_INTERVAL_MS,
+    DEFAULT_REFRESH_INTERVAL_MS,
+    MAX_CONTROL_INTERVAL_MS,
+    MIN_CONTROL_INTERVAL_MS,
+)
 from .runtime_logging import create_runtime_logger
 from .settings_store import FrontendSettingsStore
 from .vision_tuning import TuningWindow
+from .vision_tuning_store import VisionTuningSettingsStore
 from .paths import ensure_user_subdir
 from .pid_replay import PIDReplayDialog
 
@@ -148,8 +157,17 @@ class RoiImageLabel(QLabel):
 
     def mousePressEvent(self,event:QMouseEvent):
         target=self.image_rect()
-        if event.button()==Qt.LeftButton and target.contains(event.position().toPoint()):
-            self._start=event.position().toPoint(); self._selection=QRect(self._start,self._start); self._dragging=True; self.update()
+        point=event.position().toPoint()
+        # A fitted wall can lie on the first or last image row. Accept clicks
+        # in the adjacent letterbox within the configured line tolerance.
+        hit_target=target.adjusted(
+            -int(self._line_click_tolerance),
+            -int(self._line_click_tolerance),
+            int(self._line_click_tolerance),
+            int(self._line_click_tolerance),
+        )
+        if event.button()==Qt.LeftButton and hit_target.contains(point):
+            self._start=self._clamp_to_image(point,target); self._selection=QRect(self._start,self._start); self._dragging=True; self.update()
 
     def mouseMoveEvent(self,event:QMouseEvent):
         if self._dragging:
@@ -159,8 +177,8 @@ class RoiImageLabel(QLabel):
     def mouseReleaseEvent(self,event:QMouseEvent):
         if not self._dragging: return
         self._dragging=False; target=self.image_rect(); selected=self._selection.intersected(target)
-        end=event.position().toPoint(); dx=end.x()-self._start.x(); dy=end.y()-self._start.y(); movement=(dx*dx+dy*dy)**0.5
-        click_drag_limit=max(10.0,min(20.0,self._line_click_tolerance))
+        end=self._clamp_to_image(event.position().toPoint(),target); dx=end.x()-self._start.x(); dy=end.y()-self._start.y(); movement=(dx*dx+dy*dy)**0.5
+        click_drag_limit=max(12.0,min(32.0,self._line_click_tolerance*1.25))
         if movement<=click_drag_limit and self._select_nearest_line(end): self._selection=QRect(); self.update(); return
         if selected.width()<5 or selected.height()<5: self._selection=QRect(); self.update(); return
         x0=(selected.left()-target.left())/target.width(); y0=(selected.top()-target.top())/target.height(); x1=(selected.right()-target.left()+1)/target.width(); y1=(selected.bottom()-target.top()+1)/target.height()
@@ -172,6 +190,13 @@ class RoiImageLabel(QLabel):
         return (
             QPoint(target.left()+int(round(float(line["x1"])*width)),target.top()+int(round(float(line["y1"])*height))),
             QPoint(target.left()+int(round(float(line["x2"])*width)),target.top()+int(round(float(line["y2"])*height))),
+        )
+
+    @staticmethod
+    def _clamp_to_image(point,target):
+        return QPoint(
+            max(target.left(),min(target.right(),point.x())),
+            max(target.top(),min(target.bottom(),point.y())),
         )
 
     def _select_nearest_line(self,point):
@@ -263,10 +288,15 @@ class ParameterPage(Page):
         self.target = self.field(form, "目标液滴直径 (μm)", cfg.get("target_diameter", 60))
         self.mag = self.field(form, "总放大倍率", cfg.get("magnification", 10))
         self.pixel = self.field(form, "相机像元尺寸 (μm)", cfg.get("camera_pixel_size_um", 6.9))
-        self.interval = self.field(form, "控制周期 (ms)", cfg.get("control_interval_ms", 500))
+        self.interval = self.field(
+            form,
+            f"控制周期 (ms，最低 {MIN_CONTROL_INTERVAL_MS})",
+            int(cfg.get("control_interval_ms", DEFAULT_CONTROL_INTERVAL_MS)),
+        )
         calibration_row=QWidget(); calibration_layout=QHBoxLayout(calibration_row); calibration_layout.setContentsMargins(0,0,0,0)
         self.calibration_path=QLineEdit(str(cfg.get("calibration_path",""))); calibration_button=QPushButton("选择…"); calibration_button.clicked.connect(self._browse_calibration)
-        calibration_layout.addWidget(self.calibration_path,1); calibration_layout.addWidget(calibration_button); form.addRow("版本化标定 JSON",calibration_row)
+        calibration_layout.addWidget(self.calibration_path,1); calibration_layout.addWidget(calibration_button); form.addRow("版本化标定 JSON（可选）",calibration_row)
+        form.addRow("", QLabel("没有标定文件可留空；将使用像元尺寸÷放大倍率，仅允许预览，闭环控制前需补充标定 JSON。"))
         button = QPushButton("保存并选择视频源"); button.clicked.connect(self.submit); form.addRow("", button)
         layout.addWidget(box); layout.addStretch()
 
@@ -278,8 +308,9 @@ class ParameterPage(Page):
         try:
             target, mag, pixel = float(self.target.text()), float(self.mag.text()), float(self.pixel.text())
             interval = int(float(self.interval.text()))
-            if min(target, mag, pixel) <= 0 or not 500<=interval<=30000: raise ValueError("光学参数必须大于 0，控制周期必须为 500–30000 ms")
+            if min(target, mag, pixel) <= 0 or not MIN_CONTROL_INTERVAL_MS<=interval<=MAX_CONTROL_INTERVAL_MS: raise ValueError(f"光学参数必须大于 0，实时控制周期必须为 {MIN_CONTROL_INTERVAL_MS}–{MAX_CONTROL_INTERVAL_MS} ms")
             calibration_path=self.calibration_path.text().strip(); calibration={}
+            # 标定文件是闭环控制的前置条件，但不应阻止用户先进入视频/预览步骤。
             scale=pixel/mag
             if calibration_path:
                 record=load_calibration(calibration_path); calibration=record.to_dict(); scale=record.pixel_to_micron
@@ -308,6 +339,8 @@ class VideoPage(Page):
         self.exposure=self.field(form,"曝光时间 (μs)",params.get("exposure",3000)); self.gain=self.field(form,"增益",params.get("gain",0)); self.fps=self.field(form,"目标帧率",params.get("frame_rate",100))
         self.frame_width=self.field(form,"图像宽度",params.get("width",720)); self.frame_height=self.field(form,"图像高度",params.get("height",540))
         roi=dict(cfg.get("recognition_roi",{}) or {}); self._roi_user_modified=bool(roi.get("user_defined",False)); self._selected_wall_lines=[dict(line) for line in list(roi.get("wall_lines",[]) or [])[:2]]; self._last_test_preview_b64=""; self.roi_on=QCheckBox("启用 ROI，仅识别框选区域"); self.roi_on.setChecked(bool(roi.get("enabled",False))); form.addRow("",self.roi_on)
+        self.channel_region_on=QCheckBox("启动时自动检定管道区域（失败回退整帧）"); self.channel_region_on.setChecked(bool(roi.get("channel_region_enabled",True))); form.addRow("",self.channel_region_on)
+        self.channel_region_samples=self.field(form,"自动检定采样帧数",roi.get("channel_region_sample_frames",12))
         values=[float(roi.get(k,d))*100 for k,d in (("x_start_ratio",0),("y_start_ratio",0),("x_end_ratio",1),("y_end_ratio",1))]; self.roi=self.field(form,"ROI 左,上,右,下 (%)",",".join(f"{v:g}" for v in values)); self.roi.textEdited.connect(self._mark_roi_modified); self.roi.editingFinished.connect(self._analyze_user_roi)
         self.channel_cal_on=QCheckBox("用已知管道内宽自动标定 μm/px"); self.channel_cal_on.setChecked(bool(roi.get("channel_calibration_enabled",True))); form.addRow("",self.channel_cal_on)
         self.channel_width=self.field(form,"管道内宽 (μm)",roi.get("channel_width_um",430.0))
@@ -427,11 +460,16 @@ class VideoPage(Page):
             lambda exc: self.roi_status.setText(f"霍夫直线识别失败：{exc}"),
         )
 
+    def _channel_region_sample_count(self):
+        sample_frames=int(float(self.channel_region_samples.text()))
+        if not 1<=sample_frames<=48: raise ValueError("自动检定采样帧数必须在 1–48 之间")
+        return sample_frames
+
     def roi_drawn(self,x0,y0,x1,y1):
         self._roi_user_modified=True; self._selected_wall_lines=[]; self.preview.set_hough_lines(self.preview._line_candidates,[]); self.roi_on.setChecked(True); values=(x0*100,y0*100,x1*100,y1*100); self.roi.setText(",".join(f"{v:.2f}" for v in values))
-        try: channel_width=float(self.channel_width.text())
-        except ValueError: channel_width=430.0
-        roi={"enabled":True,"x_start_ratio":x0,"y_start_ratio":y0,"x_end_ratio":x1,"y_end_ratio":y1,"user_defined":True,"wall_lines":[],"channel_calibration_enabled":self.channel_cal_on.isChecked(),"channel_width_um":channel_width}; self.app.save(recognition_roi=roi)
+        try: channel_width=float(self.channel_width.text()); sample_frames=self._channel_region_sample_count()
+        except ValueError as exc: self.roi_status.setText(str(exc)); return
+        roi={"enabled":True,"x_start_ratio":x0,"y_start_ratio":y0,"x_end_ratio":x1,"y_end_ratio":y1,"user_defined":True,"wall_lines":[],"channel_region_enabled":self.channel_region_on.isChecked(),"channel_region_sample_frames":sample_frames,"channel_calibration_enabled":self.channel_cal_on.isChecked(),"channel_width_um":channel_width}; self.app.save(recognition_roi=roi)
         self.roi_status.setText(f"已选择 ROI：左 {values[0]:.2f}% / 上 {values[1]:.2f}% / 右 {values[2]:.2f}% / 下 {values[3]:.2f}%。请确认两条内壁均完整可见。")
         self._analyze_user_roi()
 
@@ -455,7 +493,8 @@ class VideoPage(Page):
         if len(coords)!=4 or not (0<=coords[0]<coords[2]<=1 and 0<=coords[1]<coords[3]<=1): raise ValueError("ROI 范围无效")
         width=float(self.channel_width.text())
         if width<=0: raise ValueError("管道内宽必须大于 0 μm")
-        return {"enabled":self.roi_on.isChecked(),"x_start_ratio":coords[0],"y_start_ratio":coords[1],"x_end_ratio":coords[2],"y_end_ratio":coords[3],"user_defined":self._roi_user_modified,"wall_lines":[dict(line) for line in self._selected_wall_lines] if len(self._selected_wall_lines)==2 else [],"channel_calibration_enabled":self.channel_cal_on.isChecked(),"channel_width_um":width}
+        sample_frames=self._channel_region_sample_count()
+        return {"enabled":self.roi_on.isChecked(),"x_start_ratio":coords[0],"y_start_ratio":coords[1],"x_end_ratio":coords[2],"y_end_ratio":coords[3],"user_defined":self._roi_user_modified,"wall_lines":[dict(line) for line in self._selected_wall_lines] if len(self._selected_wall_lines)==2 else [],"channel_region_enabled":self.channel_region_on.isChecked(),"channel_region_sample_frames":sample_frames,"channel_calibration_enabled":self.channel_cal_on.isChecked(),"channel_width_um":width}
 
     def _analyze_user_roi(self):
         if not self._last_test_preview_b64 or not self._roi_user_modified: return
@@ -475,7 +514,9 @@ class VideoPage(Page):
         if analysis.get("auto_suggested") and applied and not self._roi_user_modified:
             values=[float(applied.get(k,d))*100 for k,d in (("x_start_ratio",0),("y_start_ratio",0),("x_end_ratio",1),("y_end_ratio",1))]
             self.roi.setText(",".join(f"{v:.2f}" for v in values)); self.roi_on.setChecked(True)
-            applied["channel_calibration_enabled"]=self.channel_cal_on.isChecked(); applied["channel_width_um"]=float(self.channel_width.text()); applied["user_defined"]=False; self.app.save(recognition_roi=applied)
+            try: sample_frames=self._channel_region_sample_count()
+            except ValueError as exc: self.roi_status.setText(str(exc)); return
+            applied["channel_region_enabled"]=self.channel_region_on.isChecked(); applied["channel_region_sample_frames"]=sample_frames; applied["channel_calibration_enabled"]=self.channel_cal_on.isChecked(); applied["channel_width_um"]=float(self.channel_width.text()); applied["user_defined"]=False; self.app.save(recognition_roi=applied)
         if analysis.get("ok"):
             source="用户 ROI" if analysis.get("used_user_roi") else "自动 ROI"
             self.roi_status.setText(f"{source} 管壁拟合成功：内宽 {float(analysis.get('channel_width_px')):.2f} px，比例 {float(analysis.get('pixel_to_micron')):.6f} μm/px；共显示 {len(hough_lines)} 条候选线。单击候选线附近即可选择，橙色表示已选。")
@@ -838,7 +879,6 @@ class MonitorPage(Page):
             config=getattr(snapshot,"config",None)
             if config is None:
                 raise RuntimeError("请先完成参数配置和系统初始化")
-            q1=float(config.initial_q1); q2=float(config.initial_q2)
             target=float(config.target_diameter)
         except Exception as exc:
             QMessageBox.warning(self,"无法启动 BO",str(exc)); return
@@ -849,8 +889,8 @@ class MonitorPage(Page):
         note.setWordWrap(True); layout.addWidget(note)
         form=QFormLayout(); fields={}
         defaults={
-            "q1_min":max(0.2,q1*0.7), "q1_max":q1*1.3,
-            "q2_min":max(0.2,q2*0.7), "q2_max":q2*1.3,
+            "q1_min":DEFAULT_BO_Q1_RANGE[0], "q1_max":DEFAULT_BO_Q1_RANGE[1],
+            "q2_min":DEFAULT_BO_Q2_RANGE[0], "q2_max":DEFAULT_BO_Q2_RANGE[1],
             "delay":"", "uncertainty":"", "settling":"", "source":"阶跃实验",
         }
         for key,label in (("q1_min","Q1 下限 (uL/min)"),("q1_max","Q1 上限 (uL/min)"),("q2_min","Q2 下限 (uL/min)"),("q2_max","Q2 上限 (uL/min)"),("delay","实测响应延迟 (ms)"),("uncertainty","延迟不确定度/安全余量 (ms)"),("settling","候选点稳定时间 (ms)"),("source","延迟测量来源")):
@@ -1278,16 +1318,23 @@ class TuningPage(Page):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 12, 16, 12)
         layout.addWidget(app.title("液滴识别算法调参", "只处理本地视频或图像，不连接相机、泵机、跟踪或 PID"))
-        video = str(app.frontend_config.get("video_source", ""))
-        initial_video = video if app.frontend_config.get("video_source_type") == "file" else ""
-        self.workbench = TuningWindow(initial_video, self)
+        tuning_sample = str(app.frontend_config.get("tuning_sample", ""))
+        if not tuning_sample:
+            video = str(app.frontend_config.get("video_source", ""))
+            tuning_sample = video if app.frontend_config.get("video_source_type") == "file" else ""
+        self.workbench = TuningWindow(
+            tuning_sample,
+            self,
+            app.save_tuning_sample,
+            settings_store=app.vision_tuning_settings_store,
+        )
         layout.addWidget(self.workbench, 1)
 
 
 class FrontendApp(QMainWindow):
     def __init__(self, orchestrator=None, settings_store=None):
         super().__init__(); self.setWindowTitle(APP_TITLE); self.resize(1360,860); self.setMinimumSize(QSize(1280,760))
-        self.runtime_logger=create_runtime_logger(); self.orchestrator=orchestrator or OrchestratorService(logger=self.runtime_logger); self.settings_store=settings_store or FrontendSettingsStore(); self.frontend_config=self.settings_store.load(); self.refresh_interval_ms=DEFAULT_REFRESH_INTERVAL_MS
+        self.runtime_logger=create_runtime_logger(); self.orchestrator=orchestrator or OrchestratorService(logger=self.runtime_logger); self.settings_store=settings_store or FrontendSettingsStore(); self.vision_tuning_settings_store=VisionTuningSettingsStore(); self.frontend_config=self.settings_store.load(); self.refresh_interval_ms=DEFAULT_REFRESH_INTERVAL_MS
         self.pool=QThreadPool.globalInstance(); self.workers=set(); self.current=None; self._build(); self.show_page("parameter")
 
     def _build(self):
@@ -1325,6 +1372,9 @@ class FrontendApp(QMainWindow):
         page=self.pages[key]; self.stack.setCurrentWidget(page); self.current=page; page.on_show()
         for i in range(self.nav.count()):
             if self.nav.item(i).data(Qt.UserRole)==key: self.nav.blockSignals(True); self.nav.setCurrentRow(i); self.nav.blockSignals(False); break
+    def save_tuning_sample(self, path: str):
+        self.save(tuning_sample=path)
+
     def save(self,**values):
         self.frontend_config.update(values)
         try: self.settings_store.save(self.frontend_config)

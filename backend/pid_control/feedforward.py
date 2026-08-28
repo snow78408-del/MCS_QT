@@ -49,11 +49,10 @@ class FeedforwardCompensator:
             self._last_u_ff = 0.0
             return FeedforwardResult(0.0, False, "prediction stale", confidence)
 
-        if not self.config.feedforward_calibrated:
-            self._last_u_ff = 0.0
-            return FeedforwardResult(0.0, False, "feedforward plant gain not calibrated", confidence)
+        recommended = getattr(prediction, "recommended_feedforward", None)
+        model_inverse_available = recommended is not None and is_finite(recommended)
 
-        if self.config.feedforward_require_leading_signal:
+        if self.config.feedforward_require_leading_signal and not model_inverse_available:
             leading_available = bool(getattr(prediction, "leading_signal_available", False))
             lead_ms = max(0.0, float(getattr(prediction, "signal_lead_time_ms", 0.0) or 0.0))
             measured_delay_ms = max(0.0, float(pid_input.pump_response_delay_ms or 0.0))
@@ -91,8 +90,10 @@ class FeedforwardCompensator:
             stage = str(getattr(prediction, "control_stage", "") or "")
             return FeedforwardResult(0.0, False, f"feedforward gated by stage {stage}".strip(), confidence)
 
-        recommended = getattr(prediction, "recommended_feedforward", None)
         if recommended is None:
+            if not self.config.feedforward_calibrated:
+                self._last_u_ff = 0.0
+                return FeedforwardResult(0.0, False, "feedforward plant gain not calibrated", confidence)
             change = float(getattr(prediction, "predicted_diameter_change_um", 0.0) or 0.0)
             recommended = -float(self.config.feedforward_gain) * change * weight
         if not is_finite(recommended):

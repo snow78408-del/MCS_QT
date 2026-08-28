@@ -5,6 +5,7 @@ import math
 import numpy as np
 
 from .config import BayesianOptimizationConfig
+from ..pump_hardware.invariants import q1_is_strictly_above_q2
 from .models import (
     OperatingPoint,
     OptimizationCandidate,
@@ -17,10 +18,19 @@ from .models import (
 class SafeBayesianOptimizer:
     """Sequential two-dimensional BO with fail-closed experiment handling."""
 
-    def __init__(self, config: BayesianOptimizationConfig) -> None:
+    def __init__(
+        self,
+        config: BayesianOptimizationConfig,
+        *,
+        initial_point: tuple[float, float] | None = None,
+    ) -> None:
         self.config = config
         self._rng = np.random.default_rng(int(config.random_seed))
-        self._initial = self._latin_hypercube_candidates(int(config.initial_sample_count))
+        self._seed = None
+        if initial_point is not None and self.is_feasible(*initial_point):
+            self._seed = (float(initial_point[0]), float(initial_point[1]))
+        lhs_count = max(0, int(config.initial_sample_count) - (1 if self._seed is not None else 0))
+        self._initial = self._latin_hypercube_candidates(lhs_count) if lhs_count else []
         self._x: list[tuple[float, float]] = []
         self._y: list[float] = []
         self._observations: list[OptimizationObservation] = []
@@ -43,8 +53,13 @@ class SafeBayesianOptimizer:
             q1, q2 = self._best.q1, self._best.q2
             reason = "repeat best point for independent confirmation"
             self._phase = OptimizationPhase.CONFIRMING
-        elif len(self._x) < len(self._initial):
-            q1, q2 = self._initial[len(self._x)]
+        elif self._seed is not None and not self._x:
+            q1, q2 = self._seed
+            reason = "current verified operating-point seed"
+            self._phase = OptimizationPhase.INITIAL_SAMPLING
+        elif len(self._x) < len(self._initial) + (1 if self._seed is not None else 0):
+            index = len(self._x) - (1 if self._seed is not None else 0)
+            q1, q2 = self._initial[index]
             reason = "Latin-hypercube initialization"
             self._phase = OptimizationPhase.INITIAL_SAMPLING
         else:
@@ -157,7 +172,7 @@ class SafeBayesianOptimizer:
         return bool(
             cfg.q1_min <= q1 <= cfg.q1_max
             and cfg.q2_min <= q2 <= cfg.q2_max
-            and q1 >= q2 + cfg.min_q1_q2_gap
+            and q1_is_strictly_above_q2(q1, q2, cfg.min_q1_q2_gap)
             and q1 + q2 <= cfg.total_flow_max
         )
 

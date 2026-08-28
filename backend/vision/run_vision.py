@@ -26,6 +26,8 @@ def build_config_from_args(args: argparse.Namespace) -> PipelineConfig:
 
     config.detector.min_radius = float(args.min_radius)
     config.detector.max_radius = float(args.max_radius)
+    config.channel_region.enabled = not bool(args.skip_channel_region)
+    config.channel_region.sample_frames = max(1, min(48, int(args.channel_region_sample_frames)))
 
     config.beads.mode = args.bead_mode
     config.beads.area_min = int(args.bead_area_min)
@@ -34,6 +36,7 @@ def build_config_from_args(args: argparse.Namespace) -> PipelineConfig:
     if args.roi:
         x0, x1, y0, y1, crop_top = [float(x.strip()) for x in args.roi.split(",")]
         config.roi.enabled = True
+        config.roi.user_defined = True
         config.roi.x_start_ratio = x0
         config.roi.x_end_ratio = x1
         config.roi.y_start_ratio = y0
@@ -65,6 +68,17 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-video", type=str, default=None, help="Optional output annotated video path")
     parser.add_argument("--display", action="store_true", help="Show visualization window during processing")
     parser.add_argument("--max-frames", type=int, default=None, help="Process only first N frames")
+    parser.add_argument(
+        "--skip-channel-region",
+        action="store_true",
+        help="Skip startup channel-region calibration and detect on the full/manual ROI frame",
+    )
+    parser.add_argument(
+        "--channel-region-sample-frames",
+        type=int,
+        default=12,
+        help="Startup frames used by automatic channel-region calibration",
+    )
 
     parser.add_argument("--tracker", choices=["nearest", "kalman"], default="kalman")
     parser.add_argument("--bead-mode", choices=["intensity", "connected"], default="intensity")

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, fields
 import math
+
+from ..pump_hardware.invariants import STRICT_Q1_Q2_GAP_UL_MIN
 try:
     from enum import StrEnum
 except ImportError:  # Python 3.10 compatibility
@@ -64,18 +66,18 @@ class PIDConfig:
     integral_decay_in_deadband: float = 0.8
     min_droplet_count_for_feedback: int = 1
 
-    # The TS pump requires a positive, representable flow. With the preserved
-    # 1000 uL / 0.1 min parameter profile, 0.2 uL/min remains exactly
-    # representable within the 16-bit infusion-time field.
-    q1_min: float = 0.2
-    q1_max: float = 5000.0
-    q2_min: float = 0.2
-    q2_max: float = 5000.0
+    # Keep controller authority inside the experimentally approved BO envelope.
+    # Lower Q2 values are numerically encodable but are rejected by the current
+    # pump firmware during WSP readback.
+    q1_min: float = 15.0
+    q1_max: float = 100.0
+    q2_min: float = 5.0
+    q2_max: float = 25.0
     # Oil phase Q1 must remain strictly faster than aqueous phase Q2. A
     # positive gap makes the strict inequality robust to pump quantization.
-    min_q1_q2_gap: float = 0.2
+    min_q1_q2_gap: float = STRICT_Q1_Q2_GAP_UL_MIN
     max_flow_change_per_cycle: float = 200.0
-    total_flow_max: float = 8000.0
+    total_flow_max: float = 125.0
     use_initial_flow_as_output_bias: bool = True
     # Identified plant direction: flow_delta = sign * PID output. Defaults
     # preserve the current Q1/Q2 differential-control convention.
@@ -117,8 +119,11 @@ class PIDConfig:
             raise ValueError("pump control signs must be non-zero")
         if self.q1_output_gain <= 0.0 or self.q2_output_gain <= 0.0:
             raise ValueError("pump output gains must be greater than zero")
-        if not self.min_q1_q2_gap > 0.0:
-            raise ValueError("min_q1_q2_gap must be greater than zero")
+        if self.min_q1_q2_gap < STRICT_Q1_Q2_GAP_UL_MIN:
+            raise ValueError(
+                f"min_q1_q2_gap cannot be below fixed hardware invariant "
+                f"{STRICT_Q1_Q2_GAP_UL_MIN}"
+            )
         if not 0.0 < self.q1_min <= self.q1_max or not 0.0 < self.q2_min <= self.q2_max:
             raise ValueError("pump min/max limits must be positive and ordered")
         if not 0.0 <= self.feedforward_max_output_fraction <= 1.0:

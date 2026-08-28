@@ -34,6 +34,17 @@ class DisturbancePredictor:
             return DisturbancePrediction(timestamp=time.time(), reason="model not ready")
         try:
             self._last_prediction = self._model.predict(sample, previous_diameter=sample.droplet_mean_diameter_um)
+            self._last_prediction.recommended_feedforward = self._model.recommend_feedforward(
+                sample,
+                predicted_change_um=self._last_prediction.predicted_diameter_change_um,
+                probe_output=self.config.inverse_probe_output,
+                min_sensitivity=self.config.inverse_min_sensitivity_um_per_output,
+                max_output=self.config.inverse_max_output,
+                q1_control_sign=self.config.inverse_q1_control_sign,
+                q2_control_sign=self.config.inverse_q2_control_sign,
+                q1_output_gain=self.config.inverse_q1_output_gain,
+                q2_output_gain=self.config.inverse_q2_output_gain,
+            )
             self._last_prediction.prediction_horizon_ms = float(self.config.prediction_horizon_ms)
             return self._last_prediction
         except Exception as exc:

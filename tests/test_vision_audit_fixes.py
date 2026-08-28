@@ -11,7 +11,7 @@ from backend.vision.cameras.adapters.hikrobot_camera import HikrobotCameraAdapte
 from backend.vision.cameras.models import CameraCapabilities, CameraDeviceInfo, CameraFeatureCapability
 from backend.vision.cameras.registry import default_registry
 from backend.vision.config import CameraSystemConfig, default_config
-from backend.vision.run_vision import build_argument_parser
+from backend.vision.run_vision import build_argument_parser, build_config_from_args
 
 
 def test_allied_vision_is_the_registered_canonical_backend_name() -> None:
@@ -26,6 +26,17 @@ def test_standalone_tracker_default_matches_pipeline_config() -> None:
     args = build_argument_parser().parse_args(["--video", "sample.mp4"])
 
     assert args.tracker == default_config().tracker.tracker_type == "kalman"
+
+
+def test_standalone_channel_region_can_be_skipped() -> None:
+    args = build_argument_parser().parse_args(
+        ["--video", "sample.mp4", "--skip-channel-region", "--channel-region-sample-frames", "7"]
+    )
+
+    config = build_config_from_args(args)
+
+    assert not config.channel_region.enabled
+    assert config.channel_region.sample_frames == 7
 
 
 class _FakePySpinNode:

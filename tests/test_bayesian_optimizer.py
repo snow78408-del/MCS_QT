@@ -62,6 +62,30 @@ def test_every_candidate_obeys_joint_pump_constraints() -> None:
         optimizer.tell(_observation(candidate, diameter=70.0 - index))
 
 
+def test_optimizer_starts_from_current_verified_operating_point() -> None:
+    optimizer = SafeBayesianOptimizer(_config(), initial_point=(50.0, 20.0))
+
+    candidate = optimizer.ask()
+
+    assert candidate.q1 == pytest.approx(50.0)
+    assert candidate.q2 == pytest.approx(20.0)
+    assert "verified operating-point seed" in candidate.reason
+
+
+def test_default_total_flow_limit_matches_pid_envelope() -> None:
+    assert _config().total_flow_max == 125.0
+
+
+def test_q1_above_q2_invariant_survives_runtime_config_mutation() -> None:
+    config = _config(q1_min=5.0)
+    config.min_q1_q2_gap = -100.0
+    optimizer = SafeBayesianOptimizer(config)
+
+    assert not optimizer.is_feasible(20.0, 20.0)
+    assert not optimizer.is_feasible(20.1, 20.0)
+    assert optimizer.is_feasible(20.2, 20.0)
+
+
 def test_successful_point_is_repeated_before_completion() -> None:
     optimizer = SafeBayesianOptimizer(_config())
     first = optimizer.ask()

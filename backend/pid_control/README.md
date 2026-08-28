@@ -21,6 +21,8 @@
 - 单胞率仅识别和显示，不参与控制。
 - 当样本不足时，应冻结控制输出。
 - 当任一关键流速小于等于 0 时，应触发停机逻辑。
+- 当前实验包络固定为 Q1 `15–100 uL/min`、Q2 `5–25 uL/min`，PID 与 BO 使用同一边界。
+- 1200 波特率泵的实时闭环周期下限为 `7500 ms`。
 # PID Control
 
 `pid_control` owns all feedback-control math. The orchestrator passes a
@@ -46,5 +48,6 @@ Safety behavior is internal to this package:
   controller history before using that point as the PID bias.
 - PID and feedforward are summed inside this package and pass through one
   actuator allocator. Saturation is reported and integral windup is prevented.
-- Feedforward also requires a measured physical pump response delay and a
-  causal signal whose lead time exceeds that delay plus the configured margin.
+- A validated model-supplied local inverse may provide bounded low-weight
+  feedforward. Static-gain feedforward still requires a measured physical pump
+  response delay and a causal signal whose lead exceeds that delay plus margin.

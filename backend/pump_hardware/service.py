@@ -7,6 +7,7 @@ from typing import Callable
 from . import protocol
 from .client import CommandMismatchError, FrameParseError, NoReplyError, PumpClient
 from .config import PumpHardwareConfig, SerialConfig
+from .invariants import effective_q1_q2_gap
 from .models import (
     ChannelParams,
     FlowUpdateResult,
@@ -962,7 +963,7 @@ class PumpHardwareService:
                 still_running=False,
                 reason=reason,
             )
-        min_gap = max(1e-9, float(self.runtime_config.min_q1_q2_gap))
+        min_gap = effective_q1_q2_gap(self.runtime_config.min_q1_q2_gap)
         if float(q1) < float(q2) + min_gap:
             reason = (
                 f"拒绝泵流量更新：油相 Q1 必须至少比水相 Q2 大 {min_gap:.6f} uL/min；"

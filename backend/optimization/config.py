@@ -3,6 +3,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+from ..pump_hardware.invariants import STRICT_Q1_Q2_GAP_UL_MIN
+
 
 @dataclass(slots=True)
 class BayesianOptimizationConfig:
@@ -31,8 +33,8 @@ class BayesianOptimizationConfig:
     minimum_valid_droplets: int = 5
     candidate_timeout_ms: float = 120_000.0
     invalid_retry_limit: int = 3
-    min_q1_q2_gap: float = 0.2
-    total_flow_max: float = 8000.0
+    min_q1_q2_gap: float = STRICT_Q1_Q2_GAP_UL_MIN
+    total_flow_max: float = 125.0
     cv_weight: float = 0.02
     invalid_fraction_weight: float = 1.0
     movement_weight: float = 0.01
@@ -92,8 +94,11 @@ class BayesianOptimizationConfig:
             raise ValueError("confirmation_count and minimum_valid_droplets must be positive")
         if self.invalid_retry_limit < 0 or self.acquisition_candidates < 32:
             raise ValueError("invalid retry/acquisition settings are not usable")
-        if self.min_q1_q2_gap <= 0.0:
-            raise ValueError("min_q1_q2_gap must be positive")
+        if self.min_q1_q2_gap < STRICT_Q1_Q2_GAP_UL_MIN:
+            raise ValueError(
+                f"min_q1_q2_gap cannot be below fixed hardware invariant "
+                f"{STRICT_Q1_Q2_GAP_UL_MIN}"
+            )
         if self.total_flow_max <= 0.0:
             raise ValueError("total_flow_max must be positive")
         if not self._has_feasible_region():

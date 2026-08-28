@@ -22,6 +22,13 @@ def _input(*, frame_id: int, q1: float, q2: float, current: float = 40.0) -> PID
 
 
 class DiameterPidTests(unittest.TestCase):
+    def test_default_flow_limits_match_commissioning_envelope(self) -> None:
+        config = PIDConfig()
+
+        self.assertEqual((config.q1_min, config.q1_max), (15.0, 100.0))
+        self.assertEqual((config.q2_min, config.q2_max), (5.0, 25.0))
+        self.assertEqual(config.total_flow_max, 125.0)
+
     def test_invalid_current_flow_requests_stop_without_control_output(self) -> None:
         controller = DiameterPIDController(PIDConfig())
         for q1, q2 in ((0.0, 20.0), (-1.0, 20.0), (float("nan"), 20.0), (50.0, float("inf"))):
@@ -160,6 +167,8 @@ class DiameterPidTests(unittest.TestCase):
     def test_nonpositive_phase_gap_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
             PIDConfig(min_q1_q2_gap=0.0)
+        with self.assertRaises(ValueError):
+            PIDConfig(min_q1_q2_gap=0.1)
 
     def test_nonpositive_output_gain_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
@@ -207,6 +216,11 @@ class DiameterPidTests(unittest.TestCase):
             base_ki=0.1,
             base_kd=0.0,
             output_rate_limit=1000.0,
+            q1_min=0.2,
+            q1_max=5000.0,
+            q2_min=0.2,
+            q2_max=5000.0,
+            total_flow_max=8000.0,
             min_q1_q2_gap=0.2,
         )
         controller = DiameterPIDController(config)

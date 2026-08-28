@@ -11,6 +11,7 @@ from ..disturbance_model import DisturbanceModelConfig, DisturbanceModelService
 from ..optimization import BayesianOptimizationConfig, OptimizationObservation, SafeBayesianOptimizer
 from ..pid_control import DiameterPIDController, PIDConfig, PIDInput, PumpState, TargetParams, VisionMetrics
 from ..pump_hardware import ChannelParams, PumpHardwareService
+from ..pump_hardware.invariants import effective_q1_q2_gap, q1_is_strictly_above_q2
 from .config import OrchestratorConfig
 from .models import (
     ControlSnapshot,
@@ -102,6 +103,7 @@ class OrchestratorService:
         self._last_seen_vision_period_id: int | None = None
         self._last_disturbance_prediction = None
         self._disturbance_context: dict[str, Any] = {}
+        self._auto_disturbance_experiment_id = ""
         self._target_revision = 0
         self._optimizer: SafeBayesianOptimizer | None = None
         self._optimization_candidate = None
@@ -324,9 +326,11 @@ class OrchestratorService:
             raise RuntimeError(f"state does not allow configuration: {state.value}")
         self._require_valid_phase_flows(system_config.initial_q1, system_config.initial_q2)
         interval = int(system_config.control_interval_ms)
-        interval = max(self.runtime.min_control_interval_ms, interval)
-        interval = min(self.runtime.max_control_interval_ms, interval)
-        system_config.control_interval_ms = interval
+        if not self.runtime.min_control_interval_ms <= interval <= self.runtime.max_control_interval_ms:
+            raise ValueError(
+                "control_interval_ms must be user-configured in range "
+                f"[{self.runtime.min_control_interval_ms}, {self.runtime.max_control_interval_ms}]"
+            )
 
         mode = str(system_config.video_source_type or "").strip().lower()
         realtime_mode = mode not in {"file", "local", "local_video", "video"}
@@ -531,8 +535,8 @@ class OrchestratorService:
                 f"pump flow is outside configured range: Q1 [{q1_min}, {q1_max}], "
                 f"Q2 [{q2_min}, {q2_max}] uL/min"
             )
-        min_gap = max(1e-9, float(getattr(pid_cfg, "min_q1_q2_gap", 0.2)))
-        if q1_value < q2_value + min_gap:
+        min_gap = effective_q1_q2_gap(getattr(pid_cfg, "min_q1_q2_gap", None))
+        if not q1_is_strictly_above_q2(q1_value, q2_value, min_gap):
             raise ValueError(
                 f"油相 Q1 必须至少比水相 Q2 大 {min_gap:.1f} uL/min；"
                 f"当前 Q1={float(q1):.6f}, Q2={float(q2):.6f}"
@@ -785,6 +789,7 @@ class OrchestratorService:
 
     def _update_flow_with_lifecycle_guard(self, q1: float, q2: float, generation: int):
         """Run a flow update without letting lifecycle changes trigger retries."""
+        self._require_valid_phase_flows(q1, q2)
         with self._lock:
             if (
                 generation != self._lifecycle_generation
@@ -793,6 +798,24 @@ class OrchestratorService:
                 or self._pause_event.is_set()
             ):
                 return None
+        token = self._run_token
+        interval_s = max(
+            0.01,
+            float(
+                getattr(self._cfg, "control_interval_ms", self.runtime.default_control_interval_ms)
+                if self._cfg is not None
+                else self.runtime.default_control_interval_ms
+            )
+            / 1000.0,
+        )
+        transaction_watchdog_s = self._control_heartbeat_timeout_s(
+            interval_s,
+            pump_transaction=True,
+        )
+        if token is not None and not self._safety.heartbeat(
+            token, timeout_s=transaction_watchdog_s
+        ):
+            raise RuntimeError("pump update rejected by safety supervisor")
         update_res = self.pump_service.update_flow_while_running(float(q1), float(q2))
         with self._lock:
             current = (
@@ -804,6 +827,31 @@ class OrchestratorService:
         if not current:
             return None
         return update_res
+
+    def _control_heartbeat_timeout_s(
+        self,
+        interval_s: float,
+        *,
+        pump_transaction: bool = False,
+    ) -> float:
+        timeout_s = max(5.0, max(0.01, float(interval_s)) * 2.5)
+        if pump_transaction:
+            timeout_s = max(
+                timeout_s,
+                float(getattr(self.runtime, "pump_update_watchdog_timeout_s", 15.0)),
+            )
+        return timeout_s
+
+    @staticmethod
+    def _advance_control_deadline(
+        deadline: float,
+        interval_s: float,
+        completed_at: float,
+    ) -> tuple[float, int]:
+        """Advance an anchored periodic schedule without catch-up bursts."""
+        interval = max(0.01, float(interval_s))
+        slots = max(1, int((float(completed_at) - float(deadline)) // interval) + 1)
+        return float(deadline) + slots * interval, max(0, slots - 1)
 
     def _rollback_start(self, *, adapter_started: bool, recorder_started: bool, stop_pump: bool) -> bool:
         """Undo resources acquired by a partially completed start."""
@@ -888,6 +936,7 @@ class OrchestratorService:
             cfg = self._cfg
             state = self._state
         safety = self._safety.snapshot()
+        calibration_source = "none"
         if cfg is None:
             issues.append("system configuration is missing")
         if state not in {SystemState.INITIALIZED, SystemState.PAUSED, SystemState.STOPPED}:
@@ -897,13 +946,52 @@ class OrchestratorService:
         if not safety.stop_verified:
             issues.append("pump stop has not been verified")
         if cfg is not None and self._is_realtime_mode():
-            if not dict(getattr(cfg, "calibration", {}) or {}):
-                issues.append("a versioned pixel calibration file is required for realtime PID")
+            if dict(getattr(cfg, "calibration", {}) or {}):
+                calibration_source = "versioned_file"
+            elif self._has_verified_runtime_channel_calibration():
+                calibration_source = "runtime_channel"
+            else:
+                issues.append(
+                    "a versioned pixel calibration file or a successful runtime channel calibration "
+                    "is required for realtime PID"
+                )
             if not self._pump_control_enabled:
                 issues.append("pump control is not initialized")
             if not self._pump_state.connected or not self._pump_state.comm_established:
                 issues.append("pump communication is not established")
-        return {"ok": not issues, "issues": issues, "state": state.value}
+        return {
+            "ok": not issues,
+            "issues": issues,
+            "state": state.value,
+            "calibration_source": calibration_source,
+        }
+
+    def _has_verified_runtime_channel_calibration(self) -> bool:
+        """Accept only a completed, physically anchored channel-width calibration."""
+        adapter = self.vision_adapter
+        if adapter is None:
+            return False
+        try:
+            raw = adapter.get_snapshot()
+        except Exception:
+            return False
+
+        def value(name: str, default: Any = None) -> Any:
+            if isinstance(raw, dict):
+                return raw.get(name, default)
+            return getattr(raw, name, default)
+
+        try:
+            return (
+                str(value("channel_calibration_status", "")) == "calibrated"
+                and str(value("scale_source", "")) == "channel_430um"
+                and float(value("channel_calibration_confidence", 0.0) or 0.0) > 0.0
+                and float(value("pixel_to_micron", 0.0) or 0.0) > 0.0
+                and float(value("channel_width_um", 0.0) or 0.0) > 0.0
+                and float(value("channel_width_px", 0.0) or 0.0) > 0.0
+            )
+        except (TypeError, ValueError):
+            return False
 
     def start(self) -> None:
         # Serialize start attempts while allowing stop() to invalidate the
@@ -935,7 +1023,12 @@ class OrchestratorService:
                 raise ValueError("optimizer phase gap is weaker than controller safety limit")
             if float(config.total_flow_max) > float(self.pid_config.total_flow_max):
                 raise ValueError("optimizer total-flow limit exceeds controller safety limit")
-            self._optimizer = SafeBayesianOptimizer(config)
+            current_q1 = float(getattr(self._pump_state, "q1", None) or self._cfg.initial_q1)
+            current_q2 = float(getattr(self._pump_state, "q2", None) or self._cfg.initial_q2)
+            self._optimizer = SafeBayesianOptimizer(
+                config,
+                initial_point=(current_q1, current_q2),
+            )
             self._optimization_candidate = None
             self._optimization_candidate_applied_monotonic = 0.0
             self._optimization_candidate_period_id = 0
@@ -989,6 +1082,24 @@ class OrchestratorService:
 
         token = self._safety.begin_session()
         self._run_token = token
+        with self._lock:
+            context = dict(self._disturbance_context)
+            configured_experiment = str(context.get("experiment_id", "")).strip()
+            if not configured_experiment or configured_experiment == self._auto_disturbance_experiment_id:
+                context["experiment_id"] = token.session_id
+                self._auto_disturbance_experiment_id = token.session_id
+            if not str(context.get("chip_id", "")).strip():
+                context["chip_id"] = str(
+                    dict(getattr(self._cfg, "calibration", {}) or {}).get("calibration_id")
+                    or getattr(self._cfg, "video_source", "")
+                    or getattr(self._cfg, "camera_backend", "")
+                    or "realtime-camera"
+                )
+            if not str(context.get("disturbance_name", "")).strip():
+                context["disturbance_name"] = "closed_loop_dynamics"
+            if not str(context.get("disturbance_stage", "")).strip():
+                context["disturbance_stage"] = "disturbed"
+            self._disturbance_context = context
         set_context = getattr(adapter, "set_run_context", None)
         if callable(set_context):
             set_context(token.session_id, token.generation)
@@ -1099,9 +1210,9 @@ class OrchestratorService:
             adapter_started=adapter_started,
             recorder_started=recorder_started,
         )
-        heartbeat_timeout = max(
-            5.0,
-            2.5 * float(self._cfg.control_interval_ms if self._cfg else self.runtime.default_control_interval_ms) / 1000.0,
+        heartbeat_timeout = self._control_heartbeat_timeout_s(
+            float(self._cfg.control_interval_ms if self._cfg else self.runtime.default_control_interval_ms)
+            / 1000.0,
         )
         try:
             self._safety.arm(token, heartbeat_timeout_s=heartbeat_timeout)
@@ -1526,16 +1637,24 @@ class OrchestratorService:
         token = self._run_token
         with self._lock:
             generation = self._lifecycle_generation
+        interval_s = max(
+            0.01,
+            (self._cfg.control_interval_ms if self._cfg else self.runtime.default_control_interval_ms)
+            / 1000.0,
+        )
+        next_deadline = time.monotonic() + interval_s
+        self._log(f"[CONTROL][SCHEDULE] interval_ms={interval_s * 1000.0:.3f}")
         try:
-            # Prefer completed-period events from vision. The timeout remains a
-            # watchdog/fallback for adapters that cannot publish such events.
+            # Vision events can wake the loop early, but PID execution remains
+            # anchored to the configured control period. Missed slots are
+            # skipped rather than executed as a burst after slow hardware I/O.
             while not self._stop_event.is_set():
                 interval_s = max(
                     0.01,
                     (self._cfg.control_interval_ms if self._cfg else self.runtime.default_control_interval_ms)
                     / 1000.0,
                 )
-                heartbeat_timeout = max(5.0, interval_s * 2.5)
+                heartbeat_timeout = self._control_heartbeat_timeout_s(interval_s)
                 if token is None or not self._safety.heartbeat(
                     token,
                     timeout_s=heartbeat_timeout,
@@ -1543,16 +1662,20 @@ class OrchestratorService:
                     raise RuntimeError("control loop lost its safety run token")
 
                 waiter = getattr(self.vision_adapter, "wait_for_recognition_snapshot", None)
+                remaining_s = max(0.0, next_deadline - time.monotonic())
                 if callable(waiter):
                     try:
                         waiter(
                             after_period_id=int(self._last_seen_vision_period_id or 0),
-                            timeout=interval_s,
+                            timeout=remaining_s,
                         )
                     except (AttributeError, TypeError):
-                        if self._stop_event.wait(interval_s):
+                        if self._stop_event.wait(remaining_s):
                             break
-                elif self._stop_event.wait(interval_s):
+                elif self._stop_event.wait(remaining_s):
+                    break
+                remaining_s = max(0.0, next_deadline - time.monotonic())
+                if remaining_s > 0.0 and self._stop_event.wait(remaining_s):
                     break
                 with self._lock:
                     lifecycle_valid = (
@@ -1566,7 +1689,21 @@ class OrchestratorService:
                     continue
                 if not self._safety.permits(token):
                     raise RuntimeError("safety supervisor rejected control execution")
+                step_started = time.monotonic()
                 self.run_control_step()
+                step_completed = time.monotonic()
+                next_deadline, skipped_slots = self._advance_control_deadline(
+                    next_deadline,
+                    interval_s,
+                    step_completed,
+                )
+                if skipped_slots > 0:
+                    self._log(
+                        "[CONTROL][OVERRUN] "
+                        f"configured_ms={interval_s * 1000.0:.3f} "
+                        f"step_ms={(step_completed - step_started) * 1000.0:.3f} "
+                        f"skipped_slots={skipped_slots}"
+                    )
         except Exception as exc:
             self._pump_control_enabled = False
             self._run_token = None
@@ -1987,7 +2124,10 @@ class OrchestratorService:
             f"q1_gain={cmd.q1_output_gain:.3f} q2_gain={cmd.q2_output_gain:.3f} "
             f"q1={cmd.q1:.6f}, q2={cmd.q2:.6f}, adj={cmd.adjustment:.6f} "
             f"owner={cmd.control_owner} saturated={cmd.actuator_saturated} "
-            f"adaptive_reason={cmd.adaptive_reason}"
+            f"adaptive_reason={cmd.adaptive_reason} "
+            f"feedforward_active={cmd.feedforward_active} "
+            f"feedforward_output={cmd.feedforward_output:.6f} "
+            f"feedforward_reason={cmd.feedforward_reason}"
         )
         # Revalidate immediately before hardware I/O. The safety token binds
         # session_id + run generation; the lifecycle generation closes the
