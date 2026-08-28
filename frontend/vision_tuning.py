@@ -237,22 +237,35 @@ class StageCard(QGroupBox):
             form.setContentsMargins(0, 4, 0, 0)
             for spec in controls:
                 widget = self._control_widget(spec)
+                modified = bool(spec.get("modified", False))
                 label = QLabel(str(spec["label"]))
-                if spec.get("modified", False):
-                    label.setText(f'<span style="color:#dc2626">{spec["label"]}</span>')
-                    label.setTextFormat(Qt.RichText)
+                if modified:
+                    label.setStyleSheet("color:#dc2626")
                     label.setToolTip("此参数已偏离打开页面时的原设定")
-                    reset = QPushButton("恢复")
-                    reset.setFixedWidth(52)
-                    reset.setToolTip("恢复此参数的原设定")
-                    reset.clicked.connect(lambda _checked=False, name=str(spec["key"]): self.parameter_reset.emit(name))
-                    row = QWidget()
-                    row_layout = QHBoxLayout(row)
-                    row_layout.setContentsMargins(0, 0, 0, 0)
-                    row_layout.addWidget(widget, 1)
-                    row_layout.addWidget(reset)
-                    widget = row
-                form.addRow(label, widget)
+
+                # Keep a stable, text-free restore affordance beside every
+                # label.  The fixed slot prevents a redraw from moving the
+                # control being edited when a parameter becomes modified.
+                reset = QPushButton()
+                reset.setFixedSize(14, 14)
+                reset.setEnabled(modified)
+                reset.setAccessibleName(f"恢复参数 {spec['label']}")
+                reset.setToolTip("恢复此参数的原设定" if modified else "参数未修改")
+                reset.setStyleSheet(
+                    "QPushButton { border: none; border-radius: 7px; "
+                    f"background-color: {'#f59e0b' if modified else '#cbd5e1'}; }}"
+                    "QPushButton:disabled { background-color: #cbd5e1; }"
+                )
+                reset.clicked.connect(
+                    lambda _checked=False, name=str(spec["key"]): self.parameter_reset.emit(name)
+                )
+                label_row = QWidget()
+                label_layout = QHBoxLayout(label_row)
+                label_layout.setContentsMargins(0, 0, 4, 0)
+                label_layout.setSpacing(4)
+                label_layout.addWidget(label, 1)
+                label_layout.addWidget(reset)
+                form.addRow(label_row, widget)
             layout.addLayout(form)
 
         if stage.parameters:
