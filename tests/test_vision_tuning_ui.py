@@ -72,11 +72,11 @@ def _wait_until(app: QApplication, predicate, timeout: float = 2.0) -> None:
 
 
 def test_invalid_algorithm_parameters_are_rejected_before_inspection() -> None:
-    detector = DetectorConfig(hough_dp=float("nan"))
+    detector = DetectorConfig(sensitivity=float("nan"))
     with pytest.raises(ValueError, match="有限数值"):
         _validate_tuning_configs(detector, ChannelRegionConfig())
 
-    detector = DetectorConfig(hough_min_radius=90, hough_max_radius=20)
+    detector = DetectorConfig(min_radius=90, max_radius=20)
     with pytest.raises(ValueError, match="最小半径不能大于最大半径"):
         _validate_tuning_configs(detector, ChannelRegionConfig())
 

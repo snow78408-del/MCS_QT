@@ -48,19 +48,8 @@ class PipelineStage:
 SEARCHABLE_FIELDS = (
     "min_radius",
     "max_radius",
-    "gaussian_blur_size",
-    "hough_dp",
-    "hough_min_distance",
-    "hough_param1",
-    "hough_param2",
-    "hough_min_radius",
-    "hough_max_radius",
-    "hough_edge_support_threshold",
-    "hough_edge_neighborhood",
-    "expected_radius",
-    "expected_radius_tolerance_ratio",
-    "candidate_min_visible_circle_ratio",
-    "candidate_full_circle_ratio",
+    "min_center_distance",
+    "sensitivity",
 )
 
 
@@ -159,29 +148,25 @@ def inspect_frame(
 
     detector = DropletDetector(config, DebugConfig(enabled=False))
     gray = detector._ensure_gray(detection_frame)
-    normalized = detector._normalize(gray)
-    smoothed = detector._smooth(normalized)
-    cut_line = int(smoothed.shape[0] * config.cut_line_ratio)
     trace: dict[str, object] = {}
-    centers, radii = detector._detect_hough_candidates(smoothed, cut_line, trace)
+    corrected = detector._preprocess(gray, trace)
+    centers, radii = detector._detect_hough_candidates(corrected, trace)
     diameter_valid = [
-        detector._candidate_diameter_valid(normalized.shape[:2], center, radius)
+        detector._candidate_diameter_valid(gray.shape[:2], center, radius)
         for center, radius in zip(centers, radii)
     ]
     result = DetectionResult(
         centers,
         radii,
         np.empty((0, 0, 3), dtype=np.uint8),
-        detector._build_bead_helper_mask(normalized),
+        detector._build_bead_helper_mask(gray),
         diameter_valid,
     )
-    work_gray = np.asarray(trace.get("work_gray", smoothed))
-    enhanced = np.asarray(trace.get("enhanced", work_gray))
-    edges = np.asarray(trace.get("edges", np.zeros_like(work_gray)))
+    background = np.asarray(trace["background"])
+    illumination_corrected = np.asarray(trace["illumination_corrected"])
+    clahe = np.asarray(trace["clahe"])
     raw_centers = list(trace.get("raw_centers", []))
     raw_radii = list(trace.get("raw_radii", []))
-    scale = float(trace.get("scale", 1.0))
-    blur_size = detector._odd(config.gaussian_blur_size)
     stages = [
         PipelineStage(
             "1. 原始图像",
@@ -197,55 +182,46 @@ def inspect_frame(
             statistics=f"亮度范围 {int(gray.min())}–{int(gray.max())}",
         ),
         PipelineStage(
-            "3. 对比度归一化",
-            "拉伸灰度范围，降低曝光变化对 Hough 梯度的影响。",
-            normalized,
-            parameters="NORM_MINMAX: 0–255" if config.enable_intensity_normalization else "已跳过",
-            statistics=f"均值 {float(normalized.mean()):.1f}",
+            "3. 光照背景估计",
+            "用大尺度高斯模糊估计缓慢变化的照明背景。",
+            background,
+            parameters="Gaussian sigma=25",
+            statistics=f"背景均值 {float(background.mean()):.1f}",
         ),
         PipelineStage(
-            "4. 高斯平滑",
-            "在 Hough 变换前抑制高频噪声。",
-            smoothed,
-            parameters=f"核大小 {blur_size}×{blur_size}" if config.enable_gaussian_blur else "已跳过",
+            "4. 光照校正",
+            "从灰度图减去背景并加 128，保留液滴边缘。",
+            illumination_corrected,
+            parameters="gray - background + 128",
         ),
         PipelineStage(
-            "5. Hough 输入预处理",
-            "按工作尺寸缩放，并可选执行 CLAHE 与中值滤波。",
-            enhanced,
-            parameters=(
-                f"缩放 {scale:.2f}；CLAHE {'开' if config.enable_hough_clahe else '关'}；"
-                f"中值滤波 {'开' if config.enable_hough_median_blur else '关'}"
-            ),
+            "5. CLAHE 局部增强",
+            "增强局部对比度，使亮度不均区域中的液滴边缘更清晰。",
+            clahe,
+            parameters="clipLimit=2.0；tileGridSize=8×8",
         ),
         PipelineStage(
-            "6. Hough 边缘支撑",
-            "生成仅用于验证圆周边缘覆盖率的 Canny 边缘图。",
-            edges,
-            parameters=(
-                f"Canny {config.hough_param1 * 0.5:g}–{config.hough_param1:g}；"
-                f"邻域 {config.hough_edge_neighborhood}px"
-            ),
+            "6. Hough 前高斯平滑",
+            "按给定算法使用固定高斯核抑制高频噪声。",
+            corrected,
+            parameters="核 7×7；sigma=1.4",
         ),
         PipelineStage(
             "7. Hough 原始圆",
-            "在整张工作图上执行一次 cv2.HoughCircles。",
+            "在整张校正图上执行一次 cv2.HoughCircles，并按从上到下、从左到右排序。",
             _candidate_overlay(detection_frame, raw_centers, raw_radii, (255, 120, 0)),
             parameters=(
-                f"dp={config.hough_dp:g}；param2={config.hough_param2:g}；"
-                f"半径 {config.hough_min_radius:g}–{config.hough_max_radius:g}px"
+                f"dp=1.2；param1=75；param2={45.0 - 25.0 * config.sensitivity:g}；"
+                f"半径 {config.min_radius:g}–{config.max_radius:g}px；"
+                f"圆心距 ≥ {config.min_center_distance:g}px"
             ),
-            statistics=f"原始圆 {len(raw_centers)} 个",
+            statistics=f"检测圆 {len(raw_centers)} 个",
         ),
         PipelineStage(
-            "8. 简单过滤结果",
-            "仅按尺寸、截断线、可见圆周、边缘支撑和圆心距离过滤。",
+            "8. 最终识别结果",
+            "直接显示 Hough 输出，不执行边缘支撑、尺寸门控或候选去重。",
             annotate_frame(detection_frame, result),
-            parameters=(
-                f"边缘支撑 ≥ {config.hough_edge_support_threshold:g}；"
-                f"可见圆周 ≥ {config.candidate_min_visible_circle_ratio:g}；"
-                f"直径完整度 ≥ {config.candidate_full_circle_ratio:g}"
-            ),
+            parameters=f"敏感度 {config.sensitivity:g}",
             statistics=f"最终液滴 {len(centers)} 个",
         ),
     ]

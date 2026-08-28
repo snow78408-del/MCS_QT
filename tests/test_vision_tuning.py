@@ -38,9 +38,9 @@ class VisionTuningTests(unittest.TestCase):
         result, stages = inspect_frame(frame, DetectorConfig())
         self.assertEqual(len(stages), 8)
         self.assertEqual(stages[0].name, "1. 原始图像")
-        self.assertEqual(stages[-1].name, "8. 简单过滤结果")
-        self.assertIn("Hough 输入预处理", stages[4].name)
-        self.assertIn("Hough 边缘支撑", stages[5].name)
+        self.assertEqual(stages[-1].name, "8. 最终识别结果")
+        self.assertIn("CLAHE", stages[4].name)
+        self.assertIn("高斯平滑", stages[5].name)
         self.assertIn("Hough 原始圆", stages[6].name)
         self.assertTrue(all(stage.image.size > 0 for stage in stages))
         self.assertEqual(len(result.centers), len(result.radii))
@@ -68,30 +68,18 @@ class VisionTuningTests(unittest.TestCase):
         self.assertIn("有效区域", stages[3].name)
         self.assertTrue(stages[4].name.startswith("B1."))
 
-    def test_optional_preprocessing_steps_can_be_skipped(self):
-        frame = self._frames()[0].image
-        config = DetectorConfig(
-            enable_intensity_normalization=False,
-            enable_gaussian_blur=False,
-        )
-        _, stages = inspect_frame(frame, config)
-        np.testing.assert_array_equal(stages[2].image, stages[1].image)
-        np.testing.assert_array_equal(stages[3].image, stages[2].image)
-        self.assertEqual(stages[2].parameters, "已跳过")
-        self.assertEqual(stages[3].parameters, "已跳过")
-
     def test_grid_search_returns_best_first_and_does_not_mutate_base(self):
         frames = self._frames()
         base = DetectorConfig()
         results = grid_search(
             frames,
             base,
-            {"hough_param2": [20, 28], "hough_edge_support_threshold": [0.1, 0.2]},
+            {"sensitivity": [0.90, 0.96], "min_center_distance": [24, 32]},
             expected_count=1,
         )
         self.assertEqual(len(results), 4)
         self.assertGreaterEqual(results[0].score, results[-1].score)
-        self.assertEqual(base.hough_param2, 28.0)
+        self.assertEqual(base.sensitivity, 0.96)
 
     def test_unknown_search_field_is_rejected(self):
         with self.assertRaises(ValueError):

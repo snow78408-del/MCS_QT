@@ -324,17 +324,7 @@ class PipelineVisionService:
         self._configured_pixel_to_micron = self._pixel_to_micron
         pipeline = self._ensure_pipeline()
         # The control target is deliberately stored only for display/control.
-        # It must not influence detector gates, candidate scores, or tracking.
-        pipeline.config.detector.expected_size_hard_gate = False
-        pipeline.config.detector.hough_work_max_width = 480
-        pipeline.config.detector.hough_work_max_height = 360
-        pipeline.config.detector.hough_max_candidates = 40
-        # Recover weaker, partially illuminated droplets, then let geometric
-        # scoring and temporal tracking reject isolated false candidates.
-        pipeline.config.detector.hough_param2 = 22.0
-        pipeline.config.detector.hough_edge_support_threshold = 0.12
-        pipeline.config.detector.candidate_min_edge_support = 0.12
-        pipeline.config.detector.candidate_full_circle_ratio = 0.75
+        # It must not influence the image-domain Hough detector or tracking.
         # Recognition may run much slower than camera acquisition.  A droplet
         # can move farther than the old 120 px gate between processed frames.
         pipeline.config.tracker.match_distance = 180.0

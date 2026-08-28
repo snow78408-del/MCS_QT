@@ -75,8 +75,8 @@ class ChannelRegionConfig:
 @dataclass
 class DetectorConfig:
     # Image-domain measurement bounds. These are independent of the PID target.
-    min_radius: float = 8.0
-    max_radius: float = 80.0
+    min_radius: float = 18.0
+    max_radius: float = 32.0
     expected_radius: float = 0.0
     # Retained for settings compatibility; PID targets never change this gate.
     expected_size_hard_gate: bool = False
@@ -84,7 +84,10 @@ class DetectorConfig:
     adaptive_max_radius_ratio: float = 1.60
     adaptive_radius_learning_rate: float = 0.12
     adaptive_radius_min_candidates: int = 4
-    min_center_distance: float = 0.0
+    min_center_distance: float = 32.0
+    # Friendly 0..1 control mapped to the Hough accumulator threshold as
+    # ``45 - 25 * sensitivity``. Higher values detect weaker circles.
+    sensitivity: float = 0.96
     min_center_distance_radius_ratio: float = 0.75
     deduplicate_distance_ratio: float = 0.60
     deduplicate_min_distance: float = 6.0
@@ -128,7 +131,8 @@ class DetectorConfig:
     split_peak_threshold_ratio: float = 0.55
     split_min_radius_ratio: float = 0.65
     split_large_area_ratio: float = 1.15
-    # Active detector path: one full-frame HoughCircles call per frame.
+    # Compatibility fields retained for older saved profiles. The active
+    # detector uses min/max_radius, min_center_distance, and sensitivity above.
     enable_hough_candidates: bool = True
     # Deprecated hybrid-detector compatibility fields.
     hough_fallback_only: bool = False
@@ -136,11 +140,11 @@ class DetectorConfig:
     enable_hough_clahe: bool = True
     enable_hough_median_blur: bool = True
     hough_dp: float = 1.2
-    hough_min_distance: float = 0.0
-    hough_param1: float = 100.0
-    hough_param2: float = 28.0
-    hough_min_radius: float = 8.0
-    hough_max_radius: float = 80.0
+    hough_min_distance: float = 32.0
+    hough_param1: float = 75.0
+    hough_param2: float = 21.0
+    hough_min_radius: float = 18.0
+    hough_max_radius: float = 32.0
     hough_preferred_radius: float = 0.0
     hough_edge_support_threshold: float = 0.15
     hough_edge_neighborhood: int = 2

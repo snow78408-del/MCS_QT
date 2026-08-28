@@ -41,11 +41,6 @@ _LOGGER = logging.getLogger(__name__)
 _INSPECTION_TIMEOUT_MS = 15_000
 
 _INTEGER_PARAMETERS = {
-    "gaussian_blur_size",
-    "hough_edge_neighborhood",
-    "hough_work_max_width",
-    "hough_work_max_height",
-    "hough_max_candidates",
     "channel_region.sample_frames",
     "channel_region.work_max_width",
     "channel_region.work_max_height",
@@ -58,25 +53,10 @@ _INTEGER_PARAMETERS = {
 # Algorithm-safe slider ranges: (minimum, maximum, step). Text entry remains
 # available for exact values, while sliders cover the useful operating range.
 _PARAMETER_RANGES: dict[str, tuple[float, float, float]] = {
-    "gaussian_blur_size": (1.0, 31.0, 2.0),
-    "hough_param1": (10.0, 300.0, 1.0),
-    "hough_dp": (1.0, 3.0, 0.05),
-    "hough_min_distance": (0.0, 200.0, 1.0),
-    "hough_param2": (5.0, 100.0, 1.0),
     "min_radius": (1.0, 300.0, 1.0),
     "max_radius": (2.0, 300.0, 1.0),
-    "hough_min_radius": (1.0, 300.0, 1.0),
-    "hough_max_radius": (2.0, 300.0, 1.0),
-    "hough_edge_support_threshold": (0.0, 1.0, 0.01),
-    "hough_edge_neighborhood": (0.0, 8.0, 1.0),
-    "hough_work_max_width": (160.0, 3840.0, 20.0),
-    "hough_work_max_height": (120.0, 2160.0, 20.0),
-    "hough_max_candidates": (1.0, 500.0, 1.0),
-    "expected_radius": (0.0, 300.0, 1.0),
-    "expected_radius_tolerance_ratio": (0.0, 1.0, 0.01),
-    "candidate_min_visible_circle_ratio": (0.0, 1.0, 0.01),
-    "candidate_full_circle_ratio": (0.0, 1.0, 0.01),
-    "cut_line_ratio": (0.0, 1.0, 0.01),
+    "min_center_distance": (1.0, 300.0, 1.0),
+    "sensitivity": (0.0, 1.0, 0.01),
     "channel_region.sample_frames": (1.0, 48.0, 1.0),
     "channel_region.min_confidence": (0.0, 1.0, 0.01),
     "channel_region.frequency_window_ratio": (0.005, 0.20, 0.005),
@@ -129,8 +109,7 @@ def _validate_tuning_configs(
             raise ValueError(f"参数 {key} 必须在 {minimum:g}–{maximum:g} 之间")
 
     relationships = (
-        (detector_config.min_radius, detector_config.max_radius, "绝对最小半径不能大于最大半径"),
-        (detector_config.hough_min_radius, detector_config.hough_max_radius, "Hough 最小半径不能大于最大半径"),
+        (detector_config.min_radius, detector_config.max_radius, "最小半径不能大于最大半径"),
         (channel_config.min_width_ratio, channel_config.max_width_ratio, "最小管宽比例不能大于最大管宽比例"),
     )
     for lower, upper, message in relationships:
@@ -701,42 +680,15 @@ class TuningWindow(QWidget):
                 self._number("channel_region.straightness_weight", "直线性质权重", channel.straightness_weight),
                 self._number("channel_region.geometry_weight", "区域几何权重", channel.geometry_weight),
             ],
-            6: [
-                self._check("enable_intensity_normalization", "启用归一化", config.enable_intensity_normalization),
-            ],
-            7: [
-                self._check("enable_gaussian_blur", "启用高斯平滑", config.enable_gaussian_blur),
-                self._number("gaussian_blur_size", "高斯核大小", config.gaussian_blur_size),
-            ],
-            8: [
-                self._check("enable_hough_clahe", "启用 CLAHE", config.enable_hough_clahe),
-                self._check("enable_hough_median_blur", "启用中值滤波", config.enable_hough_median_blur),
-                self._number("hough_work_max_width", "最大工作宽度", config.hough_work_max_width),
-                self._number("hough_work_max_height", "最大工作高度", config.hough_work_max_height),
-            ],
-            9: [
-                self._number("hough_param1", "Hough/Canny 梯度阈值", config.hough_param1),
-                self._number("hough_edge_neighborhood", "边缘支撑邻域", config.hough_edge_neighborhood),
-            ],
             10: [
                 self._check("enable_hough_candidates", "启用全帧 Hough", config.enable_hough_candidates),
-                self._number("hough_dp", "累加器分辨率 dp", config.hough_dp),
-                self._number("hough_min_distance", "最小圆心距离（0=自动）", config.hough_min_distance),
-                self._number("hough_param2", "Hough 累加阈值", config.hough_param2),
-                self._number("hough_min_radius", "Hough 最小半径", config.hough_min_radius),
-                self._number("hough_max_radius", "Hough 最大半径", config.hough_max_radius),
+                self._number("min_radius", "最小半径", config.min_radius),
+                self._number("max_radius", "最大半径", config.max_radius),
+                self._number("min_center_distance", "最小圆心距离", config.min_center_distance),
+                self._number("sensitivity", "识别敏感度", config.sensitivity),
             ],
             11: [
-                self._number("min_radius", "绝对最小半径", config.min_radius),
-                self._number("max_radius", "绝对最大半径", config.max_radius),
-                self._number("hough_edge_support_threshold", "最小边缘支撑", config.hough_edge_support_threshold),
-                self._number("candidate_min_visible_circle_ratio", "最小可见圆周", config.candidate_min_visible_circle_ratio),
-                self._number("cut_line_ratio", "检测截止线比例", config.cut_line_ratio),
-                self._check("enable_expected_size_filter", "启用标定尺寸过滤", config.enable_expected_size_filter),
-                self._check("expected_size_hard_gate", "严格尺寸过滤", config.expected_size_hard_gate),
-                self._number("expected_radius", "期望液滴半径（px）", config.expected_radius),
-                self._number("expected_radius_tolerance_ratio", "半径容差比例", config.expected_radius_tolerance_ratio),
-                self._number("candidate_full_circle_ratio", "直径有效完整度", config.candidate_full_circle_ratio),
+                self._number("sensitivity", "识别敏感度", config.sensitivity),
             ],
         }
         return controls.get(index, [])
