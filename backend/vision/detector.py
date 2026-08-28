@@ -128,10 +128,13 @@ class DropletDetector:
         minimum = int(round(float(self._config.min_radius)))
         maximum = int(round(float(self._config.max_radius)))
         sensitivity = float(self._config.sensitivity)
+        radius_adjustment_percent = float(self._config.radius_adjustment_percent)
         if minimum <= 0 or maximum < minimum:
             raise ValueError("液滴检测半径范围无效")
         if not 0.0 <= sensitivity <= 1.0:
             raise ValueError("液滴检测敏感度必须在 0 到 1 之间")
+        if not -20.0 <= radius_adjustment_percent <= 20.0:
+            raise ValueError("液滴整体尺寸调节必须在 -20% 到 20% 之间")
 
         circles = cv2.HoughCircles(
             corrected,
@@ -149,10 +152,12 @@ class DropletDetector:
         result = np.rint(circles[0]).astype(np.int32)
         result = result[np.lexsort((result[:, 0], result[:, 1]))]
         centers = [np.asarray((x, y), dtype=np.float32) for x, y, _radius in result]
-        radii = [float(radius) for _x, _y, radius in result]
+        raw_radii = [float(radius) for _x, _y, radius in result]
         if trace is not None:
             trace["raw_centers"] = list(centers)
-            trace["raw_radii"] = list(radii)
+            trace["raw_radii"] = list(raw_radii)
+        scale = 1.0 + radius_adjustment_percent / 100.0
+        radii = [radius * scale for radius in raw_radii]
         return centers, radii
 
     def _candidate_diameter_valid(

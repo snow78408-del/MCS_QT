@@ -79,7 +79,7 @@ class VisionTuningTests(unittest.TestCase):
         )
         self.assertEqual(len(results), 4)
         self.assertGreaterEqual(results[0].score, results[-1].score)
-        self.assertEqual(base.sensitivity, 0.96)
+        self.assertEqual(base.sensitivity, 0.98)
 
     def test_unknown_search_field_is_rejected(self):
         with self.assertRaises(ValueError):

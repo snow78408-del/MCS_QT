@@ -87,7 +87,10 @@ class DetectorConfig:
     min_center_distance: float = 32.0
     # Friendly 0..1 control mapped to the Hough accumulator threshold as
     # ``45 - 25 * sensitivity``. Higher values detect weaker circles.
-    sensitivity: float = 0.96
+    sensitivity: float = 0.98
+    # Apply one final measurement correction after Hough detection. Positive
+    # values enlarge every reported radius; negative values shrink it.
+    radius_adjustment_percent: float = 0.0
     min_center_distance_radius_ratio: float = 0.75
     deduplicate_distance_ratio: float = 0.60
     deduplicate_min_distance: float = 6.0

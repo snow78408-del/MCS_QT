@@ -219,9 +219,12 @@ def inspect_frame(
         ),
         PipelineStage(
             "8. 最终识别结果",
-            "直接显示 Hough 输出，不执行边缘支撑、尺寸门控或候选去重。",
+            "对 Hough 输出半径进行统一百分比调节后显示；调节后的尺寸会用于跟踪、统计和 PID。",
             annotate_frame(detection_frame, result),
-            parameters=f"敏感度 {config.sensitivity:g}",
+            parameters=(
+                f"敏感度 {config.sensitivity:g}；"
+                f"整体尺寸调节 {config.radius_adjustment_percent:+g}%"
+            ),
             statistics=f"最终液滴 {len(centers)} 个",
         ),
     ]

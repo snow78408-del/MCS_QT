@@ -26,6 +26,7 @@ from .config import APP_TITLE, DEFAULT_REFRESH_INTERVAL_MS
 from .runtime_logging import create_runtime_logger
 from .settings_store import FrontendSettingsStore
 from .vision_tuning import TuningWindow
+from .vision_tuning_store import VisionTuningSettingsStore
 from .paths import ensure_user_subdir
 from .pid_replay import PIDReplayDialog
 
@@ -1294,14 +1295,19 @@ class TuningPage(Page):
         if not tuning_sample:
             video = str(app.frontend_config.get("video_source", ""))
             tuning_sample = video if app.frontend_config.get("video_source_type") == "file" else ""
-        self.workbench = TuningWindow(tuning_sample, self, app.save_tuning_sample)
+        self.workbench = TuningWindow(
+            tuning_sample,
+            self,
+            app.save_tuning_sample,
+            settings_store=app.vision_tuning_settings_store,
+        )
         layout.addWidget(self.workbench, 1)
 
 
 class FrontendApp(QMainWindow):
     def __init__(self, orchestrator=None, settings_store=None):
         super().__init__(); self.setWindowTitle(APP_TITLE); self.resize(1360,860); self.setMinimumSize(QSize(1280,760))
-        self.runtime_logger=create_runtime_logger(); self.orchestrator=orchestrator or OrchestratorService(logger=self.runtime_logger); self.settings_store=settings_store or FrontendSettingsStore(); self.frontend_config=self.settings_store.load(); self.refresh_interval_ms=DEFAULT_REFRESH_INTERVAL_MS
+        self.runtime_logger=create_runtime_logger(); self.orchestrator=orchestrator or OrchestratorService(logger=self.runtime_logger); self.settings_store=settings_store or FrontendSettingsStore(); self.vision_tuning_settings_store=VisionTuningSettingsStore(); self.frontend_config=self.settings_store.load(); self.refresh_interval_ms=DEFAULT_REFRESH_INTERVAL_MS
         self.pool=QThreadPool.globalInstance(); self.workers=set(); self.current=None; self._build(); self.show_page("parameter")
 
     def _build(self):

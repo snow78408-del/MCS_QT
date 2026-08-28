@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import json
 import logging
 import math
 import sys
 import traceback
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable
 
@@ -36,6 +34,8 @@ from PySide6.QtWidgets import (
 from backend.vision.config import ChannelRegionConfig, DetectorConfig
 from backend.vision.tuning import PipelineStage, TuningFrame, inspect_frame, read_video_frames
 
+from .vision_tuning_store import TuningLoadStatus, VisionTuningSettingsStore
+
 
 _LOGGER = logging.getLogger(__name__)
 _INSPECTION_TIMEOUT_MS = 15_000
@@ -57,6 +57,7 @@ _PARAMETER_RANGES: dict[str, tuple[float, float, float]] = {
     "max_radius": (2.0, 300.0, 1.0),
     "min_center_distance": (1.0, 300.0, 1.0),
     "sensitivity": (0.0, 1.0, 0.01),
+    "radius_adjustment_percent": (-20.0, 20.0, 1.0),
     "channel_region.sample_frames": (1.0, 48.0, 1.0),
     "channel_region.min_confidence": (0.0, 1.0, 0.01),
     "channel_region.frequency_window_ratio": (0.005, 0.20, 0.005),
@@ -439,6 +440,7 @@ class TuningWindow(QWidget):
         initial_video: str = "",
         parent: QWidget | None = None,
         on_sample_loaded: Callable[[str], None] | None = None,
+        settings_store: VisionTuningSettingsStore | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("液滴识别算法调参工作台")
@@ -446,11 +448,13 @@ class TuningWindow(QWidget):
         self.frames: list[TuningFrame] = []
         self.frame_pos = 0
         self._on_sample_loaded = on_sample_loaded
+        self._settings_store = settings_store
         self._expanded_stages: set[int] = set()
-        self.original_config = DetectorConfig()
-        self.current_config = DetectorConfig()
-        self.original_channel_config = ChannelRegionConfig()
-        self.current_channel_config = ChannelRegionConfig()
+        detector_config, channel_config, self._initial_parameter_status = self._load_initial_parameters()
+        self.original_config = DetectorConfig(**vars(detector_config))
+        self.current_config = DetectorConfig(**vars(detector_config))
+        self.original_channel_config = ChannelRegionConfig(**vars(channel_config))
+        self.current_channel_config = ChannelRegionConfig(**vars(channel_config))
         self._last_good_config = DetectorConfig(**vars(self.current_config))
         self._last_good_channel_config = ChannelRegionConfig(**vars(self.current_channel_config))
         self._last_good_stages: list[PipelineStage] = []
@@ -472,6 +476,39 @@ class TuningWindow(QWidget):
         self._inspection_timeout.setInterval(_INSPECTION_TIMEOUT_MS)
         self._inspection_timeout.timeout.connect(self._inspection_timed_out)
         self._build(initial_video)
+        if self._initial_parameter_status:
+            self.status.setText(self._initial_parameter_status)
+
+    def _load_initial_parameters(self) -> tuple[DetectorConfig, ChannelRegionConfig, str]:
+        defaults = (DetectorConfig(), ChannelRegionConfig())
+        if self._settings_store is None:
+            return defaults[0], defaults[1], ""
+        try:
+            result = self._settings_store.load_or_create()
+            if result.status is not TuningLoadStatus.INVALID:
+                _validate_tuning_configs(result.detector, result.channel_region)
+                message = "已创建并加载默认算法参数。" if result.status is TuningLoadStatus.CREATED else "已加载用户算法参数。"
+                return result.detector, result.channel_region, message
+            error = result.error
+        except Exception as exc:
+            error = str(exc)
+
+        answer = QMessageBox.question(
+            self,
+            "算法参数版本不兼容",
+            "用户算法参数与当前算法格式不一致，可能由算法更新导致。\n"
+            f"详情：{error}\n\n是否删除老版本参数并重建默认参数？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer == QMessageBox.Yes:
+            try:
+                detector, channel = self._settings_store.delete_and_create_defaults()
+                return detector, channel, "已删除老版本参数，并重建默认算法参数。"
+            except Exception as exc:
+                QMessageBox.warning(self, "参数重建失败", str(exc))
+                return defaults[0], defaults[1], "参数文件重建失败，本次使用默认算法参数。"
+        return defaults[0], defaults[1], "已保留老版本参数文件，本次使用默认算法参数。"
 
     def _build(self, initial_video: str) -> None:
         layout = QVBoxLayout(self)
@@ -687,8 +724,19 @@ class TuningWindow(QWidget):
                 self._number("min_center_distance", "最小圆心距离", config.min_center_distance),
                 self._number("sensitivity", "识别敏感度", config.sensitivity),
             ],
+            7: [
+                self._number(
+                    "radius_adjustment_percent",
+                    "液滴整体尺寸调节（%）",
+                    config.radius_adjustment_percent,
+                ),
+            ],
             11: [
-                self._number("sensitivity", "识别敏感度", config.sensitivity),
+                self._number(
+                    "radius_adjustment_percent",
+                    "液滴整体尺寸调节（%）",
+                    config.radius_adjustment_percent,
+                ),
             ],
         }
         return controls.get(index, [])
@@ -895,29 +943,25 @@ class TuningWindow(QWidget):
             self._expanded_stages.discard(index)
 
     def _save(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "保存检测参数",
-            "droplet_detector_tuning.json",
-            "JSON (*.json)",
-        )
-        if path:
-            Path(path).write_text(
-                json.dumps(
-                    {
-                        "detector": asdict(self.current_config),
-                        "channel_region": asdict(self.current_channel_config),
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
+        if self._settings_store is None:
+            QMessageBox.warning(self, "保存失败", "未配置算法参数存储位置。")
+            return
+        try:
+            _validate_tuning_configs(self.current_config, self.current_channel_config)
+            self._settings_store.save(self.current_config, self.current_channel_config)
+        except Exception as exc:
+            QMessageBox.warning(self, "保存失败", str(exc))
+            return
+
+        self.original_config = DetectorConfig(**vars(self.current_config))
+        self.original_channel_config = ChannelRegionConfig(**vars(self.current_channel_config))
+        self.reset.setEnabled(False)
+        self.status.setText("算法参数已保存，并替代原用户参数。")
 
 
 def main(video: str = "") -> None:
     app = QApplication.instance() or QApplication(sys.argv)
-    window = TuningWindow(video)
+    window = TuningWindow(video, settings_store=VisionTuningSettingsStore())
     window.show()
     raise SystemExit(app.exec())
 

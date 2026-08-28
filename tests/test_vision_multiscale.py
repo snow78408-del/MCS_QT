@@ -65,6 +65,27 @@ class DropletDetectorTests(unittest.TestCase):
         self.assertEqual([center.tolist() for center in result.centers], [[20.0, 30.0], [81.0, 30.0], [91.0, 70.0]])
         self.assertEqual(result.radii, [20.0, 20.0, 23.0])
 
+    def test_final_radius_adjustment_scales_all_reported_sizes(self) -> None:
+        image = np.full((120, 180), 180, dtype=np.uint8)
+        circles = np.asarray([[[40.0, 40.0, 20.0], [100.0, 70.0, 25.0]]])
+
+        for percent, expected in ((20.0, [24.0, 30.0]), (-20.0, [16.0, 20.0])):
+            with self.subTest(percent=percent):
+                config = default_config()
+                config.detector.radius_adjustment_percent = percent
+                detector = DropletDetector(config.detector, config.debug)
+                with patch("backend.vision.detector.cv2.HoughCircles", return_value=circles):
+                    result = detector.detect(image)
+                self.assertEqual(result.radii, expected)
+
+    def test_invalid_final_radius_adjustment_is_rejected(self) -> None:
+        config = default_config()
+        config.detector.radius_adjustment_percent = 21.0
+        with self.assertRaisesRegex(ValueError, "整体尺寸调节"):
+            DropletDetector(config.detector, config.debug).detect(
+                np.zeros((80, 80), dtype=np.uint8)
+            )
+
     def test_preprocessing_matches_illumination_correction_pipeline(self) -> None:
         image = np.arange(120 * 180, dtype=np.uint8).reshape(120, 180)
         detector = DropletDetector(default_config().detector, default_config().debug)

@@ -9,12 +9,13 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import numpy as np
 import pytest
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QGridLayout, QWidget
+from PySide6.QtWidgets import QApplication, QGridLayout, QMessageBox, QWidget
 
 from backend.vision.config import ChannelRegionConfig, DetectorConfig
 from backend.vision.tuning import PipelineStage, TuningFrame
 import frontend.vision_tuning as vision_tuning_ui
 from frontend.vision_tuning import StageCard, TuningWindow, _validate_tuning_configs
+from frontend.vision_tuning_store import TuningLoadStatus, VisionTuningSettingsStore
 
 
 def _application() -> QApplication:
@@ -80,6 +81,20 @@ def test_invalid_algorithm_parameters_are_rejected_before_inspection() -> None:
     with pytest.raises(ValueError, match="最小半径不能大于最大半径"):
         _validate_tuning_configs(detector, ChannelRegionConfig())
 
+    detector = DetectorConfig(radius_adjustment_percent=21)
+    with pytest.raises(ValueError, match="radius_adjustment_percent"):
+        _validate_tuning_configs(detector, ChannelRegionConfig())
+
+
+def test_final_stage_exposes_global_radius_adjustment() -> None:
+    window = TuningWindow()
+
+    controls = window._controls_for_stage(11)
+
+    assert [control["key"] for control in controls] == ["radius_adjustment_percent"]
+    assert controls[0]["label"] == "液滴整体尺寸调节（%）"
+    window.close()
+
 
 def test_algorithm_exception_rolls_back_without_escaping_gui_thread(monkeypatch) -> None:
     app = _application()
@@ -107,6 +122,40 @@ def test_algorithm_exception_rolls_back_without_escaping_gui_thread(monkeypatch)
 
     assert window.current_config.hough_dp == original_dp
     assert "已回退到上次有效参数" in window.status.text()
+    window.close()
+
+
+def test_incompatible_saved_parameters_prompt_and_can_be_recreated(tmp_path, monkeypatch) -> None:
+    _application()
+    path = tmp_path / "vision_tuning_parameters.json"
+    path.write_text("old algorithm format", encoding="utf-8")
+    prompts: list[str] = []
+
+    def answer(_parent, _title, message, *_args):
+        prompts.append(message)
+        return QMessageBox.Yes
+
+    monkeypatch.setattr(QMessageBox, "question", answer)
+    store = VisionTuningSettingsStore(path)
+    window = TuningWindow(settings_store=store)
+
+    assert prompts and "是否删除老版本参数" in prompts[0]
+    assert store.load_or_create().status is TuningLoadStatus.LOADED
+    assert "重建默认算法参数" in window.status.text()
+    window.close()
+
+
+def test_save_button_overwrites_user_algorithm_parameters(tmp_path) -> None:
+    _application()
+    store = VisionTuningSettingsStore(tmp_path / "vision_tuning_parameters.json")
+    window = TuningWindow(settings_store=store)
+    window.current_config.sensitivity = 0.71
+
+    window._save()
+
+    assert store.load_or_create().detector.sensitivity == 0.71
+    assert "替代原用户参数" in window.status.text()
+    assert not window.reset.isEnabled()
     window.close()
 
 
