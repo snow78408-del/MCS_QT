@@ -266,7 +266,8 @@ class ParameterPage(Page):
         self.interval = self.field(form, "控制周期 (ms)", cfg.get("control_interval_ms", 500))
         calibration_row=QWidget(); calibration_layout=QHBoxLayout(calibration_row); calibration_layout.setContentsMargins(0,0,0,0)
         self.calibration_path=QLineEdit(str(cfg.get("calibration_path",""))); calibration_button=QPushButton("选择…"); calibration_button.clicked.connect(self._browse_calibration)
-        calibration_layout.addWidget(self.calibration_path,1); calibration_layout.addWidget(calibration_button); form.addRow("版本化标定 JSON",calibration_row)
+        calibration_layout.addWidget(self.calibration_path,1); calibration_layout.addWidget(calibration_button); form.addRow("版本化标定 JSON（可选）",calibration_row)
+        form.addRow("", QLabel("没有标定文件可留空；将使用像元尺寸÷放大倍率，仅允许预览，闭环控制前需补充标定 JSON。"))
         button = QPushButton("保存并选择视频源"); button.clicked.connect(self.submit); form.addRow("", button)
         layout.addWidget(box); layout.addStretch()
 
@@ -280,6 +281,7 @@ class ParameterPage(Page):
             interval = int(float(self.interval.text()))
             if min(target, mag, pixel) <= 0 or not 500<=interval<=30000: raise ValueError("光学参数必须大于 0，控制周期必须为 500–30000 ms")
             calibration_path=self.calibration_path.text().strip(); calibration={}
+            # 标定文件是闭环控制的前置条件，但不应阻止用户先进入视频/预览步骤。
             scale=pixel/mag
             if calibration_path:
                 record=load_calibration(calibration_path); calibration=record.to_dict(); scale=record.pixel_to_micron
