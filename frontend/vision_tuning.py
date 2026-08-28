@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+import logging
+import math
 import sys
+import traceback
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable
 
 import cv2
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal, Slot
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -33,6 +36,9 @@ from PySide6.QtWidgets import (
 from backend.vision.config import ChannelRegionConfig, DetectorConfig
 from backend.vision.tuning import PipelineStage, TuningFrame, inspect_frame, read_video_frames
 
+
+_LOGGER = logging.getLogger(__name__)
+_INSPECTION_TIMEOUT_MS = 15_000
 
 _INTEGER_PARAMETERS = {
     "gaussian_blur_size",
@@ -107,6 +113,65 @@ _PARAMETER_RANGES: dict[str, tuple[float, float, float]] = {
     "channel_region.straightness_weight": (0.0, 1.0, 0.01),
     "channel_region.geometry_weight": (0.0, 1.0, 0.01),
 }
+
+
+def _config_value(
+    detector_config: DetectorConfig,
+    channel_config: ChannelRegionConfig,
+    key: str,
+) -> int | float:
+    if key.startswith("channel_region."):
+        return getattr(channel_config, key.split(".", 1)[1])
+    return getattr(detector_config, key)
+
+
+def _validate_tuning_configs(
+    detector_config: DetectorConfig,
+    channel_config: ChannelRegionConfig,
+) -> None:
+    """Reject values known to make OpenCV invalid or pathologically expensive."""
+    for key, (minimum, maximum, _step) in _PARAMETER_RANGES.items():
+        value = _config_value(detector_config, channel_config, key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"参数 {key} 必须是数值")
+        if not math.isfinite(float(value)):
+            raise ValueError(f"参数 {key} 必须是有限数值")
+        if not minimum <= float(value) <= maximum:
+            raise ValueError(f"参数 {key} 必须在 {minimum:g}–{maximum:g} 之间")
+
+    relationships = (
+        (detector_config.min_radius, detector_config.max_radius, "绝对最小半径不能大于最大半径"),
+        (detector_config.hough_min_radius, detector_config.hough_max_radius, "Hough 最小半径不能大于最大半径"),
+        (channel_config.min_width_ratio, channel_config.max_width_ratio, "最小管宽比例不能大于最大管宽比例"),
+    )
+    for lower, upper, message in relationships:
+        if float(lower) > float(upper):
+            raise ValueError(message)
+    if channel_config.canny_low >= channel_config.canny_high:
+        raise ValueError("Canny 低阈值必须小于高阈值")
+
+
+class _InspectionSignals(QObject):
+    succeeded = Signal(int, object)
+    failed = Signal(int, object, str)
+    finished = Signal(int)
+
+
+class _InspectionWorker(QRunnable):
+    def __init__(self, request_id: int, task: Callable[[], object]) -> None:
+        super().__init__()
+        self.request_id = request_id
+        self.task = task
+        self.signals = _InspectionSignals()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            self.signals.succeeded.emit(self.request_id, self.task())
+        except Exception as exc:
+            self.signals.failed.emit(self.request_id, exc, traceback.format_exc())
+        finally:
+            self.signals.finished.emit(self.request_id)
 
 
 def _pixmap(image) -> QPixmap:
@@ -418,10 +483,26 @@ class TuningWindow(QWidget):
         self.current_config = DetectorConfig()
         self.original_channel_config = ChannelRegionConfig()
         self.current_channel_config = ChannelRegionConfig()
+        self._last_good_config = DetectorConfig(**vars(self.current_config))
+        self._last_good_channel_config = ChannelRegionConfig(**vars(self.current_channel_config))
+        self._last_good_stages: list[PipelineStage] = []
+        self._config_revision = 0
+        self._sample_revision = 0
+        self._request_sequence = 0
+        self._active_request: int | None = None
+        self._request_context: dict[int, tuple[int, int, int, DetectorConfig, ChannelRegionConfig]] = {}
+        self._workers: dict[int, _InspectionWorker] = {}
+        self._pending_refresh = False
+        self._timed_out_requests: set[int] = set()
+        self._inspection_pool = QThreadPool.globalInstance()
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setSingleShot(True)
         self._refresh_timer.setInterval(500)
         self._refresh_timer.timeout.connect(self._redraw)
+        self._inspection_timeout = QTimer(self)
+        self._inspection_timeout.setSingleShot(True)
+        self._inspection_timeout.setInterval(_INSPECTION_TIMEOUT_MS)
+        self._inspection_timeout.timeout.connect(self._inspection_timed_out)
         self._build(initial_video)
 
     def _build(self, initial_video: str) -> None:
@@ -490,6 +571,8 @@ class TuningWindow(QWidget):
             self._load()
 
     def _load(self) -> None:
+        self._sample_revision += 1
+        self._refresh_timer.stop()
         try:
             path = self.video.text().strip()
             suffix = Path(path).suffix.lower()
@@ -511,7 +594,9 @@ class TuningWindow(QWidget):
             self._redraw()
         except Exception as exc:
             self.frames = []
+            self._pending_refresh = False
             self.slider.setEnabled(False)
+            self.status.setText(f"加载失败：{exc}")
             QMessageBox.warning(self, "加载失败", str(exc))
 
     def _slider_changed(self, value: int) -> None:
@@ -545,6 +630,11 @@ class TuningWindow(QWidget):
         except (TypeError, ValueError):
             self.status.setText(f"参数 {key} 尚未输入完成")
             return
+        except Exception as exc:
+            _LOGGER.exception("更新调参字段 %s 失败", key)
+            self.status.setText(f"参数 {key} 更新失败：{exc}")
+            return
+        self._config_revision += 1
         self.reset.setEnabled(self._has_modified_parameters())
         if self.frames:
             self.status.setText("参数已修改，正在等待自动刷新…")
@@ -556,6 +646,7 @@ class TuningWindow(QWidget):
         if not hasattr(original, original_field):
             return
         setattr(owner, field, getattr(original, original_field))
+        self._config_revision += 1
         self.reset.setEnabled(self._has_modified_parameters())
         if self.frames:
             self.status.setText(f"参数 {key} 已恢复原设定")
@@ -577,6 +668,7 @@ class TuningWindow(QWidget):
     def _reset_parameters(self) -> None:
         self.current_config = DetectorConfig(**vars(self.original_config))
         self.current_channel_config = ChannelRegionConfig(**vars(self.original_channel_config))
+        self._config_revision += 1
         self.reset.setEnabled(False)
         if self.frames:
             self._redraw()
@@ -689,20 +781,153 @@ class TuningWindow(QWidget):
     def _redraw(self) -> None:
         if not self.frames:
             return
+        if self._active_request is not None:
+            self._pending_refresh = True
+            self.status.setText("算法仍在后台计算；已记录最新参数，完成后自动刷新。")
+            return
+
+        detector_config = DetectorConfig(**vars(self.current_config))
+        channel_config = ChannelRegionConfig(**vars(self.current_channel_config))
         try:
-            result, stages = inspect_frame(
-                self.frames[self.frame_pos].image,
-                self.current_config,
-                channel_config=self.current_channel_config,
-                channel_frames=[item.image for item in self.frames],
-            )
-            self._show_stages(stages)
-            frame_index = self.frames[self.frame_pos].index
-            self.status.setText(
-                f"帧 {frame_index}（{self.frame_pos + 1}/{len(self.frames)}）：检测到 {len(result.centers)} 个液滴"
-            )
+            _validate_tuning_configs(detector_config, channel_config)
         except Exception as exc:
-            self.status.setText(f"识别失败：{exc}")
+            self._rollback_after_failure(f"参数无效：{exc}")
+            return
+
+        frame_position = self.frame_pos
+        sample_revision = self._sample_revision
+        config_revision = self._config_revision
+        frame = self.frames[frame_position].image
+        channel_frames = [item.image for item in self.frames]
+        self._request_sequence += 1
+        request_id = self._request_sequence
+
+        def task() -> object:
+            return inspect_frame(
+                frame,
+                detector_config,
+                channel_config=channel_config,
+                channel_frames=channel_frames,
+            )
+
+        worker = _InspectionWorker(request_id, task)
+        worker.signals.succeeded.connect(self._inspection_succeeded)
+        worker.signals.failed.connect(self._inspection_failed)
+        worker.signals.finished.connect(self._inspection_finished)
+        self._workers[request_id] = worker
+        self._request_context[request_id] = (
+            sample_revision,
+            config_revision,
+            frame_position,
+            detector_config,
+            channel_config,
+        )
+        self._active_request = request_id
+        self._pending_refresh = False
+        self.status.setText("正在后台运行识别算法…")
+        self._inspection_timeout.start()
+        self._inspection_pool.start(worker)
+
+    def _request_is_stale(self, request_id: int) -> bool:
+        context = self._request_context.get(request_id)
+        if context is None:
+            return True
+        sample_revision, config_revision, frame_position, _detector, _channel = context
+        return (
+            sample_revision != self._sample_revision
+            or config_revision != self._config_revision
+            or frame_position != self.frame_pos
+            or not self.frames
+        )
+
+    def _inspection_succeeded(self, request_id: int, payload: object) -> None:
+        if request_id != self._active_request:
+            return
+        timed_out = request_id in self._timed_out_requests
+        stale = self._request_is_stale(request_id)
+        context = self._request_context.get(request_id)
+        self._complete_active_request(request_id)
+        if timed_out or stale or context is None:
+            self._start_pending_refresh()
+            return
+
+        try:
+            result, stages = payload
+            self._show_stages(stages)
+        except Exception as exc:
+            _LOGGER.exception("显示识别算法结果失败")
+            self._rollback_after_failure(f"结果显示失败：{exc}")
+            return
+
+        _sample_revision, _config_revision, frame_position, detector_config, channel_config = context
+        self._last_good_config = DetectorConfig(**vars(detector_config))
+        self._last_good_channel_config = ChannelRegionConfig(**vars(channel_config))
+        self._last_good_stages = list(stages)
+        frame_index = self.frames[frame_position].index
+        self.status.setText(
+            f"帧 {frame_index}（{frame_position + 1}/{len(self.frames)}）：检测到 {len(result.centers)} 个液滴"
+        )
+        self._start_pending_refresh()
+
+    def _inspection_failed(self, request_id: int, exc: object, details: str) -> None:
+        if request_id != self._active_request:
+            return
+        timed_out = request_id in self._timed_out_requests
+        stale = self._request_is_stale(request_id)
+        self._complete_active_request(request_id)
+        _LOGGER.error("调参识别任务失败：%s\n%s", exc, details)
+        if timed_out or stale:
+            self._start_pending_refresh()
+            return
+        self._rollback_after_failure(f"识别失败：{exc}")
+
+    def _inspection_finished(self, request_id: int) -> None:
+        self._workers.pop(request_id, None)
+        if request_id != self._active_request:
+            self._request_context.pop(request_id, None)
+            self._timed_out_requests.discard(request_id)
+
+    def _inspection_timed_out(self) -> None:
+        request_id = self._active_request
+        if request_id is None:
+            return
+        self._timed_out_requests.add(request_id)
+        if not self._request_is_stale(request_id):
+            self._rollback_to_last_good()
+            self._pending_refresh = False
+            self.status.setText(
+                "识别算法运行超过 15 秒，已回退到上次有效参数；后台任务结束前界面仍可继续操作。"
+            )
+
+    def _complete_active_request(self, request_id: int) -> None:
+        if request_id != self._active_request:
+            return
+        self._inspection_timeout.stop()
+        self._active_request = None
+        self._request_context.pop(request_id, None)
+        self._timed_out_requests.discard(request_id)
+
+    def _start_pending_refresh(self) -> None:
+        if self._active_request is not None or not self._pending_refresh or not self.frames:
+            return
+        self._pending_refresh = False
+        QTimer.singleShot(0, self._redraw)
+
+    def _rollback_to_last_good(self) -> None:
+        self.current_config = DetectorConfig(**vars(self._last_good_config))
+        self.current_channel_config = ChannelRegionConfig(**vars(self._last_good_channel_config))
+        self._config_revision += 1
+        self.reset.setEnabled(self._has_modified_parameters())
+        if self._last_good_stages:
+            try:
+                self._show_stages(self._last_good_stages)
+            except Exception:
+                _LOGGER.exception("恢复上次成功的算法画面失败")
+
+    def _rollback_after_failure(self, message: str) -> None:
+        self._pending_refresh = False
+        self._rollback_to_last_good()
+        self.status.setText(f"{message}；已回退到上次有效参数。")
 
     def _show_stages(self, stages: list[PipelineStage]) -> None:
         scroll_position = self.stage_scroll.verticalScrollBar().value()
