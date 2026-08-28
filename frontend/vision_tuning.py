@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSlider,
     QVBoxLayout,
     QWidget,
@@ -234,6 +235,9 @@ class StageCard(QGroupBox):
         super().__init__(stage.name, parent)
         self.stage = stage
         self.setMinimumWidth(390)
+        # Cards should keep their own natural height.  Otherwise QGridLayout
+        # stretches the shorter card when its neighbour's parameters open.
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
         layout = QVBoxLayout(self)
 
         image = _StageImage()
@@ -252,18 +256,27 @@ class StageCard(QGroupBox):
 
         if controls:
             self.parameter_toggle = QPushButton()
-            self.parameter_toggle.setText("▾  收起参数" if expanded else "▸  展开参数")
+            self.parameter_toggle.setObjectName("stageParameterToggle")
             self.parameter_toggle.setCheckable(True)
             self.parameter_toggle.setChecked(expanded)
-            self.parameter_toggle.setFlat(True)
             self.parameter_toggle.setCursor(Qt.PointingHandCursor)
+            self.parameter_toggle.setMinimumHeight(38)
             self.parameter_toggle.setStyleSheet(
-                "QPushButton { color:#2563eb; border:none; padding:5px 4px; "
-                "text-align:left; font-weight:600; }"
-                "QPushButton:hover { color:#1d4ed8; background:#eff6ff; "
-                "border-radius:4px; }"
+                "QPushButton#stageParameterToggle {"
+                " background:#e7effc; color:#123f82; border:1px solid #7899cc;"
+                " border-radius:7px; padding:8px 11px; text-align:left; font-weight:700;"
+                "}"
+                "QPushButton#stageParameterToggle:hover {"
+                " background:#d7e6fb; border-color:#2563eb; color:#102f61;"
+                "}"
+                "QPushButton#stageParameterToggle:checked {"
+                " background:#1d4ed8; border-color:#1e3a8a; color:#ffffff;"
+                "}"
+                "QPushButton#stageParameterToggle:checked:hover { background:#1e40af; }"
+                "QPushButton#stageParameterToggle:focus { border:2px solid #f59e0b; padding:7px 10px; }"
             )
-            self.parameter_toggle.setAccessibleName(f"{stage.name} 参数调节")
+            self.parameter_toggle.setAccessibleName(f"{stage.name} 参数设置")
+            self._update_parameter_toggle(expanded)
             self.parameter_toggle.toggled.connect(self._toggle_parameters)
             layout.addWidget(self.parameter_toggle)
 
@@ -315,12 +328,15 @@ class StageCard(QGroupBox):
             statistics.setStyleSheet("font-weight:600;color:#166534")
             layout.addWidget(statistics)
 
+    def _update_parameter_toggle(self, expanded: bool) -> None:
+        self.parameter_toggle.setText("－  参数设置（点击收起）" if expanded else "＋  参数设置（点击展开）")
+        self.parameter_toggle.setAccessibleDescription(
+            "参数设置已展开，点击收起" if expanded else "参数设置已收起，点击展开"
+        )
+
     def _toggle_parameters(self, expanded: bool) -> None:
         self.parameter_panel.setVisible(expanded)
-        self.parameter_toggle.setText("▾  收起参数" if expanded else "▸  展开参数")
-        self.parameter_toggle.setAccessibleDescription(
-            "收起可调参数" if expanded else "展开可调参数"
-        )
+        self._update_parameter_toggle(expanded)
         self.expanded_changed.emit(expanded)
 
     def _control_widget(self, spec: dict[str, Any]) -> QWidget:
@@ -707,7 +723,9 @@ class TuningWindow(QWidget):
             )
             card.parameter_changed.connect(self._parameter_changed)
             card.parameter_reset.connect(self._reset_parameter)
-            self.stage_grid.addWidget(card, index // 2, index % 2)
+            # Top alignment keeps this card independent from a taller card in
+            # the same row, so opening one panel never stretches its neighbour.
+            self.stage_grid.addWidget(card, index // 2, index % 2, Qt.AlignTop)
         self.stage_grid.setRowStretch((len(stages) + 1) // 2, 1)
         QTimer.singleShot(0, lambda: self.stage_scroll.verticalScrollBar().setValue(scroll_position))
 
