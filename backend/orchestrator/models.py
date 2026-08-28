@@ -26,7 +26,6 @@ class SystemConfig:
     camera_parameters: dict[str, float | int | str] = field(default_factory=dict)
     recognition_roi: dict[str, Any] = field(default_factory=dict)
     calibration: dict[str, Any] = field(default_factory=dict)
-    detector_algorithm: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         finite_positive = {

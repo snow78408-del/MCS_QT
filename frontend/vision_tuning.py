@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import sys
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable
 
@@ -17,21 +19,18 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
     QScrollArea,
     QSlider,
-    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from backend.vision.algorithm_profiles import AlgorithmProfileStore
-from backend.vision.algorithms import get_algorithm, list_algorithms
-from backend.vision.tuning import PipelineStage, TuningFrame, read_video_frames
+from backend.vision.config import DetectorConfig
+from backend.vision.tuning import PipelineStage, TuningFrame, inspect_frame, read_video_frames
 
 
 _INTEGER_PARAMETERS = {
@@ -232,8 +231,22 @@ class StageCard(QGroupBox):
             form.setContentsMargins(0, 4, 0, 0)
             for spec in controls:
                 widget = self._control_widget(spec)
-                widget.setEnabled(bool(spec.get("editable", True)))
-                form.addRow(self._parameter_label(spec), widget)
+                label = QLabel(str(spec["label"]))
+                if spec.get("modified", False):
+                    label.setText(f'<span style="color:#dc2626">{spec["label"]}</span>')
+                    label.setTextFormat(Qt.RichText)
+                    label.setToolTip("此参数已偏离打开页面时的原设定")
+                    reset = QPushButton("恢复")
+                    reset.setFixedWidth(52)
+                    reset.setToolTip("恢复此参数的原设定")
+                    reset.clicked.connect(lambda _checked=False, name=str(spec["key"]): self.parameter_reset.emit(name))
+                    row = QWidget()
+                    row_layout = QHBoxLayout(row)
+                    row_layout.setContentsMargins(0, 0, 0, 0)
+                    row_layout.addWidget(widget, 1)
+                    row_layout.addWidget(reset)
+                    widget = row
+                form.addRow(label, widget)
             layout.addLayout(form)
 
         if stage.parameters:
@@ -246,45 +259,6 @@ class StageCard(QGroupBox):
             statistics.setWordWrap(True)
             statistics.setStyleSheet("font-weight:600;color:#166534")
             layout.addWidget(statistics)
-
-    def _parameter_label(self, spec: dict[str, Any]) -> QWidget:
-        key = str(spec["key"])
-        modified = bool(spec.get("modified", False))
-        row = QWidget()
-        row.setObjectName(f"parameter-label-{key}")
-        layout = QHBoxLayout(row)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
-
-        label = QLabel(str(spec["label"]))
-        if modified:
-            label.setStyleSheet("color:#dc2626")
-            label.setToolTip("此参数已偏离打开页面时的原设定")
-        layout.addWidget(label)
-
-        # The slot always keeps the same size, while the icon itself is only
-        # shown for a modified value. This prevents a reset action from being
-        # inserted into the slider row and shifting the card layout.
-        icon_slot = QWidget()
-        icon_slot.setFixedSize(24, 24)
-        icon_layout = QHBoxLayout(icon_slot)
-        icon_layout.setContentsMargins(1, 1, 1, 1)
-        reset = QToolButton()
-        reset.setObjectName(f"parameter-reset-{key}")
-        reset.setText("↶")
-        reset.setAccessibleName(f"恢复{spec['label']}的原设定")
-        reset.setToolTip("恢复此参数的原设定")
-        reset.setAutoRaise(True)
-        reset.setFixedSize(22, 22)
-        reset.setStyleSheet(
-            "QToolButton{color:#dc2626;border:0;font-size:16px;padding:0}"
-            "QToolButton:hover{background:#fee2e2;border-radius:4px}"
-        )
-        reset.clicked.connect(lambda _checked=False, name=key: self.parameter_reset.emit(name))
-        reset.setVisible(modified and bool(spec.get("editable", True)))
-        icon_layout.addWidget(reset)
-        layout.addWidget(icon_slot)
-        return row
 
     def _control_widget(self, spec: dict[str, Any]) -> QWidget:
         key = str(spec["key"])
@@ -314,7 +288,7 @@ class StageCard(QGroupBox):
                 minimum,
                 maximum,
                 step,
-                (key in _INTEGER_PARAMETERS) or (isinstance(value, int) and not isinstance(value, bool)),
+                key in _INTEGER_PARAMETERS,
             )
             widget.value_changed.connect(
                 lambda changed, name=key: self.parameter_changed.emit(name, changed)
@@ -348,23 +322,14 @@ class StageCard(QGroupBox):
 
 
 class TuningWindow(QWidget):
-    def __init__(
-        self,
-        initial_video: str = "",
-        parent: QWidget | None = None,
-        algorithm_store: AlgorithmProfileStore | None = None,
-    ) -> None:
+    def __init__(self, initial_video: str = "", parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("液滴识别算法调参工作台")
         self.resize(1280, 820)
         self.frames: list[TuningFrame] = []
         self.frame_pos = 0
-        self.algorithm_store = algorithm_store or AlgorithmProfileStore()
-        self.current_profile = self.algorithm_store.active_profile()
-        self.current_plugin = get_algorithm(self.current_profile.plugin_id)
-        self.original_config = self.current_plugin.build_config(self.current_profile.parameters)
-        self.current_config = self.current_plugin.build_config(self.current_profile.parameters)
-        self._profile_dirty = False
+        self.original_config = DetectorConfig()
+        self.current_config = DetectorConfig()
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setSingleShot(True)
         self._refresh_timer.setInterval(500)
@@ -375,36 +340,6 @@ class TuningWindow(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(8)
-
-        algorithm_bar = QHBoxLayout()
-        algorithm_bar.addWidget(QLabel("整体算法"))
-        self.algorithm_combo = QComboBox()
-        self.algorithm_combo.setMinimumWidth(260)
-        self.algorithm_combo.currentIndexChanged.connect(self._algorithm_selected)
-        algorithm_bar.addWidget(self.algorithm_combo, 1)
-        self.new_algorithm = QPushButton("新建…")
-        self.new_algorithm.clicked.connect(self._create_algorithm)
-        algorithm_bar.addWidget(self.new_algorithm)
-        self.copy_algorithm = QPushButton("复制…")
-        self.copy_algorithm.clicked.connect(self._copy_algorithm)
-        algorithm_bar.addWidget(self.copy_algorithm)
-        self.rename_algorithm = QPushButton("重命名…")
-        self.rename_algorithm.clicked.connect(self._rename_algorithm)
-        algorithm_bar.addWidget(self.rename_algorithm)
-        self.delete_algorithm = QPushButton("删除")
-        self.delete_algorithm.clicked.connect(self._delete_algorithm)
-        algorithm_bar.addWidget(self.delete_algorithm)
-        self.import_algorithm = QPushButton("导入…")
-        self.import_algorithm.clicked.connect(self._import_algorithm)
-        algorithm_bar.addWidget(self.import_algorithm)
-        self.export_algorithm = QPushButton("导出…")
-        self.export_algorithm.clicked.connect(self._export_algorithm)
-        algorithm_bar.addWidget(self.export_algorithm)
-        self.activate_algorithm = QPushButton("设为运行算法")
-        self.activate_algorithm.clicked.connect(self._activate_algorithm)
-        algorithm_bar.addWidget(self.activate_algorithm)
-        layout.addLayout(algorithm_bar)
-        self._reload_algorithm_combo(self.current_profile.profile_id)
 
         toolbar = QHBoxLayout()
         toolbar.addWidget(QLabel("样本"))
@@ -426,9 +361,9 @@ class TuningWindow(QWidget):
         next_frame = QPushButton("下一帧")
         next_frame.clicked.connect(lambda: self.slider.setValue(min(self.slider.maximum(), self.slider.value() + 1)))
         toolbar.addWidget(next_frame)
-        self.save_parameters = QPushButton("保存参数")
-        self.save_parameters.clicked.connect(self._save)
-        toolbar.addWidget(self.save_parameters)
+        save = QPushButton("保存参数")
+        save.clicked.connect(self._save)
+        toolbar.addWidget(save)
         self.reset = QPushButton("回退参数修改")
         self.reset.setEnabled(False)
         self.reset.clicked.connect(self._reset_parameters)
@@ -454,137 +389,6 @@ class TuningWindow(QWidget):
         layout.addWidget(self.stage_scroll, 1)
         if initial_video:
             QTimer.singleShot(0, self._load)
-
-    def _reload_algorithm_combo(self, selected_id: str) -> None:
-        self.algorithm_combo.blockSignals(True)
-        self.algorithm_combo.clear()
-        for profile in self.algorithm_store.profiles():
-            suffix = "  [内置只读]" if profile.protected else ""
-            if profile.profile_id == self.algorithm_store.active_profile_id:
-                suffix += "  [运行中]"
-            self.algorithm_combo.addItem(profile.name + suffix, profile.profile_id)
-        index = self.algorithm_combo.findData(selected_id)
-        self.algorithm_combo.setCurrentIndex(max(0, index))
-        self.algorithm_combo.blockSignals(False)
-        self._sync_algorithm_actions()
-
-    def _algorithm_selected(self, _index: int) -> None:
-        profile_id = self.algorithm_combo.currentData()
-        if not profile_id or profile_id == self.current_profile.profile_id:
-            return
-        if self._profile_dirty:
-            answer = QMessageBox.question(
-                self,
-                "放弃未保存参数？",
-                "当前算法有未保存的参数修改。切换算法将放弃这些修改，是否继续？",
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                self._reload_algorithm_combo(self.current_profile.profile_id)
-                return
-        self._select_profile(str(profile_id))
-
-    def _select_profile(self, profile_id: str) -> None:
-        self.current_profile = self.algorithm_store.get(profile_id)
-        self.current_plugin = get_algorithm(self.current_profile.plugin_id)
-        self.original_config = self.current_plugin.build_config(self.current_profile.parameters)
-        self.current_config = self.current_plugin.build_config(self.current_profile.parameters)
-        self._profile_dirty = False
-        self.reset.setEnabled(False)
-        self._reload_algorithm_combo(profile_id)
-        self._sync_algorithm_actions()
-        if self.frames:
-            self._redraw()
-        else:
-            self.status.setText(f"已选择算法：{self.current_profile.name}")
-
-    def _sync_algorithm_actions(self) -> None:
-        protected = self.current_profile.protected
-        active = self.current_profile.profile_id == self.algorithm_store.active_profile_id
-        self.rename_algorithm.setEnabled(not protected)
-        self.delete_algorithm.setEnabled(not protected and not active)
-        self.save_parameters.setEnabled(not protected)
-        self.activate_algorithm.setEnabled(not active)
-        self.activate_algorithm.setText("当前运行算法" if active else "设为运行算法")
-
-    def _create_algorithm(self) -> None:
-        plugins = list(list_algorithms())
-        labels = [f"{item.display_name} — {item.description}" for item in plugins]
-        selected, ok = QInputDialog.getItem(self, "新建算法", "选择算法实现", labels, 0, False)
-        if not ok:
-            return
-        plugin = plugins[labels.index(selected)]
-        name, ok = QInputDialog.getText(self, "新建算法", "算法名称")
-        if not ok:
-            return
-        try:
-            profile = self.algorithm_store.create(name, plugin.plugin_id)
-            self._select_profile(profile.profile_id)
-        except Exception as exc:
-            QMessageBox.warning(self, "新建失败", str(exc))
-
-    def _copy_algorithm(self) -> None:
-        suggested = self.algorithm_store.next_copy_name(self.current_profile.profile_id)
-        name, ok = QInputDialog.getText(self, "复制算法", "新算法名称", text=suggested)
-        if not ok:
-            return
-        try:
-            profile = self.algorithm_store.duplicate(self.current_profile.profile_id, name)
-            self._select_profile(profile.profile_id)
-        except Exception as exc:
-            QMessageBox.warning(self, "复制失败", str(exc))
-
-    def _rename_algorithm(self) -> None:
-        name, ok = QInputDialog.getText(self, "重命名算法", "算法名称", text=self.current_profile.name)
-        if not ok:
-            return
-        try:
-            profile = self.algorithm_store.rename(self.current_profile.profile_id, name)
-            self._select_profile(profile.profile_id)
-        except Exception as exc:
-            QMessageBox.warning(self, "重命名失败", str(exc))
-
-    def _delete_algorithm(self) -> None:
-        if QMessageBox.question(self, "删除算法", f"确定删除“{self.current_profile.name}”吗？") != QMessageBox.StandardButton.Yes:
-            return
-        try:
-            self.algorithm_store.delete(self.current_profile.profile_id)
-            self._select_profile(self.algorithm_store.active_profile_id)
-        except Exception as exc:
-            QMessageBox.warning(self, "删除失败", str(exc))
-
-    def _import_algorithm(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "导入算法", "", "算法 JSON (*.json)")
-        if not path:
-            return
-        try:
-            profile = self.algorithm_store.import_profile(path)
-            self._select_profile(profile.profile_id)
-        except Exception as exc:
-            QMessageBox.warning(self, "导入失败", str(exc))
-
-    def _export_algorithm(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "导出算法",
-            f"{self.current_profile.name}.json",
-            "算法 JSON (*.json)",
-        )
-        if not path:
-            return
-        try:
-            self.algorithm_store.export_profile(self.current_profile.profile_id, path)
-        except Exception as exc:
-            QMessageBox.warning(self, "导出失败", str(exc))
-
-    def _activate_algorithm(self) -> None:
-        try:
-            if self._profile_dirty and not self._save():
-                return
-            self.algorithm_store.activate(self.current_profile.profile_id)
-            self._reload_algorithm_combo(self.current_profile.profile_id)
-            self.status.setText(f"已将“{self.current_profile.name}”设为正式运行算法；下次初始化时生效。")
-        except Exception as exc:
-            QMessageBox.warning(self, "启用失败", str(exc))
 
     def _browse(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -627,20 +431,12 @@ class TuningWindow(QWidget):
             self._redraw()
 
     def _parameter_changed(self, key: str, raw_value: object) -> None:
-        if self.current_profile.protected:
-            self.status.setText("内置算法为只读；请先复制为新算法后再调参")
-            return
         try:
-            if isinstance(raw_value, str) and hasattr(self.current_config, key):
+            if isinstance(raw_value, str) and key in _INTEGER_PARAMETERS:
+                setattr(self.current_config, key, int(float(raw_value)))
+            elif isinstance(raw_value, str) and hasattr(self.current_config, key):
                 current = getattr(self.current_config, key)
-                if isinstance(current, bool):
-                    setattr(self.current_config, key, raw_value.strip().lower() in {"1", "true", "yes", "on"})
-                elif isinstance(current, int):
-                    setattr(self.current_config, key, int(float(raw_value)))
-                elif isinstance(current, float):
-                    setattr(self.current_config, key, float(raw_value))
-                else:
-                    setattr(self.current_config, key, raw_value)
+                setattr(self.current_config, key, float(raw_value) if isinstance(current, float) else raw_value)
             elif hasattr(self.current_config, key):
                 setattr(self.current_config, key, raw_value)
             else:
@@ -648,18 +444,16 @@ class TuningWindow(QWidget):
         except (TypeError, ValueError):
             self.status.setText(f"参数 {key} 尚未输入完成")
             return
-        self._profile_dirty = self._has_modified_parameters()
-        self.reset.setEnabled(self._profile_dirty)
+        self.reset.setEnabled(self._has_modified_parameters())
         if self.frames:
             self.status.setText("参数已修改，正在等待自动刷新…")
             self._refresh_timer.start()
 
     def _reset_parameter(self, key: str) -> None:
-        if self.current_profile.protected or not hasattr(self.original_config, key):
+        if not hasattr(self.original_config, key):
             return
         setattr(self.current_config, key, getattr(self.original_config, key))
-        self._profile_dirty = self._has_modified_parameters()
-        self.reset.setEnabled(self._profile_dirty)
+        self.reset.setEnabled(self._has_modified_parameters())
         if self.frames:
             self.status.setText(f"参数 {key} 已恢复原设定")
             self._redraw()
@@ -667,15 +461,13 @@ class TuningWindow(QWidget):
             self.status.setText(f"参数 {key} 已恢复原设定")
 
     def _has_modified_parameters(self) -> bool:
-        return self.current_plugin.serialize_config(self.current_config) != self.current_plugin.serialize_config(
-            self.original_config
+        return any(
+            getattr(self.current_config, field) != getattr(self.original_config, field)
+            for field in vars(self.original_config)
         )
 
     def _reset_parameters(self) -> None:
-        self.current_config = self.current_plugin.build_config(
-            self.current_plugin.serialize_config(self.original_config)
-        )
-        self._profile_dirty = False
+        self.current_config = DetectorConfig(**vars(self.original_config))
         self.reset.setEnabled(False)
         if self.frames:
             self._redraw()
@@ -683,32 +475,96 @@ class TuningWindow(QWidget):
             self.status.setText("参数已回退为原设定")
 
     def _controls_for_stage(self, index: int) -> list[dict[str, Any]]:
-        controls: list[dict[str, Any]] = []
-        for parameter in self.current_plugin.parameters:
-            if parameter.stage_index != index or not hasattr(self.current_config, parameter.key):
-                continue
-            value = getattr(self.current_config, parameter.key)
-            controls.append(
-                {
-                    "key": parameter.key,
-                    "label": parameter.label,
-                    "kind": parameter.kind,
-                    "value": value,
-                    "text": parameter.text,
-                    "modified": value != getattr(self.original_config, parameter.key),
-                    "editable": not self.current_profile.protected,
-                }
-            )
-        return controls
+        config = self.current_config
+        controls: dict[int, list[dict[str, Any]]] = {
+            2: [self._check("enable_intensity_normalization", "启用归一化", config.enable_intensity_normalization)],
+            3: [
+                self._check("enable_gaussian_blur", "启用输入平滑", config.enable_gaussian_blur),
+                self._number("gaussian_blur_size", "高斯核大小", config.gaussian_blur_size),
+            ],
+            4: [
+                self._check("enable_contour_candidates", "启用快速轮廓主检测", config.enable_contour_candidates),
+                self._number("contour_work_scale", "候选检测缩放", config.contour_work_scale),
+            ],
+            5: [
+                self._number("adaptive_threshold_block_size", "自适应阈值块大小", config.adaptive_threshold_block_size),
+                self._number("adaptive_threshold_c", "自适应阈值 C", config.adaptive_threshold_c),
+                self._check("enable_morphology", "启用形态学清理", config.enable_morphology),
+                self._number("morphology_open_kernel", "开运算核", config.morphology_open_kernel),
+                self._number("morphology_close_kernel", "闭运算核", config.morphology_close_kernel),
+            ],
+            6: [
+                self._check("enable_background_subtraction", "启用背景差分", config.enable_background_subtraction),
+                self._number("background_difference_threshold", "背景差分阈值", config.background_difference_threshold),
+                self._number("background_learning_rate", "背景学习率", config.background_learning_rate),
+            ],
+            7: [
+                self._number("contour_canny_low", "Canny 低阈值", config.contour_canny_low),
+                self._number("contour_canny_high", "Canny 高阈值", config.contour_canny_high),
+                self._number("contour_close_kernel", "边缘闭运算核", config.contour_close_kernel),
+            ],
+            8: [
+                self._number("min_radius", "绝对最小半径", config.min_radius),
+                self._number("max_radius", "绝对最大半径", config.max_radius),
+                self._number("contour_min_circularity", "最小圆度", config.contour_min_circularity),
+                self._number("contour_min_axis_ratio", "最小长短轴比", config.contour_min_axis_ratio),
+                self._number("contour_min_edge_support", "最小轮廓边缘支撑", config.contour_min_edge_support),
+                self._number("contour_min_area_fill_ratio", "最小椭圆填充率", config.contour_min_area_fill_ratio),
+            ],
+            9: [
+                self._check("enable_watershed_split", "启用局部 Watershed", config.enable_watershed_split),
+                self._number("watershed_peak_ratio", "距离峰比例", config.watershed_peak_ratio),
+                self._number("watershed_min_peak_radius_ratio", "最小峰半径比例", config.watershed_min_peak_radius_ratio),
+                self._number("watershed_max_markers", "局部最大标记数", config.watershed_max_markers),
+            ],
+            10: [
+                self._check("enable_hough_candidates", "启用疑难区域 Hough", config.enable_hough_candidates),
+                self._number("local_hough_padding_ratio", "局部 Hough 边距比例", config.local_hough_padding_ratio),
+                self._number("local_hough_max_regions", "每帧最大疑难区域", config.local_hough_max_regions),
+                self._number("hough_refresh_interval", "全帧 Hough 周期（0=关闭）", config.hough_refresh_interval),
+                self._number("hough_dp", "累加器分辨率 dp", config.hough_dp),
+                self._number("hough_min_distance", "最小圆心距离（0=自动）", config.hough_min_distance),
+                self._number("hough_param1", "Hough 梯度阈值", config.hough_param1),
+                self._number("hough_param2", "Hough 累加阈值", config.hough_param2),
+                self._number("hough_min_radius", "Hough 最小半径", config.hough_min_radius),
+                self._number("hough_max_radius", "Hough 最大半径", config.hough_max_radius),
+                self._number("hough_edge_support_threshold", "Hough 边缘支撑", config.hough_edge_support_threshold),
+            ],
+            11: [
+                self._check("enable_expected_size_filter", "启用目标尺寸过滤", config.enable_expected_size_filter),
+                self._number("expected_radius", "期望液滴半径（px）", config.expected_radius),
+                self._number("expected_radius_tolerance_ratio", "半径容差比例", config.expected_radius_tolerance_ratio),
+                self._number("candidate_min_edge_support", "最终最小边缘支撑", config.candidate_min_edge_support),
+                self._number("candidate_min_visible_circle_ratio", "跟踪最小可见圆周", config.candidate_min_visible_circle_ratio),
+                self._number("candidate_full_circle_ratio", "直径有效完整度", config.candidate_full_circle_ratio),
+            ],
+        }
+        return controls.get(index, [])
+
+    def _check(self, key: str, label: str, value: bool) -> dict[str, Any]:
+        return {
+            "key": key,
+            "label": label,
+            "kind": "check",
+            "value": value,
+            "text": "执行此步骤",
+            "modified": value != getattr(self.original_config, key),
+        }
+
+    def _number(self, key: str, label: str, value: int | float) -> dict[str, Any]:
+        return {
+            "key": key,
+            "label": label,
+            "kind": "number",
+            "value": value,
+            "modified": value != getattr(self.original_config, key),
+        }
 
     def _redraw(self) -> None:
         if not self.frames:
             return
         try:
-            result, stages = self.current_plugin.inspector(
-                self.frames[self.frame_pos].image,
-                self.current_config,
-            )
+            result, stages = inspect_frame(self.frames[self.frame_pos].image, self.current_config)
             self._show_stages(stages)
             frame_index = self.frames[self.frame_pos].index
             self.status.setText(
@@ -732,23 +588,18 @@ class TuningWindow(QWidget):
         self.stage_grid.setRowStretch((len(stages) + 1) // 2, 1)
         QTimer.singleShot(0, lambda: self.stage_scroll.verticalScrollBar().setValue(scroll_position))
 
-    def _save(self) -> bool:
-        try:
-            profile = self.algorithm_store.update_parameters(
-                self.current_profile.profile_id,
-                self.current_plugin.serialize_config(self.current_config),
+    def _save(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "保存检测参数",
+            "droplet_detector_tuning.json",
+            "JSON (*.json)",
+        )
+        if path:
+            Path(path).write_text(
+                json.dumps(asdict(self.current_config), ensure_ascii=False, indent=2),
+                encoding="utf-8",
             )
-            self.current_profile = profile
-            self.original_config = self.current_plugin.build_config(profile.parameters)
-            self._profile_dirty = False
-            self.reset.setEnabled(False)
-            self.status.setText(f"算法“{profile.name}”的参数已保存")
-            if self.frames:
-                self._redraw()
-            return True
-        except Exception as exc:
-            QMessageBox.warning(self, "保存失败", str(exc))
-            return False
 
 
 def main(video: str = "") -> None:

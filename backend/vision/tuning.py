@@ -3,13 +3,12 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from itertools import product
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Iterable
 
 import cv2
 import numpy as np
 
 from .config import DetectorConfig, DebugConfig
-from .algorithms import get_algorithm
 from .detector import DetectionResult, DropletDetector
 
 
@@ -107,8 +106,8 @@ def _candidate_overlay(frame: np.ndarray, centers: list[np.ndarray], radii: list
     return output
 
 
-def inspect_hybrid_frame(frame: np.ndarray, config: DetectorConfig) -> tuple[DetectionResult, list[PipelineStage]]:
-    """Inspect the built-in hybrid detector and preserve its intermediate images."""
+def inspect_frame(frame: np.ndarray, config: DetectorConfig) -> tuple[DetectionResult, list[PipelineStage]]:
+    """Run the detector pipeline while preserving its important intermediate images."""
     detector = DropletDetector(config, DebugConfig(enabled=False))
     gray = detector._ensure_gray(frame)
     normalized = (
@@ -263,17 +262,8 @@ def inspect_hybrid_frame(frame: np.ndarray, config: DetectorConfig) -> tuple[Det
     return result, stages
 
 
-def inspect_frame(
-    frame: np.ndarray,
-    config: Any,
-    algorithm_id: str = "hybrid_v1",
-) -> tuple[DetectionResult, list[PipelineStage]]:
-    """Inspect one registered algorithm without coupling the workbench to its implementation."""
-    return get_algorithm(algorithm_id).inspector(frame, config)
-
-
-def detect_frame(frame: np.ndarray, config: Any, algorithm_id: str = "hybrid_v1") -> DetectionResult:
-    return inspect_frame(frame, config, algorithm_id)[0]
+def detect_frame(frame: np.ndarray, config: DetectorConfig) -> DetectionResult:
+    return inspect_frame(frame, config)[0]
 
 
 def annotate_frame(frame: np.ndarray, result: DetectionResult) -> np.ndarray:
@@ -307,14 +297,13 @@ def annotate_frame(frame: np.ndarray, result: DetectionResult) -> np.ndarray:
 
 def evaluate_config(
     frames: Iterable[TuningFrame],
-    config: Any,
+    config: DetectorConfig,
     expected_count: float = 1.0,
-    algorithm_id: str = "hybrid_v1",
 ) -> TuningEvaluation:
     counts: list[float] = []
     radii: list[float] = []
     processed = 0
-    detector = get_algorithm(algorithm_id).detector_factory(config, DebugConfig(enabled=False))
+    detector = DropletDetector(config, DebugConfig(enabled=False))
     for item in frames:
         result = detector.detect(item.image)
         counts.append(float(len(result.centers)))
