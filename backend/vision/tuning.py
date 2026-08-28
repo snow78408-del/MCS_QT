@@ -8,7 +8,8 @@ from typing import Iterable
 import cv2
 import numpy as np
 
-from .config import DetectorConfig, DebugConfig
+from .channel_region import ChannelRegionResult, detect_channel_region
+from .config import ChannelRegionConfig, DetectorConfig, DebugConfig
 from .detector import DetectionResult, DropletDetector
 
 
@@ -48,16 +49,6 @@ SEARCHABLE_FIELDS = (
     "min_radius",
     "max_radius",
     "gaussian_blur_size",
-    "contour_work_scale",
-    "adaptive_threshold_block_size",
-    "adaptive_threshold_c",
-    "background_difference_threshold",
-    "contour_canny_low",
-    "contour_canny_high",
-    "contour_min_circularity",
-    "contour_min_axis_ratio",
-    "contour_min_edge_support",
-    "watershed_peak_ratio",
     "hough_dp",
     "hough_min_distance",
     "hough_param1",
@@ -65,12 +56,9 @@ SEARCHABLE_FIELDS = (
     "hough_min_radius",
     "hough_max_radius",
     "hough_edge_support_threshold",
+    "hough_edge_neighborhood",
     "expected_radius",
     "expected_radius_tolerance_ratio",
-    "edge_ownership_search_radius",
-    "edge_ownership_margin",
-    "edge_ownership_min_ratio",
-    "candidate_min_edge_support",
     "candidate_min_visible_circle_ratio",
     "candidate_full_circle_ratio",
 )
@@ -106,159 +94,172 @@ def _candidate_overlay(frame: np.ndarray, centers: list[np.ndarray], radii: list
     return output
 
 
-def inspect_frame(frame: np.ndarray, config: DetectorConfig) -> tuple[DetectionResult, list[PipelineStage]]:
-    """Run the detector pipeline while preserving its important intermediate images."""
-    detector = DropletDetector(config, DebugConfig(enabled=False))
-    gray = detector._ensure_gray(frame)
-    normalized = (
-        cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
-        if config.enable_intensity_normalization
-        else gray.copy()
-    )
-    blur_size = detector._odd(config.gaussian_blur_size)
-    smoothed = (
-        cv2.GaussianBlur(normalized, (blur_size, blur_size), 0)
-        if config.enable_gaussian_blur and blur_size > 1
-        else normalized
-    )
-    cut_line = int(smoothed.shape[0] * config.cut_line_ratio)
-    hybrid_trace: dict[str, object] = {}
-    candidate_centers, candidate_radii = detector._detect_hybrid_candidates(
-        smoothed,
-        cut_line,
-        hybrid_trace,
-    )
-    centers, radii = detector._score_and_suppress_candidates(
-        normalized,
-        candidate_centers,
-        candidate_radii,
-    )
-    contour_raw_centers = hybrid_trace.get("contour_raw_centers", [])
-    contour_raw_radii = hybrid_trace.get("contour_raw_radii", [])
-    contour_centers = hybrid_trace.get("contour_centers", [])
-    contour_radii = hybrid_trace.get("contour_radii", [])
-    contour_work = np.asarray(hybrid_trace.get("contour_work_gray", smoothed))
-    contour_binary = np.asarray(hybrid_trace.get("contour_binary", np.zeros_like(contour_work)))
-    contour_foreground = np.asarray(hybrid_trace.get("contour_foreground", np.zeros_like(contour_work)))
-    contour_edges = np.asarray(hybrid_trace.get("contour_edges", np.zeros_like(contour_work)))
-    contour_mask = np.asarray(hybrid_trace.get("contour_closed", np.zeros_like(contour_work)))
-    hough_centers = hybrid_trace.get("hybrid_hough_centers", [])
-    hough_radii = hybrid_trace.get("hybrid_hough_radii", [])
-    hough_scope = str(hybrid_trace.get("hough_scope", "skipped"))
+def inspect_frame(
+    frame: np.ndarray,
+    config: DetectorConfig,
+    *,
+    channel_config: ChannelRegionConfig | None = None,
+    channel_frames: Iterable[np.ndarray] | None = None,
+) -> tuple[DetectionResult, list[PipelineStage]]:
+    """Inspect optional channel calibration followed by Hough droplet detection."""
+    channel_stages: list[PipelineStage] = []
+    detection_frame = frame
+    if channel_config is not None:
+        samples = list(channel_frames or [frame])
+        channel_result = (
+            detect_channel_region(samples[: max(1, int(channel_config.sample_frames))], channel_config)
+            if channel_config.enabled
+            else ChannelRegionResult("skipped", 0.0, "已跳过管道区域检定")
+        )
+        high_frequency = channel_result.high_frequency_map
+        if high_frequency is None:
+            high_frequency = np.zeros(frame.shape[:2], dtype=np.uint8)
+        line_overlay = channel_result.line_overlay if channel_result.line_overlay is not None else frame.copy()
+        region_overlay = channel_result.region_overlay if channel_result.region_overlay is not None else frame.copy()
+        if channel_result.status == "calibrated" and channel_result.rectified_frame is not None:
+            detection_frame = channel_result.rectified_frame
+        channel_stages = [
+            PipelineStage(
+                "A1. 管道检定 · 原始大图",
+                "启动时从原始大图采集多帧；手动 ROI 优先，也可关闭并跳过本步骤。",
+                frame.copy(),
+                parameters=f"采样 {min(len(samples), max(1, int(channel_config.sample_frames)))}/{max(1, int(channel_config.sample_frames))} 帧" if channel_config.enabled else "已跳过",
+                statistics=f"尺寸 {frame.shape[1]}×{frame.shape[0]}",
+            ),
+            PipelineStage(
+                "A2. 管道检定 · 高频信号",
+                "计算每帧局部空间高频能量并进行多帧融合；管内高频、管外低频应形成连续区域和明显界线。",
+                high_frequency,
+                parameters=(
+                    f"局部窗口 {channel_config.frequency_window_ratio:g}；"
+                    f"持续帧比例 ≥ {channel_config.min_frequency_frame_support:g}；"
+                    f"界线 Canny {channel_config.canny_low}–{channel_config.canny_high}"
+                ),
+                statistics=f"平均响应 {float(high_frequency.mean()):.1f}",
+            ),
+            PipelineStage(
+                "A3. 管道检定 · 直线性质",
+                "只从高低频区域的界线上生成候选，再将两侧边界拟合为直线并验证跨度、平行度和间距稳定性。",
+                line_overlay,
+                parameters=(
+                    f"最短线 {channel_config.min_line_length_ratio:g}；"
+                    f"平行容差 {channel_config.parallel_tolerance_degrees:g}°"
+                ),
+            ),
+            PipelineStage(
+                "A4. 管道检定 · 有效区域",
+                "两条可信直线管壁围成的区域将被透视摆正，再交给液滴识别；失败时安全回退整帧。",
+                region_overlay,
+                parameters=f"最低可信度 {channel_config.min_confidence:g}",
+                statistics=(
+                    f"状态 {channel_result.status}；可信度 {channel_result.confidence:.2f}；{channel_result.reason}"
+                ),
+            ),
+        ]
 
-    helper_mask = detector._build_bead_helper_mask(normalized)
-    result = DetectionResult(centers, radii, np.empty((0, 0, 3), dtype=np.uint8), helper_mask)
+    detector = DropletDetector(config, DebugConfig(enabled=False))
+    gray = detector._ensure_gray(detection_frame)
+    normalized = detector._normalize(gray)
+    smoothed = detector._smooth(normalized)
+    cut_line = int(smoothed.shape[0] * config.cut_line_ratio)
+    trace: dict[str, object] = {}
+    centers, radii = detector._detect_hough_candidates(smoothed, cut_line, trace)
+    diameter_valid = [
+        detector._candidate_diameter_valid(normalized.shape[:2], center, radius)
+        for center, radius in zip(centers, radii)
+    ]
+    result = DetectionResult(
+        centers,
+        radii,
+        np.empty((0, 0, 3), dtype=np.uint8),
+        detector._build_bead_helper_mask(normalized),
+        diameter_valid,
+    )
+    work_gray = np.asarray(trace.get("work_gray", smoothed))
+    enhanced = np.asarray(trace.get("enhanced", work_gray))
+    edges = np.asarray(trace.get("edges", np.zeros_like(work_gray)))
+    raw_centers = list(trace.get("raw_centers", []))
+    raw_radii = list(trace.get("raw_radii", []))
+    scale = float(trace.get("scale", 1.0))
+    blur_size = detector._odd(config.gaussian_blur_size)
     stages = [
         PipelineStage(
             "1. 原始图像",
             "检测器收到的当前视频帧。",
-            frame.copy(),
-            statistics=f"尺寸 {frame.shape[1]}×{frame.shape[0]}",
+            detection_frame.copy(),
+            statistics=f"尺寸 {detection_frame.shape[1]}×{detection_frame.shape[0]}",
         ),
         PipelineStage(
             "2. 灰度转换",
-            "去除颜色信息，为分割和梯度检测准备单通道图像。",
+            "将输入统一为单通道灰度图。",
             gray,
-            parameters="BGR → Gray",
+            parameters="BGR → Gray" if frame.ndim == 3 else "输入已是灰度图",
             statistics=f"亮度范围 {int(gray.min())}–{int(gray.max())}",
         ),
         PipelineStage(
             "3. 对比度归一化",
-            "拉伸灰度范围，减轻不同曝光条件对梯度强度的影响。",
+            "拉伸灰度范围，降低曝光变化对 Hough 梯度的影响。",
             normalized,
             parameters="NORM_MINMAX: 0–255" if config.enable_intensity_normalization else "已跳过",
             statistics=f"均值 {float(normalized.mean()):.1f}",
         ),
         PipelineStage(
-            "4. 输入高斯平滑",
-            "抑制高频噪声，为快速分割和候选精修准备图像。",
+            "4. 高斯平滑",
+            "在 Hough 变换前抑制高频噪声。",
             smoothed,
             parameters=f"核大小 {blur_size}×{blur_size}" if config.enable_gaussian_blur else "已跳过",
         ),
         PipelineStage(
-            "5. 缩放检测图",
-            "在低分辨率图像上寻找候选，随后回到原图精修中心和尺寸。",
-            contour_work,
-            parameters=f"工作缩放 {float(hybrid_trace.get('contour_work_scale', 1.0)):.2f}",
-        ),
-        PipelineStage(
-            "6. 自适应二值分割",
-            "提取相对局部背景更暗的液滴边界。",
-            contour_binary,
-            parameters=f"块大小 {config.adaptive_threshold_block_size}；C={config.adaptive_threshold_c:g}",
-            statistics=(
-                f"前景像素 {100.0 * np.count_nonzero(contour_binary) / max(1, contour_binary.size):.1f}%"
-            ),
-        ),
-        PipelineStage(
-            "7. 背景运动分割",
-            "固定相机下补充弱边缘但发生运动的液滴区域。",
-            contour_foreground,
+            "5. Hough 输入预处理",
+            "按工作尺寸缩放，并可选执行 CLAHE 与中值滤波。",
+            enhanced,
             parameters=(
-                f"差分阈值 {config.background_difference_threshold:g}；"
-                f"学习率 {config.background_learning_rate:g}"
-                if config.enable_background_subtraction
-                else "已跳过"
-            ),
-            statistics=(
-                f"运动像素 {100.0 * np.count_nonzero(contour_foreground) / max(1, contour_foreground.size):.1f}%"
+                f"缩放 {scale:.2f}；CLAHE {'开' if config.enable_hough_clahe else '关'}；"
+                f"中值滤波 {'开' if config.enable_hough_median_blur else '关'}"
             ),
         ),
         PipelineStage(
-            "8. 连通域与边缘",
-            "融合二值、背景差分和 Canny 边缘后生成局部连通区域。",
-            cv2.bitwise_or(contour_edges, contour_mask),
-            parameters=f"Canny {config.contour_canny_low:g}–{config.contour_canny_high:g}",
-            statistics=(
-                f"候选区域像素 {100.0 * np.count_nonzero(contour_mask) / max(1, contour_mask.size):.1f}%"
-            ),
-        ),
-        PipelineStage(
-            "9. 轮廓初始候选",
-            "对连通区域拟合椭圆，并按面积、圆度和长短轴比初筛。",
-            _candidate_overlay(frame, contour_raw_centers, contour_raw_radii),
+            "6. Hough 边缘支撑",
+            "生成仅用于验证圆周边缘覆盖率的 Canny 边缘图。",
+            edges,
             parameters=(
-                f"圆度 ≥ {config.contour_min_circularity:g}；"
-                f"轴比 ≥ {config.contour_min_axis_ratio:g}"
+                f"Canny {config.hough_param1 * 0.5:g}–{config.hough_param1:g}；"
+                f"邻域 {config.hough_edge_neighborhood}px"
             ),
-            statistics=f"初始候选 {len(contour_raw_centers)} 个",
         ),
         PipelineStage(
-            "10. 局部 Watershed",
-            "只拆分包含多个距离峰的粘连区域，规则液滴不承担此开销。",
-            _candidate_overlay(frame, contour_centers, contour_radii, (0, 220, 80)),
+            "7. Hough 原始圆",
+            "在整张工作图上执行一次 cv2.HoughCircles。",
+            _candidate_overlay(detection_frame, raw_centers, raw_radii, (255, 120, 0)),
             parameters=(
-                f"峰值比例 {config.watershed_peak_ratio:g}"
-                if config.enable_watershed_split
-                else "已跳过"
+                f"dp={config.hough_dp:g}；param2={config.hough_param2:g}；"
+                f"半径 {config.hough_min_radius:g}–{config.hough_max_radius:g}px"
             ),
-            statistics=(
-                f"拆分区域 {int(hybrid_trace.get('contour_split_regions', 0))} 个；"
-                f"轮廓通过 {len(contour_centers)} 个"
-            ),
+            statistics=f"原始圆 {len(raw_centers)} 个",
         ),
         PipelineStage(
-            "11. 局部 Hough 验证",
-            "只在粘连或低置信局部区域运行 Hough；无候选时才全帧兜底。",
-            _candidate_overlay(frame, hough_centers, hough_radii, (255, 120, 0)),
-            parameters=f"范围 {hough_scope}；param2={config.hough_param2:g}",
-            statistics=(
-                f"Hough 补充 {len(hough_centers)} 个；"
-                f"疑难区域 {len(hybrid_trace.get('ambiguous_regions', []))} 个"
-            ),
-        ),
-        PipelineStage(
-            "12. 融合评分与抑制",
-            "融合轮廓与 Hough 候选，按边缘、内外亮度、尺寸和重叠关系输出。",
-            annotate_frame(frame, result),
+            "8. 简单过滤结果",
+            "仅按尺寸、截断线、可见圆周、边缘支撑和圆心距离过滤。",
+            annotate_frame(detection_frame, result),
             parameters=(
-                f"边缘支撑 ≥ {config.candidate_min_edge_support:g}；"
-                f"跟踪可见圆周 ≥ {config.candidate_min_visible_circle_ratio:g}；"
+                f"边缘支撑 ≥ {config.hough_edge_support_threshold:g}；"
+                f"可见圆周 ≥ {config.candidate_min_visible_circle_ratio:g}；"
                 f"直径完整度 ≥ {config.candidate_full_circle_ratio:g}"
             ),
             statistics=f"最终液滴 {len(centers)} 个",
         ),
     ]
+    if channel_stages:
+        stages = channel_stages + [
+            PipelineStage(
+                f"B{index}. {stage.name.split('. ', 1)[-1]}",
+                stage.description,
+                stage.image,
+                stage.parameters,
+                stage.statistics,
+            )
+            for index, stage in enumerate(stages, start=1)
+        ]
     return result, stages
 
 

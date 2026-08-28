@@ -60,23 +60,18 @@ class MultiscaleDropletDetectorTests(unittest.TestCase):
 
         self.assertEqual(detector._filter_expected_size(candidates), candidates)
 
-    def test_edge_ownership_rejects_circle_built_from_neighbor_edges(self) -> None:
-        config = default_config()
-        config.detector.edge_ownership_search_radius = 3
-        config.detector.edge_ownership_min_ratio = 0.55
-        detector = DropletDetector(config.detector, config.debug)
-        edges = np.zeros((140, 160), dtype=np.uint8)
-        cv2.circle(edges, (50, 70), 25, 255, 1)
-        cv2.circle(edges, (100, 70), 25, 255, 1)
-        candidates = [
-            (50.0, 70.0, 25.0),
-            (100.0, 70.0, 25.0),
-            (75.0, 70.0, 35.0),
+    def test_overlapping_hough_circles_are_deduplicated(self) -> None:
+        detector = DropletDetector(default_config().detector, default_config().debug)
+        centers = [
+            np.array([50.0, 70.0], dtype=np.float32),
+            np.array([53.0, 71.0], dtype=np.float32),
+            np.array([110.0, 70.0], dtype=np.float32),
         ]
 
-        filtered = detector._filter_edge_ownership(edges, candidates, 1.0)
+        filtered_centers, filtered_radii = detector._deduplicate(centers, [25.0, 24.0, 25.0])
 
-        self.assertEqual(filtered, candidates[:2])
+        self.assertEqual(len(filtered_centers), 2)
+        self.assertEqual(filtered_radii, [25.0, 25.0])
 
     def test_realtime_pipeline_reuses_source_frame_without_overlay(self) -> None:
         config = default_config()
@@ -87,23 +82,20 @@ class MultiscaleDropletDetectorTests(unittest.TestCase):
 
         self.assertIs(result.annotated_frame, frame)
 
-    def test_contour_branch_detects_elliptical_droplet_without_hough(self) -> None:
+    def test_disabling_hough_disables_droplet_detection(self) -> None:
         config = default_config()
         config.detector.enable_hough_candidates = False
-        config.detector.min_radius = 10.0
-        config.detector.max_radius = 50.0
         image = np.full((220, 360), 190, dtype=np.uint8)
-        cv2.ellipse(image, (120, 110), (30, 24), 12, 0, 360, 45, 3)
+        cv2.circle(image, (120, 110), 28, 45, 3)
 
         result = DropletDetector(config.detector, config.debug).detect(image)
 
-        self.assertEqual(len(result.centers), 1)
-        np.testing.assert_allclose(result.centers[0], [120.0, 110.0], atol=3.0)
-        self.assertAlmostEqual(result.radii[0], float(np.sqrt(30.0 * 24.0)), delta=4.0)
+        self.assertEqual(result.centers, [])
+        self.assertFalse(hasattr(DropletDetector, "_detect_contour_candidates"))
+        self.assertFalse(hasattr(DropletDetector, "_split_contour_watershed"))
 
-    def test_local_watershed_splits_touching_droplets(self) -> None:
+    def test_hough_detects_touching_droplets(self) -> None:
         config = default_config()
-        config.detector.enable_hough_candidates = False
         config.detector.min_radius = 10.0
         config.detector.max_radius = 50.0
         image = np.full((220, 360), 190, dtype=np.uint8)
@@ -113,7 +105,7 @@ class MultiscaleDropletDetectorTests(unittest.TestCase):
         result = DropletDetector(config.detector, config.debug).detect(image)
 
         self.assertEqual(len(result.centers), 2)
-        self.assertTrue(all(abs(float(radius) - 28.0) <= 3.0 for radius in result.radii))
+        self.assertTrue(all(abs(float(radius) - 28.0) <= 4.0 for radius in result.radii))
 
     def test_parallel_channel_edges_are_not_droplets(self) -> None:
         config = default_config()
@@ -132,17 +124,12 @@ class MultiscaleDropletDetectorTests(unittest.TestCase):
         image = np.full((120, 160), 190, dtype=np.uint8)
         cv2.circle(image, (5, 60), 20, 45, 3)
 
-        centers, radii = detector._score_and_suppress_candidates(
-            image,
-            [np.array([5.0, 60.0], dtype=np.float32)],
-            [20.0],
-        )
+        center = np.array([5.0, 60.0], dtype=np.float32)
 
-        self.assertEqual(len(centers), 1)
         self.assertGreaterEqual(detector._circle_visible_ratio(image.shape, 5.0, 60.0, 20.0), 0.5)
-        self.assertFalse(detector._candidate_diameter_valid(image.shape, centers[0], radii[0]))
+        self.assertFalse(detector._candidate_diameter_valid(image.shape, center, 20.0))
 
-    def test_hough_is_full_frame_fallback_when_fast_branch_is_empty(self) -> None:
+    def test_hough_runs_on_every_frame(self) -> None:
         config = default_config()
         detector = DropletDetector(config.detector, config.debug)
         image = np.full((100, 120), 180, dtype=np.uint8)
@@ -152,15 +139,13 @@ class MultiscaleDropletDetectorTests(unittest.TestCase):
             detector,
             "_detect_hough_candidates",
             return_value=([hough_center], [15.0]),
-        ) as hough, patch.object(
-            detector,
-            "_score_and_suppress_candidates",
-            side_effect=lambda _image, centers, radii: (centers, radii),
-        ):
-            result = detector.detect(image)
+        ) as hough:
+            first = detector.detect(image)
+            second = detector.detect(image)
 
-        hough.assert_called_once()
-        self.assertEqual(len(result.centers), 1)
+        self.assertEqual(hough.call_count, 2)
+        self.assertEqual(len(first.centers), 1)
+        self.assertEqual(len(second.centers), 1)
 
 
 if __name__ == "__main__":

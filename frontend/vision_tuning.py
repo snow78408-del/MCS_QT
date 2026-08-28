@@ -29,47 +29,29 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from backend.vision.config import DetectorConfig
+from backend.vision.config import ChannelRegionConfig, DetectorConfig
 from backend.vision.tuning import PipelineStage, TuningFrame, inspect_frame, read_video_frames
 
 
 _INTEGER_PARAMETERS = {
     "gaussian_blur_size",
-    "adaptive_threshold_block_size",
-    "morphology_open_kernel",
-    "morphology_close_kernel",
-    "contour_close_kernel",
     "hough_edge_neighborhood",
-    "hough_refresh_interval",
-    "edge_ownership_search_radius",
-    "watershed_max_markers",
-    "local_hough_max_regions",
+    "hough_work_max_width",
+    "hough_work_max_height",
+    "hough_max_candidates",
+    "channel_region.sample_frames",
+    "channel_region.work_max_width",
+    "channel_region.work_max_height",
+    "channel_region.canny_low",
+    "channel_region.canny_high",
+    "channel_region.hough_threshold",
+    "channel_region.max_lines",
 }
 
 # Algorithm-safe slider ranges: (minimum, maximum, step). Text entry remains
 # available for exact values, while sliders cover the useful operating range.
 _PARAMETER_RANGES: dict[str, tuple[float, float, float]] = {
     "gaussian_blur_size": (1.0, 31.0, 2.0),
-    "contour_work_scale": (0.25, 1.0, 0.05),
-    "adaptive_threshold_block_size": (3.0, 101.0, 2.0),
-    "adaptive_threshold_c": (-20.0, 30.0, 0.5),
-    "morphology_open_kernel": (1.0, 15.0, 2.0),
-    "morphology_close_kernel": (1.0, 21.0, 2.0),
-    "background_difference_threshold": (1.0, 80.0, 1.0),
-    "background_learning_rate": (0.0, 0.25, 0.005),
-    "contour_canny_low": (1.0, 250.0, 1.0),
-    "contour_canny_high": (2.0, 400.0, 1.0),
-    "contour_close_kernel": (1.0, 15.0, 2.0),
-    "contour_min_circularity": (0.0, 1.0, 0.01),
-    "contour_min_axis_ratio": (0.0, 1.0, 0.01),
-    "contour_min_edge_support": (0.0, 1.0, 0.01),
-    "contour_min_area_fill_ratio": (0.0, 1.0, 0.01),
-    "watershed_peak_ratio": (0.2, 0.95, 0.01),
-    "watershed_min_peak_radius_ratio": (0.1, 1.0, 0.01),
-    "watershed_max_markers": (2.0, 30.0, 1.0),
-    "local_hough_padding_ratio": (0.0, 2.0, 0.05),
-    "local_hough_max_regions": (1.0, 40.0, 1.0),
-    "hough_refresh_interval": (0.0, 30.0, 1.0),
     "hough_param1": (10.0, 300.0, 1.0),
     "hough_dp": (1.0, 3.0, 0.05),
     "hough_min_distance": (0.0, 200.0, 1.0),
@@ -80,14 +62,38 @@ _PARAMETER_RANGES: dict[str, tuple[float, float, float]] = {
     "hough_max_radius": (2.0, 300.0, 1.0),
     "hough_edge_support_threshold": (0.0, 1.0, 0.01),
     "hough_edge_neighborhood": (0.0, 8.0, 1.0),
+    "hough_work_max_width": (160.0, 3840.0, 20.0),
+    "hough_work_max_height": (120.0, 2160.0, 20.0),
+    "hough_max_candidates": (1.0, 500.0, 1.0),
     "expected_radius": (0.0, 300.0, 1.0),
     "expected_radius_tolerance_ratio": (0.0, 1.0, 0.01),
-    "edge_ownership_search_radius": (1.0, 10.0, 1.0),
-    "edge_ownership_margin": (0.0, 5.0, 0.05),
-    "edge_ownership_min_ratio": (0.0, 1.0, 0.01),
-    "candidate_min_edge_support": (0.0, 1.0, 0.01),
     "candidate_min_visible_circle_ratio": (0.0, 1.0, 0.01),
     "candidate_full_circle_ratio": (0.0, 1.0, 0.01),
+    "cut_line_ratio": (0.0, 1.0, 0.01),
+    "channel_region.sample_frames": (1.0, 48.0, 1.0),
+    "channel_region.min_confidence": (0.0, 1.0, 0.01),
+    "channel_region.frequency_window_ratio": (0.005, 0.20, 0.005),
+    "channel_region.min_frequency_region_thickness_ratio": (0.005, 0.20, 0.005),
+    "channel_region.min_frequency_frame_support": (0.0, 1.0, 0.05),
+    "channel_region.min_region_contrast": (0.0, 1.0, 0.01),
+    "channel_region.full_region_contrast": (0.01, 1.0, 0.01),
+    "channel_region.min_region_coverage": (0.0, 1.0, 0.01),
+    "channel_region.min_coverage_advantage": (0.0, 1.0, 0.01),
+    "channel_region.work_max_width": (160.0, 3840.0, 20.0),
+    "channel_region.work_max_height": (120.0, 2160.0, 20.0),
+    "channel_region.canny_low": (0.0, 254.0, 1.0),
+    "channel_region.canny_high": (1.0, 255.0, 1.0),
+    "channel_region.hough_threshold": (8.0, 300.0, 1.0),
+    "channel_region.min_line_length_ratio": (0.1, 1.0, 0.01),
+    "channel_region.max_line_gap_ratio": (0.0, 0.5, 0.01),
+    "channel_region.max_lines": (4.0, 120.0, 1.0),
+    "channel_region.parallel_tolerance_degrees": (0.5, 30.0, 0.5),
+    "channel_region.min_width_ratio": (0.01, 0.8, 0.01),
+    "channel_region.max_width_ratio": (0.1, 1.0, 0.01),
+    "channel_region.max_separation_variation_ratio": (0.01, 0.5, 0.01),
+    "channel_region.high_frequency_weight": (0.0, 1.0, 0.01),
+    "channel_region.straightness_weight": (0.0, 1.0, 0.01),
+    "channel_region.geometry_weight": (0.0, 1.0, 0.01),
 }
 
 
@@ -336,6 +342,8 @@ class TuningWindow(QWidget):
         self._on_sample_loaded = on_sample_loaded
         self.original_config = DetectorConfig()
         self.current_config = DetectorConfig()
+        self.original_channel_config = ChannelRegionConfig()
+        self.current_channel_config = ChannelRegionConfig()
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setSingleShot(True)
         self._refresh_timer.setInterval(500)
@@ -438,17 +446,28 @@ class TuningWindow(QWidget):
         if self.frames:
             self._redraw()
 
+    def _parameter_owner(self, key: str) -> tuple[object, str]:
+        if key.startswith("channel_region."):
+            return self.current_channel_config, key.split(".", 1)[1]
+        return self.current_config, key
+
+    def _original_parameter_owner(self, key: str) -> tuple[object, str]:
+        if key.startswith("channel_region."):
+            return self.original_channel_config, key.split(".", 1)[1]
+        return self.original_config, key
+
     def _parameter_changed(self, key: str, raw_value: object) -> None:
         try:
-            if isinstance(raw_value, str) and key in _INTEGER_PARAMETERS:
-                setattr(self.current_config, key, int(float(raw_value)))
-            elif isinstance(raw_value, str) and hasattr(self.current_config, key):
-                current = getattr(self.current_config, key)
-                setattr(self.current_config, key, float(raw_value) if isinstance(current, float) else raw_value)
-            elif hasattr(self.current_config, key):
-                setattr(self.current_config, key, raw_value)
-            else:
+            owner, field = self._parameter_owner(key)
+            if not hasattr(owner, field):
                 return
+            if isinstance(raw_value, str) and key in _INTEGER_PARAMETERS:
+                setattr(owner, field, int(float(raw_value)))
+            elif isinstance(raw_value, str):
+                current = getattr(owner, field)
+                setattr(owner, field, float(raw_value) if isinstance(current, float) else raw_value)
+            else:
+                setattr(owner, field, raw_value)
         except (TypeError, ValueError):
             self.status.setText(f"参数 {key} 尚未输入完成")
             return
@@ -458,9 +477,11 @@ class TuningWindow(QWidget):
             self._refresh_timer.start()
 
     def _reset_parameter(self, key: str) -> None:
-        if not hasattr(self.original_config, key):
+        owner, field = self._parameter_owner(key)
+        original, original_field = self._original_parameter_owner(key)
+        if not hasattr(original, original_field):
             return
-        setattr(self.current_config, key, getattr(self.original_config, key))
+        setattr(owner, field, getattr(original, original_field))
         self.reset.setEnabled(self._has_modified_parameters())
         if self.frames:
             self.status.setText(f"参数 {key} 已恢复原设定")
@@ -469,13 +490,19 @@ class TuningWindow(QWidget):
             self.status.setText(f"参数 {key} 已恢复原设定")
 
     def _has_modified_parameters(self) -> bool:
-        return any(
+        detector_modified = any(
             getattr(self.current_config, field) != getattr(self.original_config, field)
             for field in vars(self.original_config)
         )
+        channel_modified = any(
+            getattr(self.current_channel_config, field) != getattr(self.original_channel_config, field)
+            for field in vars(self.original_channel_config)
+        )
+        return detector_modified or channel_modified
 
     def _reset_parameters(self) -> None:
         self.current_config = DetectorConfig(**vars(self.original_config))
+        self.current_channel_config = ChannelRegionConfig(**vars(self.original_channel_config))
         self.reset.setEnabled(False)
         if self.frames:
             self._redraw()
@@ -484,66 +511,76 @@ class TuningWindow(QWidget):
 
     def _controls_for_stage(self, index: int) -> list[dict[str, Any]]:
         config = self.current_config
+        channel = self.current_channel_config
         controls: dict[int, list[dict[str, Any]]] = {
-            2: [self._check("enable_intensity_normalization", "启用归一化", config.enable_intensity_normalization)],
+            0: [
+                self._check("channel_region.enabled", "启用管道区域检定", channel.enabled),
+                self._number("channel_region.sample_frames", "启动采样帧数", channel.sample_frames),
+            ],
+            1: [
+                self._number("channel_region.frequency_window_ratio", "局部高频窗口比例", channel.frequency_window_ratio),
+                self._number("channel_region.min_frequency_region_thickness_ratio", "最小高频区域厚度比例", channel.min_frequency_region_thickness_ratio),
+                self._number("channel_region.min_frequency_frame_support", "最低帧持续比例", channel.min_frequency_frame_support),
+                self._number("channel_region.canny_low", "界线 Canny 低阈值", channel.canny_low),
+                self._number("channel_region.canny_high", "界线 Canny 高阈值", channel.canny_high),
+                self._number("channel_region.work_max_width", "最大工作宽度", channel.work_max_width),
+                self._number("channel_region.work_max_height", "最大工作高度", channel.work_max_height),
+            ],
+            2: [
+                self._number("channel_region.hough_threshold", "直线累加阈值", channel.hough_threshold),
+                self._number("channel_region.min_line_length_ratio", "最短直线比例", channel.min_line_length_ratio),
+                self._number("channel_region.max_line_gap_ratio", "最大断线间隙比例", channel.max_line_gap_ratio),
+                self._number("channel_region.max_lines", "最大候选直线数", channel.max_lines),
+                self._number("channel_region.parallel_tolerance_degrees", "平行角容差（°）", channel.parallel_tolerance_degrees),
+            ],
             3: [
-                self._check("enable_gaussian_blur", "启用输入平滑", config.enable_gaussian_blur),
-                self._number("gaussian_blur_size", "高斯核大小", config.gaussian_blur_size),
-            ],
-            4: [
-                self._check("enable_contour_candidates", "启用快速轮廓主检测", config.enable_contour_candidates),
-                self._number("contour_work_scale", "候选检测缩放", config.contour_work_scale),
-            ],
-            5: [
-                self._number("adaptive_threshold_block_size", "自适应阈值块大小", config.adaptive_threshold_block_size),
-                self._number("adaptive_threshold_c", "自适应阈值 C", config.adaptive_threshold_c),
-                self._check("enable_morphology", "启用形态学清理", config.enable_morphology),
-                self._number("morphology_open_kernel", "开运算核", config.morphology_open_kernel),
-                self._number("morphology_close_kernel", "闭运算核", config.morphology_close_kernel),
+                self._number("channel_region.min_confidence", "最低可信度", channel.min_confidence),
+                self._number("channel_region.min_width_ratio", "最小管宽比例", channel.min_width_ratio),
+                self._number("channel_region.max_width_ratio", "最大管宽比例", channel.max_width_ratio),
+                self._number("channel_region.max_separation_variation_ratio", "间距变化容差", channel.max_separation_variation_ratio),
+                self._number("channel_region.min_region_contrast", "最低内外高频对比", channel.min_region_contrast),
+                self._number("channel_region.full_region_contrast", "满分内外高频对比", channel.full_region_contrast),
+                self._number("channel_region.min_region_coverage", "最低高频区域覆盖率", channel.min_region_coverage),
+                self._number("channel_region.min_coverage_advantage", "最低内外覆盖率差", channel.min_coverage_advantage),
+                self._number("channel_region.high_frequency_weight", "高低频区域权重", channel.high_frequency_weight),
+                self._number("channel_region.straightness_weight", "直线性质权重", channel.straightness_weight),
+                self._number("channel_region.geometry_weight", "区域几何权重", channel.geometry_weight),
             ],
             6: [
-                self._check("enable_background_subtraction", "启用背景差分", config.enable_background_subtraction),
-                self._number("background_difference_threshold", "背景差分阈值", config.background_difference_threshold),
-                self._number("background_learning_rate", "背景学习率", config.background_learning_rate),
+                self._check("enable_intensity_normalization", "启用归一化", config.enable_intensity_normalization),
             ],
             7: [
-                self._number("contour_canny_low", "Canny 低阈值", config.contour_canny_low),
-                self._number("contour_canny_high", "Canny 高阈值", config.contour_canny_high),
-                self._number("contour_close_kernel", "边缘闭运算核", config.contour_close_kernel),
+                self._check("enable_gaussian_blur", "启用高斯平滑", config.enable_gaussian_blur),
+                self._number("gaussian_blur_size", "高斯核大小", config.gaussian_blur_size),
             ],
             8: [
-                self._number("min_radius", "绝对最小半径", config.min_radius),
-                self._number("max_radius", "绝对最大半径", config.max_radius),
-                self._number("contour_min_circularity", "最小圆度", config.contour_min_circularity),
-                self._number("contour_min_axis_ratio", "最小长短轴比", config.contour_min_axis_ratio),
-                self._number("contour_min_edge_support", "最小轮廓边缘支撑", config.contour_min_edge_support),
-                self._number("contour_min_area_fill_ratio", "最小椭圆填充率", config.contour_min_area_fill_ratio),
+                self._check("enable_hough_clahe", "启用 CLAHE", config.enable_hough_clahe),
+                self._check("enable_hough_median_blur", "启用中值滤波", config.enable_hough_median_blur),
+                self._number("hough_work_max_width", "最大工作宽度", config.hough_work_max_width),
+                self._number("hough_work_max_height", "最大工作高度", config.hough_work_max_height),
             ],
             9: [
-                self._check("enable_watershed_split", "启用局部 Watershed", config.enable_watershed_split),
-                self._number("watershed_peak_ratio", "距离峰比例", config.watershed_peak_ratio),
-                self._number("watershed_min_peak_radius_ratio", "最小峰半径比例", config.watershed_min_peak_radius_ratio),
-                self._number("watershed_max_markers", "局部最大标记数", config.watershed_max_markers),
+                self._number("hough_param1", "Hough/Canny 梯度阈值", config.hough_param1),
+                self._number("hough_edge_neighborhood", "边缘支撑邻域", config.hough_edge_neighborhood),
             ],
             10: [
-                self._check("enable_hough_candidates", "启用疑难区域 Hough", config.enable_hough_candidates),
-                self._number("local_hough_padding_ratio", "局部 Hough 边距比例", config.local_hough_padding_ratio),
-                self._number("local_hough_max_regions", "每帧最大疑难区域", config.local_hough_max_regions),
-                self._number("hough_refresh_interval", "全帧 Hough 周期（0=关闭）", config.hough_refresh_interval),
+                self._check("enable_hough_candidates", "启用全帧 Hough", config.enable_hough_candidates),
                 self._number("hough_dp", "累加器分辨率 dp", config.hough_dp),
                 self._number("hough_min_distance", "最小圆心距离（0=自动）", config.hough_min_distance),
-                self._number("hough_param1", "Hough 梯度阈值", config.hough_param1),
                 self._number("hough_param2", "Hough 累加阈值", config.hough_param2),
                 self._number("hough_min_radius", "Hough 最小半径", config.hough_min_radius),
                 self._number("hough_max_radius", "Hough 最大半径", config.hough_max_radius),
-                self._number("hough_edge_support_threshold", "Hough 边缘支撑", config.hough_edge_support_threshold),
             ],
             11: [
-                self._check("enable_expected_size_filter", "启用目标尺寸过滤", config.enable_expected_size_filter),
+                self._number("min_radius", "绝对最小半径", config.min_radius),
+                self._number("max_radius", "绝对最大半径", config.max_radius),
+                self._number("hough_edge_support_threshold", "最小边缘支撑", config.hough_edge_support_threshold),
+                self._number("candidate_min_visible_circle_ratio", "最小可见圆周", config.candidate_min_visible_circle_ratio),
+                self._number("cut_line_ratio", "检测截止线比例", config.cut_line_ratio),
+                self._check("enable_expected_size_filter", "启用标定尺寸过滤", config.enable_expected_size_filter),
+                self._check("expected_size_hard_gate", "严格尺寸过滤", config.expected_size_hard_gate),
                 self._number("expected_radius", "期望液滴半径（px）", config.expected_radius),
                 self._number("expected_radius_tolerance_ratio", "半径容差比例", config.expected_radius_tolerance_ratio),
-                self._number("candidate_min_edge_support", "最终最小边缘支撑", config.candidate_min_edge_support),
-                self._number("candidate_min_visible_circle_ratio", "跟踪最小可见圆周", config.candidate_min_visible_circle_ratio),
                 self._number("candidate_full_circle_ratio", "直径有效完整度", config.candidate_full_circle_ratio),
             ],
         }
@@ -556,7 +593,7 @@ class TuningWindow(QWidget):
             "kind": "check",
             "value": value,
             "text": "执行此步骤",
-            "modified": value != getattr(self.original_config, key),
+            "modified": value != getattr(self._original_parameter_owner(key)[0], self._original_parameter_owner(key)[1]),
         }
 
     def _number(self, key: str, label: str, value: int | float) -> dict[str, Any]:
@@ -565,14 +602,19 @@ class TuningWindow(QWidget):
             "label": label,
             "kind": "number",
             "value": value,
-            "modified": value != getattr(self.original_config, key),
+            "modified": value != getattr(self._original_parameter_owner(key)[0], self._original_parameter_owner(key)[1]),
         }
 
     def _redraw(self) -> None:
         if not self.frames:
             return
         try:
-            result, stages = inspect_frame(self.frames[self.frame_pos].image, self.current_config)
+            result, stages = inspect_frame(
+                self.frames[self.frame_pos].image,
+                self.current_config,
+                channel_config=self.current_channel_config,
+                channel_frames=[item.image for item in self.frames],
+            )
             self._show_stages(stages)
             frame_index = self.frames[self.frame_pos].index
             self.status.setText(
@@ -605,7 +647,14 @@ class TuningWindow(QWidget):
         )
         if path:
             Path(path).write_text(
-                json.dumps(asdict(self.current_config), ensure_ascii=False, indent=2),
+                json.dumps(
+                    {
+                        "detector": asdict(self.current_config),
+                        "channel_region": asdict(self.current_channel_config),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
                 encoding="utf-8",
             )
 

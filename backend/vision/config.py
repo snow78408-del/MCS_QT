@@ -11,6 +11,9 @@ BeadMode = Literal["intensity", "connected"]
 
 @dataclass
 class ROIConfig:
+    # Explicit/manual rectangles take priority over automatic channel-region
+    # calibration. Auto-suggested preview rectangles set this to False.
+    user_defined: bool = True
     # The configured HIKROBOT view places the useful channel in the lower
     # middle of the 720x540 frame. Keeping the analysis away from the channel
     # walls removes the strongest non-droplet edges before detection.
@@ -36,6 +39,40 @@ class ROIConfig:
 
 
 @dataclass
+class ChannelRegionConfig:
+    # Startup-only automatic channel-region calibration. Manual ROI/wall
+    # selections always take priority; low-confidence results fall back to the
+    # complete frame instead of blocking recognition.
+    enabled: bool = True
+    sample_frames: int = 12
+    min_confidence: float = 0.58
+    work_max_width: int = 960
+    work_max_height: int = 720
+    # Local RMS window used to turn thin spatial gradients into a continuous
+    # high-frequency region before its high/low boundary is fitted.
+    frequency_window_ratio: float = 0.025
+    min_frequency_region_thickness_ratio: float = 0.055
+    min_frequency_frame_support: float = 0.60
+    min_region_contrast: float = 0.10
+    full_region_contrast: float = 0.35
+    min_region_coverage: float = 0.55
+    min_coverage_advantage: float = 0.25
+    canny_low: int = 35
+    canny_high: int = 110
+    hough_threshold: int = 42
+    min_line_length_ratio: float = 0.45
+    max_line_gap_ratio: float = 0.08
+    max_lines: int = 40
+    parallel_tolerance_degrees: float = 8.0
+    min_width_ratio: float = 0.08
+    max_width_ratio: float = 0.90
+    max_separation_variation_ratio: float = 0.12
+    high_frequency_weight: float = 0.65
+    straightness_weight: float = 0.25
+    geometry_weight: float = 0.10
+
+
+@dataclass
 class DetectorConfig:
     # Image-domain measurement bounds. These are independent of the PID target.
     min_radius: float = 8.0
@@ -52,8 +89,9 @@ class DetectorConfig:
     deduplicate_distance_ratio: float = 0.60
     deduplicate_min_distance: float = 6.0
     deduplicate_contained_ratio: float = 0.88
-    # Fast contour branch. It supplies high-recall candidates on every frame;
-    # Hough remains an independent periodic/fallback source for weak outlines.
+    # Deprecated compatibility fields from the former contour/background/
+    # Watershed detector. Saved JSON profiles may still contain them, but the
+    # Hough-only detector does not read them.
     enable_contour_candidates: bool = True
     contour_work_scale: float = 0.50
     enable_background_subtraction: bool = True
@@ -90,12 +128,10 @@ class DetectorConfig:
     split_peak_threshold_ratio: float = 0.55
     split_min_radius_ratio: float = 0.65
     split_large_area_ratio: float = 1.15
-    # Hough is deliberately not paid on every frame. Ambiguous local regions,
-    # empty fast-path frames, and optional refresh frames run it as needed.
+    # Active detector path: one full-frame HoughCircles call per frame.
     enable_hough_candidates: bool = True
+    # Deprecated hybrid-detector compatibility fields.
     hough_fallback_only: bool = False
-    # Zero disables periodic full-frame Hough. Set this to 2 or 3 only when a
-    # camera setup has outlines too weak for segmentation/background motion.
     hough_refresh_interval: int = 0
     enable_hough_clahe: bool = True
     enable_hough_median_blur: bool = True
@@ -108,9 +144,8 @@ class DetectorConfig:
     hough_preferred_radius: float = 0.0
     hough_edge_support_threshold: float = 0.15
     hough_edge_neighborhood: int = 2
-    # Dense-droplet safeguards. A reliable target radius rejects implausible
-    # Hough sizes; edge ownership rejects circles assembled from neighbouring
-    # droplets' arcs.
+    # Optional calibrated-size hard gate. Edge-ownership fields below are kept
+    # only for settings compatibility and are not used by the simple detector.
     enable_expected_size_filter: bool = True
     expected_radius_tolerance_ratio: float = 0.30
     enable_edge_ownership_filter: bool = True
@@ -136,6 +171,8 @@ class DetectorConfig:
     multi_droplet_child_radius_ratio: float = 0.82
     multi_droplet_child_distance_ratio: float = 0.90
     multi_droplet_child_count: int = 2
+    # Deprecated scoring-pipeline fields; Hough edge support is controlled by
+    # hough_edge_support_threshold.
     candidate_min_edge_support: float = 0.15
     candidate_min_ring_contrast: float = -1.0
     # In the current bright-field setup, a real droplet has a brighter inner
@@ -226,6 +263,7 @@ class DebugConfig:
 @dataclass
 class PipelineConfig:
     roi: ROIConfig = field(default_factory=ROIConfig)
+    channel_region: ChannelRegionConfig = field(default_factory=ChannelRegionConfig)
     detector: DetectorConfig = field(default_factory=DetectorConfig)
     tracker: TrackerConfig = field(default_factory=TrackerConfig)
     beads: BeadConfig = field(default_factory=BeadConfig)

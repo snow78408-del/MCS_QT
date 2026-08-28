@@ -118,6 +118,9 @@ class RecognitionSnapshot:
     channel_calibration_status: str = "disabled"
     channel_calibration_confidence: float = 0.0
     channel_calibration_reason: str = ""
+    channel_region_status: str = "skipped"
+    channel_region_confidence: float = 0.0
+    channel_region_reason: str = ""
     session_id: str = ""
     run_generation: int = 0
     capture_monotonic: float = 0.0

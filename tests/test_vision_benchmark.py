@@ -11,7 +11,6 @@ from backend.vision.tuning import TuningFrame
 
 def test_labeled_benchmark_reports_accuracy_radius_error_and_runtime() -> None:
     config = default_config()
-    config.detector.enable_hough_candidates = False
     frames: list[TuningFrame] = []
     labels: list[LabeledFrame] = []
     for index in range(4):

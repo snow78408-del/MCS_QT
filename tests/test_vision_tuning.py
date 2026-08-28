@@ -5,7 +5,7 @@ import unittest
 import cv2
 import numpy as np
 
-from backend.vision.config import DetectorConfig
+from backend.vision.config import ChannelRegionConfig, DetectorConfig
 from backend.vision.tuning import (
     TuningFrame,
     annotate_frame,
@@ -36,15 +36,37 @@ class VisionTuningTests(unittest.TestCase):
     def test_pipeline_inspection_exposes_each_processing_stage(self):
         frame = self._frames()[0].image
         result, stages = inspect_frame(frame, DetectorConfig())
-        self.assertEqual(len(stages), 12)
+        self.assertEqual(len(stages), 8)
         self.assertEqual(stages[0].name, "1. 原始图像")
-        self.assertEqual(stages[-1].name, "12. 融合评分与抑制")
-        self.assertIn("缩放检测图", stages[4].name)
-        self.assertIn("自适应二值分割", stages[5].name)
-        self.assertIn("局部 Watershed", stages[9].name)
-        self.assertIn("局部 Hough", stages[10].name)
+        self.assertEqual(stages[-1].name, "8. 简单过滤结果")
+        self.assertIn("Hough 输入预处理", stages[4].name)
+        self.assertIn("Hough 边缘支撑", stages[5].name)
+        self.assertIn("Hough 原始圆", stages[6].name)
         self.assertTrue(all(stage.image.size > 0 for stage in stages))
         self.assertEqual(len(result.centers), len(result.radii))
+
+    def test_channel_region_is_exposed_as_a_major_stage_before_detection(self):
+        frames = []
+        for index in range(12):
+            image = np.full((240, 520, 3), 180, dtype=np.uint8)
+            cv2.line(image, (3, 45), (516, 58), (35, 35, 35), 3)
+            cv2.line(image, (3, 185), (516, 198), (35, 35, 35), 3)
+            cv2.circle(image, (80 + index * 10, 120), 20, (90, 90, 90), 2)
+            frames.append(image)
+
+        _result, stages = inspect_frame(
+            frames[0],
+            DetectorConfig(),
+            channel_config=ChannelRegionConfig(),
+            channel_frames=frames,
+        )
+
+        self.assertEqual(len(stages), 12)
+        self.assertIn("管道检定", stages[0].name)
+        self.assertIn("高频信号", stages[1].name)
+        self.assertIn("直线性质", stages[2].name)
+        self.assertIn("有效区域", stages[3].name)
+        self.assertTrue(stages[4].name.startswith("B1."))
 
     def test_optional_preprocessing_steps_can_be_skipped(self):
         frame = self._frames()[0].image
@@ -64,7 +86,7 @@ class VisionTuningTests(unittest.TestCase):
         results = grid_search(
             frames,
             base,
-            {"hough_param2": [20, 28], "candidate_min_edge_support": [0.1, 0.2]},
+            {"hough_param2": [20, 28], "hough_edge_support_threshold": [0.1, 0.2]},
             expected_count=1,
         )
         self.assertEqual(len(results), 4)

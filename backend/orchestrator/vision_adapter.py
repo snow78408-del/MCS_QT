@@ -264,6 +264,9 @@ class PipelineVisionService:
             channel_calibration_status=self._channel_calibration_status,
             channel_calibration_confidence=self._channel_calibration_confidence,
             channel_calibration_reason=self._channel_calibration_reason,
+            channel_region_status=self._ensure_pipeline().current_channel_region().status,
+            channel_region_confidence=self._ensure_pipeline().current_channel_region().confidence,
+            channel_region_reason=self._ensure_pipeline().current_channel_region().reason,
         )
 
     def _snapshot_with_error(self, reason: str) -> RecognitionSnapshot:
@@ -356,9 +359,18 @@ class PipelineVisionService:
         )
 
     def set_recognition_roi(self, roi: dict[str, Any] | None) -> None:
-        config = self._ensure_pipeline().config.roi
+        pipeline = self._ensure_pipeline()
+        config = pipeline.config.roi
         values = dict(roi or {})
         config.enabled = bool(values.get("enabled", False))
+        config.user_defined = bool(values.get("user_defined", config.enabled))
+        channel_region = pipeline.config.channel_region
+        channel_region.enabled = bool(values.get("channel_region_enabled", True))
+        channel_region.sample_frames = max(1, min(48, int(values.get("channel_region_sample_frames", 12))))
+        channel_region.min_confidence = max(
+            0.0,
+            min(1.0, float(values.get("channel_region_min_confidence", channel_region.min_confidence))),
+        )
         config.x_start_ratio = max(0.0, min(1.0, float(values.get("x_start_ratio", 0.0))))
         config.x_end_ratio = max(0.0, min(1.0, float(values.get("x_end_ratio", 1.0))))
         config.y_start_ratio = max(0.0, min(1.0, float(values.get("y_start_ratio", 0.0))))
@@ -386,7 +398,14 @@ class PipelineVisionService:
             raise ValueError("管道内宽必须大于 0 μm")
         if self._channel_calibration_enabled and not config.enabled:
             raise ValueError("启用 430 μm 管道标定前必须先启用并框选 ROI")
-        self._log(f"[VISION][ROI] enabled={config.enabled} x={config.x_start_ratio:.3f}-{config.x_end_ratio:.3f} y={config.y_start_ratio:.3f}-{config.y_end_ratio:.3f}")
+        pipeline.channel_region_detector.reset()
+        self._log(
+            f"[VISION][ROI] enabled={config.enabled} "
+            f"channel_region_enabled={channel_region.enabled} "
+            f"channel_region_samples={channel_region.sample_frames} "
+            f"x={config.x_start_ratio:.3f}-{config.x_end_ratio:.3f} "
+            f"y={config.y_start_ratio:.3f}-{config.y_end_ratio:.3f}"
+        )
 
     def _reset_channel_calibration(self) -> None:
         self._channel_width_px = None
@@ -1135,6 +1154,9 @@ class PipelineVisionService:
             channel_calibration_status=self._channel_calibration_status,
             channel_calibration_confidence=self._channel_calibration_confidence,
             channel_calibration_reason=self._channel_calibration_reason,
+            channel_region_status=result.channel_region.status,
+            channel_region_confidence=result.channel_region.confidence,
+            channel_region_reason=result.channel_region.reason,
             calibration_id=str(self._calibration_metadata.get("calibration_id", "") or ""),
             calibration_uncertainty_um_per_px=(
                 None

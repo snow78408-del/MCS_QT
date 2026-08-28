@@ -310,6 +310,8 @@ class VideoPage(Page):
         self.exposure=self.field(form,"曝光时间 (μs)",params.get("exposure",3000)); self.gain=self.field(form,"增益",params.get("gain",0)); self.fps=self.field(form,"目标帧率",params.get("frame_rate",100))
         self.frame_width=self.field(form,"图像宽度",params.get("width",720)); self.frame_height=self.field(form,"图像高度",params.get("height",540))
         roi=dict(cfg.get("recognition_roi",{}) or {}); self._roi_user_modified=bool(roi.get("user_defined",False)); self._selected_wall_lines=[dict(line) for line in list(roi.get("wall_lines",[]) or [])[:2]]; self._last_test_preview_b64=""; self.roi_on=QCheckBox("启用 ROI，仅识别框选区域"); self.roi_on.setChecked(bool(roi.get("enabled",False))); form.addRow("",self.roi_on)
+        self.channel_region_on=QCheckBox("启动时自动检定管道区域（失败回退整帧）"); self.channel_region_on.setChecked(bool(roi.get("channel_region_enabled",True))); form.addRow("",self.channel_region_on)
+        self.channel_region_samples=self.field(form,"自动检定采样帧数",roi.get("channel_region_sample_frames",12))
         values=[float(roi.get(k,d))*100 for k,d in (("x_start_ratio",0),("y_start_ratio",0),("x_end_ratio",1),("y_end_ratio",1))]; self.roi=self.field(form,"ROI 左,上,右,下 (%)",",".join(f"{v:g}" for v in values)); self.roi.textEdited.connect(self._mark_roi_modified); self.roi.editingFinished.connect(self._analyze_user_roi)
         self.channel_cal_on=QCheckBox("用已知管道内宽自动标定 μm/px"); self.channel_cal_on.setChecked(bool(roi.get("channel_calibration_enabled",True))); form.addRow("",self.channel_cal_on)
         self.channel_width=self.field(form,"管道内宽 (μm)",roi.get("channel_width_um",430.0))
@@ -429,11 +431,16 @@ class VideoPage(Page):
             lambda exc: self.roi_status.setText(f"霍夫直线识别失败：{exc}"),
         )
 
+    def _channel_region_sample_count(self):
+        sample_frames=int(float(self.channel_region_samples.text()))
+        if not 1<=sample_frames<=48: raise ValueError("自动检定采样帧数必须在 1–48 之间")
+        return sample_frames
+
     def roi_drawn(self,x0,y0,x1,y1):
         self._roi_user_modified=True; self._selected_wall_lines=[]; self.preview.set_hough_lines(self.preview._line_candidates,[]); self.roi_on.setChecked(True); values=(x0*100,y0*100,x1*100,y1*100); self.roi.setText(",".join(f"{v:.2f}" for v in values))
-        try: channel_width=float(self.channel_width.text())
-        except ValueError: channel_width=430.0
-        roi={"enabled":True,"x_start_ratio":x0,"y_start_ratio":y0,"x_end_ratio":x1,"y_end_ratio":y1,"user_defined":True,"wall_lines":[],"channel_calibration_enabled":self.channel_cal_on.isChecked(),"channel_width_um":channel_width}; self.app.save(recognition_roi=roi)
+        try: channel_width=float(self.channel_width.text()); sample_frames=self._channel_region_sample_count()
+        except ValueError as exc: self.roi_status.setText(str(exc)); return
+        roi={"enabled":True,"x_start_ratio":x0,"y_start_ratio":y0,"x_end_ratio":x1,"y_end_ratio":y1,"user_defined":True,"wall_lines":[],"channel_region_enabled":self.channel_region_on.isChecked(),"channel_region_sample_frames":sample_frames,"channel_calibration_enabled":self.channel_cal_on.isChecked(),"channel_width_um":channel_width}; self.app.save(recognition_roi=roi)
         self.roi_status.setText(f"已选择 ROI：左 {values[0]:.2f}% / 上 {values[1]:.2f}% / 右 {values[2]:.2f}% / 下 {values[3]:.2f}%。请确认两条内壁均完整可见。")
         self._analyze_user_roi()
 
@@ -457,7 +464,8 @@ class VideoPage(Page):
         if len(coords)!=4 or not (0<=coords[0]<coords[2]<=1 and 0<=coords[1]<coords[3]<=1): raise ValueError("ROI 范围无效")
         width=float(self.channel_width.text())
         if width<=0: raise ValueError("管道内宽必须大于 0 μm")
-        return {"enabled":self.roi_on.isChecked(),"x_start_ratio":coords[0],"y_start_ratio":coords[1],"x_end_ratio":coords[2],"y_end_ratio":coords[3],"user_defined":self._roi_user_modified,"wall_lines":[dict(line) for line in self._selected_wall_lines] if len(self._selected_wall_lines)==2 else [],"channel_calibration_enabled":self.channel_cal_on.isChecked(),"channel_width_um":width}
+        sample_frames=self._channel_region_sample_count()
+        return {"enabled":self.roi_on.isChecked(),"x_start_ratio":coords[0],"y_start_ratio":coords[1],"x_end_ratio":coords[2],"y_end_ratio":coords[3],"user_defined":self._roi_user_modified,"wall_lines":[dict(line) for line in self._selected_wall_lines] if len(self._selected_wall_lines)==2 else [],"channel_region_enabled":self.channel_region_on.isChecked(),"channel_region_sample_frames":sample_frames,"channel_calibration_enabled":self.channel_cal_on.isChecked(),"channel_width_um":width}
 
     def _analyze_user_roi(self):
         if not self._last_test_preview_b64 or not self._roi_user_modified: return
@@ -477,7 +485,9 @@ class VideoPage(Page):
         if analysis.get("auto_suggested") and applied and not self._roi_user_modified:
             values=[float(applied.get(k,d))*100 for k,d in (("x_start_ratio",0),("y_start_ratio",0),("x_end_ratio",1),("y_end_ratio",1))]
             self.roi.setText(",".join(f"{v:.2f}" for v in values)); self.roi_on.setChecked(True)
-            applied["channel_calibration_enabled"]=self.channel_cal_on.isChecked(); applied["channel_width_um"]=float(self.channel_width.text()); applied["user_defined"]=False; self.app.save(recognition_roi=applied)
+            try: sample_frames=self._channel_region_sample_count()
+            except ValueError as exc: self.roi_status.setText(str(exc)); return
+            applied["channel_region_enabled"]=self.channel_region_on.isChecked(); applied["channel_region_sample_frames"]=sample_frames; applied["channel_calibration_enabled"]=self.channel_cal_on.isChecked(); applied["channel_width_um"]=float(self.channel_width.text()); applied["user_defined"]=False; self.app.save(recognition_roi=applied)
         if analysis.get("ok"):
             source="用户 ROI" if analysis.get("used_user_roi") else "自动 ROI"
             self.roi_status.setText(f"{source} 管壁拟合成功：内宽 {float(analysis.get('channel_width_px')):.2f} px，比例 {float(analysis.get('pixel_to_micron')):.6f} μm/px；共显示 {len(hough_lines)} 条候选线。单击候选线附近即可选择，橙色表示已选。")
