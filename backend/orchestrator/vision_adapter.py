@@ -109,6 +109,7 @@ class PipelineVisionService:
 
         self._log = logger or (lambda _msg: None)
         self._pipeline = None
+        self._custom_algorithm_profile = False
         self._camera_service = VisionCameraService(logger=self._log)
         self._video_source_type = "camera"
         self._video_source = "0"
@@ -315,28 +316,41 @@ class PipelineVisionService:
     def set_calibration_metadata(self, metadata: dict[str, Any] | None) -> None:
         self._calibration_metadata = dict(metadata or {})
 
+    def configure_algorithm(self, profile: dict[str, Any] | None) -> None:
+        values = dict(profile or {})
+        plugin_id = str(values.get("plugin_id") or "hybrid_v1")
+        parameters = dict(values.get("parameters") or {})
+        self._ensure_pipeline().configure_algorithm(plugin_id, parameters)
+        self._custom_algorithm_profile = bool(values) and not bool(values.get("protected", False))
+        self._log(
+            f"[VISION][ALGORITHM] profile={values.get('name') or '内置算法'} "
+            f"plugin={plugin_id} custom={self._custom_algorithm_profile}"
+        )
+
     def configure_detection_scale(self, target_diameter_um: float, pixel_to_micron: float) -> None:
         self._expected_diameter_um = max(0.0, float(target_diameter_um))
         self._pixel_to_micron = float(pixel_to_micron) if float(pixel_to_micron) > 0.0 else 1.0
         self._configured_pixel_to_micron = self._pixel_to_micron
         pipeline = self._ensure_pipeline()
-        # The control target is deliberately stored only for display/control.
-        # It must not influence detector gates, candidate scores, or tracking.
-        pipeline.config.detector.expected_size_hard_gate = False
-        pipeline.config.detector.hough_work_max_width = 480
-        pipeline.config.detector.hough_work_max_height = 360
-        pipeline.config.detector.hough_max_candidates = 40
-        # Recover weaker, partially illuminated droplets, then let geometric
-        # scoring and temporal tracking reject isolated false candidates.
-        pipeline.config.detector.hough_param2 = 22.0
-        pipeline.config.detector.hough_edge_support_threshold = 0.12
-        pipeline.config.detector.candidate_min_edge_support = 0.12
-        pipeline.config.detector.candidate_full_circle_ratio = 0.75
+        # Preserve the historical runtime defaults for the protected built-in
+        # algorithm. A named user algorithm must run with exactly the values
+        # tuned and saved in its own profile.
+        detector_config = getattr(pipeline.config, "detector", None)
+        if not self._custom_algorithm_profile and detector_config is not None:
+            detector_config.expected_size_hard_gate = False
+            detector_config.hough_work_max_width = 480
+            detector_config.hough_work_max_height = 360
+            detector_config.hough_max_candidates = 40
+            detector_config.hough_param2 = 22.0
+            detector_config.hough_edge_support_threshold = 0.12
+            detector_config.candidate_min_edge_support = 0.12
+            detector_config.candidate_full_circle_ratio = 0.75
         # Recognition may run much slower than camera acquisition.  A droplet
         # can move farther than the old 120 px gate between processed frames.
         pipeline.config.tracker.match_distance = 180.0
         pipeline.config.tracker.match_distance_radius_ratio = 4.0
-        min_r, preferred_r, max_r = pipeline.detector.runtime_radius_range()
+        radius_range = getattr(pipeline.detector, "runtime_radius_range", None)
+        min_r, preferred_r, max_r = radius_range() if callable(radius_range) else (0.0, 0.0, 0.0)
         self._log(
             "[VISION][DETECTOR][SCALE] "
             f"control_target_ignored={self._expected_diameter_um:.3f}um "

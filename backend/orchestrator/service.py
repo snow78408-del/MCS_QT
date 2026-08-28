@@ -412,6 +412,9 @@ class OrchestratorService:
             set_camera_parameters = getattr(self.vision_service, "set_camera_parameters", None)
             if callable(set_camera_parameters):
                 set_camera_parameters(dict(getattr(cfg, "camera_parameters", {}) or {}))
+            configure_algorithm = getattr(self.vision_service, "configure_algorithm", None)
+            if callable(configure_algorithm):
+                configure_algorithm(dict(getattr(cfg, "detector_algorithm", {}) or {}))
             set_roi = getattr(self.vision_service, "set_recognition_roi", None)
             if callable(set_roi):
                 set_roi(dict(getattr(cfg, "recognition_roi", {}) or {}))

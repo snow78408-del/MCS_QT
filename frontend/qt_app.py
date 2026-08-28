@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFil
 
 from backend.orchestrator import BayesianOptimizationConfig, OrchestratorService
 from backend.orchestrator.models import SystemConfig
+from backend.vision.algorithm_profiles import AlgorithmProfileStore
 from backend.vision.calibration import load_calibration
 from .config import APP_TITLE, DEFAULT_REFRESH_INTERVAL_MS
 from .runtime_logging import create_runtime_logger
@@ -1280,14 +1281,14 @@ class TuningPage(Page):
         layout.addWidget(app.title("液滴识别算法调参", "只处理本地视频或图像，不连接相机、泵机、跟踪或 PID"))
         video = str(app.frontend_config.get("video_source", ""))
         initial_video = video if app.frontend_config.get("video_source_type") == "file" else ""
-        self.workbench = TuningWindow(initial_video, self)
+        self.workbench = TuningWindow(initial_video, self, algorithm_store=app.algorithm_store)
         layout.addWidget(self.workbench, 1)
 
 
 class FrontendApp(QMainWindow):
     def __init__(self, orchestrator=None, settings_store=None):
         super().__init__(); self.setWindowTitle(APP_TITLE); self.resize(1360,860); self.setMinimumSize(QSize(1280,760))
-        self.runtime_logger=create_runtime_logger(); self.orchestrator=orchestrator or OrchestratorService(logger=self.runtime_logger); self.settings_store=settings_store or FrontendSettingsStore(); self.frontend_config=self.settings_store.load(); self.refresh_interval_ms=DEFAULT_REFRESH_INTERVAL_MS
+        self.runtime_logger=create_runtime_logger(); self.orchestrator=orchestrator or OrchestratorService(logger=self.runtime_logger); self.settings_store=settings_store or FrontendSettingsStore(); self.frontend_config=self.settings_store.load(); self.algorithm_store=AlgorithmProfileStore(); self.refresh_interval_ms=DEFAULT_REFRESH_INTERVAL_MS
         self.pool=QThreadPool.globalInstance(); self.workers=set(); self.current=None; self._build(); self.show_page("parameter")
 
     def _build(self):
@@ -1332,7 +1333,7 @@ class FrontendApp(QMainWindow):
     def build_system_config(self):
         cfg=self.frontend_config; required=("target_diameter","pixel_to_micron","video_source_type","video_source","initial_q1","initial_q2","control_interval_ms"); missing=[k for k in required if k not in cfg]
         if missing: raise ValueError(f"缺少配置字段: {', '.join(missing)}")
-        return SystemConfig(target_diameter=float(cfg["target_diameter"]),pixel_to_micron=float(cfg["pixel_to_micron"]),video_source_type=str(cfg["video_source_type"]),video_source=str(cfg["video_source"]),initial_q1=float(cfg["initial_q1"]),initial_q2=float(cfg["initial_q2"]),control_interval_ms=int(cfg["control_interval_ms"]),pump_port=str(cfg.get("pump_port","")),pump_address=int(cfg.get("pump_address",1)),pump_baudrate=int(cfg.get("pump_baudrate",1200)),pump_parity=str(cfg.get("pump_parity","N")),mvs_sdk_path=str(cfg.get("mvs_sdk_path","")),camera_backend=str(cfg.get("camera_backend","")),camera_parameters=dict(cfg.get("camera_parameters",{}) or {}),recognition_roi=dict(cfg.get("recognition_roi",{}) or {}),calibration=dict(cfg.get("calibration",{}) or {}))
+        return SystemConfig(target_diameter=float(cfg["target_diameter"]),pixel_to_micron=float(cfg["pixel_to_micron"]),video_source_type=str(cfg["video_source_type"]),video_source=str(cfg["video_source"]),initial_q1=float(cfg["initial_q1"]),initial_q2=float(cfg["initial_q2"]),control_interval_ms=int(cfg["control_interval_ms"]),pump_port=str(cfg.get("pump_port","")),pump_address=int(cfg.get("pump_address",1)),pump_baudrate=int(cfg.get("pump_baudrate",1200)),pump_parity=str(cfg.get("pump_parity","N")),mvs_sdk_path=str(cfg.get("mvs_sdk_path","")),camera_backend=str(cfg.get("camera_backend","")),camera_parameters=dict(cfg.get("camera_parameters",{}) or {}),recognition_roi=dict(cfg.get("recognition_roi",{}) or {}),calibration=dict(cfg.get("calibration",{}) or {}),detector_algorithm=self.algorithm_store.active_profile().to_dict())
     def configure_prepare_initialize(self):
         cfg=self.build_system_config(); self.orchestrator.configure(cfg); self.orchestrator.prepare_video(); self.orchestrator.initialize_system()
     def task(self,task,on_success=None,on_error=None,disable=None):

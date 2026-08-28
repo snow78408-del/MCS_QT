@@ -8,17 +8,19 @@ import cv2
 import numpy as np
 
 try:
+    from .algorithms import get_algorithm
     from .bead_counter import BeadCounter, BeadResult
     from .config import PipelineConfig
-    from .detector import DetectionResult, DropletDetector
+    from .detector import DetectionResult
     from .kalman_tracker import KalmanTracker
     from .metrics import MetricsCalculator, MetricsResult
     from .nearest_tracker import NearestTracker
     from .tracker import BaseTracker, TrackingResult
 except ImportError:
+    from algorithms import get_algorithm
     from bead_counter import BeadCounter, BeadResult
     from config import PipelineConfig
-    from detector import DetectionResult, DropletDetector
+    from detector import DetectionResult
     from kalman_tracker import KalmanTracker
     from metrics import MetricsCalculator, MetricsResult
     from nearest_tracker import NearestTracker
@@ -41,14 +43,28 @@ class VisionPipeline:
     def __init__(self, config: PipelineConfig, logger: Callable[[str], None] | None = None) -> None:
         self.config = config
         self._log = logger or (lambda _msg: None)
-        self.detector = DropletDetector(config.detector, config.debug)
+        self.algorithm_id = "hybrid_v1"
+        self.algorithm_parameters = {}
+        self.detector = get_algorithm(self.algorithm_id).detector_factory(config.detector, config.debug)
         self.bead_counter = BeadCounter(config.beads, config.debug)
         self.metrics = MetricsCalculator(config.metrics, logger=self._log)
         self.tracker: BaseTracker = self._build_tracker(config)
         self._frame_index = 0
 
+    def configure_algorithm(self, plugin_id: str, parameters: dict | None = None) -> None:
+        plugin = get_algorithm(plugin_id)
+        algorithm_config = plugin.build_config(parameters)
+        self.algorithm_id = plugin.plugin_id
+        self.algorithm_parameters = plugin.serialize_config(algorithm_config)
+        self.detector = plugin.detector_factory(algorithm_config, self.config.debug)
+        # Preserve the legacy public config field for the built-in detector.
+        if plugin.plugin_id == "hybrid_v1":
+            self.config.detector = algorithm_config
+
     def configure_expected_diameter(self, diameter_um: float, pixel_to_micron: float) -> None:
-        self.detector.configure_expected_diameter(diameter_um, pixel_to_micron)
+        callback = getattr(self.detector, "configure_expected_diameter", None)
+        if callable(callback):
+            callback(diameter_um, pixel_to_micron)
 
     def _build_tracker(self, config: PipelineConfig) -> BaseTracker:
         if config.tracker.tracker_type == "kalman":
@@ -56,7 +72,9 @@ class VisionPipeline:
         return NearestTracker(config.tracker)
 
     def reset(self) -> None:
-        self.detector.reset_adaptive_size()
+        reset_detector = getattr(self.detector, "reset_adaptive_size", None)
+        if callable(reset_detector):
+            reset_detector()
         self.tracker.reset()
         self.metrics.reset()
         self._frame_index = 0
