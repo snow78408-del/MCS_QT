@@ -10,6 +10,7 @@ from PySide6.QtWidgets import QApplication, QDoubleSpinBox, QLabel, QSpinBox
 from backend.orchestrator.state import SystemState
 from frontend.qt_app import (
     CollapsibleSection,
+    InitPage,
     ParameterPage,
     StatusModule,
     StatusPage,
@@ -24,6 +25,7 @@ def _application() -> QApplication:
 class _PageApp:
     def __init__(self, config=None):
         self.frontend_config = dict(config or {})
+        self.device_verification = {"camera": False, "pump": False}
         self.saved = {}
         self.shown = ""
 
@@ -138,3 +140,56 @@ def test_status_overview_prefers_health_summary_over_raw_json() -> None:
     assert overview["system"][1] == "等待"
     assert overview["vision"][1] == "等待"
     assert overview["alert"] == "等待配置"
+
+
+def test_initialization_page_is_read_only_confirmation_for_saved_configuration() -> None:
+    _application()
+    page_app = _PageApp({
+        "video_source_type": "camera",
+        "video_source": "camera-001",
+        "camera_backend": "hikrobot",
+        "recognition_roi": {"enabled": True, "channel_calibration_enabled": True, "channel_width_um": 430.0},
+        "pump_port": "COM3",
+        "pump_address": 1,
+        "pump_baudrate": 1200,
+        "pump_parity": "N",
+        "initial_q1": 50.0,
+        "initial_q2": 20.0,
+    })
+    page = InitPage(page_app)
+    page_app.device_verification.update(camera=True, pump=True)
+    page.on_show()
+
+    assert page.button.isEnabled()
+    assert page.pump_card.property("health") == "ok"
+    assert page.flow_card.property("health") == "idle"
+    assert page.flow_card.badge.text() == "已保存"
+    assert page.back_button.text() == "返回泵机配置"
+
+    page.back_button.click()
+    assert page_app.shown == "pump"
+    page.close()
+
+
+def test_initialization_page_does_not_treat_saved_hardware_as_verified() -> None:
+    _application()
+    page_app = _PageApp({
+        "video_source_type": "camera",
+        "video_source": "saved-camera-id",
+        "camera_backend": "hikrobot",
+        "pump_port": "COM3",
+        "pump_address": 1,
+        "pump_baudrate": 1200,
+        "initial_q1": 50.0,
+        "initial_q2": 20.0,
+    })
+    page = InitPage(page_app)
+    page.on_show()
+
+    assert not page.button.isEnabled()
+    assert page.source_card.property("health") == "warning"
+    assert page.source_card.badge.text() == "仅保存配置"
+    assert page.pump_card.property("health") == "warning"
+    assert page.pump_card.badge.text() == "仅保存配置"
+    assert "尚缺" in page.readiness.text()
+    page.close()

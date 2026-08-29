@@ -560,6 +560,9 @@ class VideoPage(Page):
         for control in (self.roi_on,self.channel_region_on,self.channel_cal_on): control.toggled.connect(self._refresh_advanced_summary)
         for control in (self.channel_region_samples,self.channel_width): control.valueChanged.connect(self._refresh_advanced_summary)
         self.roi.textChanged.connect(self._refresh_advanced_summary)
+        for control in (self.exposure,self.gain,self.fps,self.frame_width,self.frame_height): control.valueChanged.connect(self._invalidate_camera_verification)
+        self.backend.currentTextChanged.connect(self._invalidate_camera_verification)
+        self.source.textChanged.connect(self._invalidate_camera_verification)
         self.mode.currentIndexChanged.connect(self._source_mode_changed)
         self._refresh_advanced_summary()
         self._source_mode_changed()
@@ -570,7 +573,11 @@ class VideoPage(Page):
         calibration=f"{self.channel_width.value():g} μm" if self.channel_cal_on.isChecked() else "关闭"
         self.advanced_summary.setText(f"ROI：{roi_text}  ·  自动检定：{region}  ·  宽度标定：{calibration}")
 
+    def _invalidate_camera_verification(self, *_args):
+        self.app.device_verification["camera"]=False
+
     def _source_mode_changed(self, *_args):
+        self._invalidate_camera_verification()
         is_camera=self.mode.currentData()=="camera"
         self.scan_button.setVisible(is_camera)
         self.browse_button.setVisible(not is_camera)
@@ -797,7 +804,10 @@ class VideoPage(Page):
             if preview:
                 try: self._last_test_preview_b64=preview; self._channel_analysis_done(test.get("channel_calibration_analysis") or {"ok":False,"reason":"未返回管壁分析结果","pixel_to_micron":float(self.app.frontend_config.get("pixel_to_micron",1.0))})
                 except Exception as exc: self.app.runtime_logger(f"[CAMERA][UI][PREVIEW][ERROR] {exc}")
-        else: self.app.error("相机测试失败",str(test.get("error") or test.get("message") or "设备未返回有效数据"))
+            self.app.device_verification["camera"]=True
+        else:
+            self.app.device_verification["camera"]=False
+            self.app.error("相机测试失败",str(test.get("error") or test.get("message") or "设备未返回有效数据"))
 
     def browse(self):
         name, _ = QFileDialog.getOpenFileName(self, "选择视频", "", "视频 (*.mp4 *.avi *.mov *.mkv);;所有文件 (*)")
@@ -830,11 +840,19 @@ class PumpPage(Page):
         read=QPushButton("连接并读取全部数据"); set_button_role(read,"secondary"); read.clicked.connect(self.read_pump); write=QPushButton("写入 Q1/Q2 并回读校验"); set_button_role(write,"warning"); write.clicked.connect(self.write_pump); row.addWidget(read); row.addWidget(write); form.addRow("",actions)
         self.result=QPlainTextEdit(); self.result.setReadOnly(True); form.addRow("识别与读写结果",self.result)
         layout.addWidget(box)
+        self.ports.currentIndexChanged.connect(self._invalidate_pump_verification)
+        self.address.valueChanged.connect(self._invalidate_pump_verification)
+        self.baud.valueChanged.connect(self._invalidate_pump_verification)
+        self.parity.currentTextChanged.connect(self._invalidate_pump_verification)
+
+    def _invalidate_pump_verification(self, *_args):
+        self.app.device_verification["pump"]=False
 
     def on_show(self):
         if self.ports.count()==0: self.scan_ports()
 
     def scan_ports(self):
+        self._invalidate_pump_verification()
         self.result.setPlainText("正在枚举串口设备…")
         def operation():
             from serial.tools import list_ports
@@ -878,6 +896,7 @@ class PumpPage(Page):
 
     def pump_done(self, action, values, result):
         recognized=bool((result or {}).get("recognized_as_pump",(result or {}).get("ok",False)))
+        self.app.device_verification["pump"]=recognized
         self.result.setPlainText(f"{action}完成；泵机协议识别: {'成功' if recognized else '失败'}\n"+json.dumps(result,ensure_ascii=False,indent=2,default=str))
         if recognized: self.app.save(pump_port=values["port"],pump_address=values["address"],pump_baudrate=values["baudrate"],pump_parity=values["parity"],initial_q1=values["q1"],initial_q2=values["q2"])
         else: self.app.error("未识别到泵机","串口可以打开，但设备没有返回有效泵协议数据。请检查地址、波特率和线缆。")
@@ -885,38 +904,81 @@ class PumpPage(Page):
 
 class InitPage(Page):
     def __init__(self, app):
-        super().__init__(app); layout = QVBoxLayout(self); layout.addWidget(app.title("系统初始化", "配置泵通信并启动后端服务"))
-        box = QGroupBox("泵与初始流量"); form = QFormLayout(box)
-        self.q1=self.number_field(form,"Q1",50,0.01,5000,decimals=2,suffix="μL/min"); self.q2=self.number_field(form,"Q2",20,0.01,5000,decimals=2,suffix="μL/min"); self.port=self.field(form,"串口","")
-        self.address=self.number_field(form,"地址",1,1,31,integer=True); self.baud=self.number_field(form,"波特率",1200,1,2000000,integer=True,suffix="baud"); self.parity=QComboBox(); self.parity.addItems(["N","E"]); form.addRow("校验位",self.parity)
-        self.status=QLabel("未初始化"); form.addRow("状态",self.status); self.button=QPushButton("初始化系统"); self.button.clicked.connect(self.initialize); form.addRow("",self.button)
-        summary, summary_layout=self.summary_box("初始化前检查")
-        self.check_summary=QLabel("等待配置")
-        self.check_summary.setWordWrap(True)
-        summary_layout.addWidget(self.check_summary)
-        summary_layout.addStretch()
-        content=QHBoxLayout(); content.addWidget(box,3); content.addWidget(summary,2); layout.addLayout(content); layout.addStretch()
+        super().__init__(app)
+        layout=QVBoxLayout(self)
+        layout.addWidget(app.title("系统初始化","确认已验证配置并启动视频、泵通信和控制服务"))
+        self.readiness=QLabel("正在检查配置…"); self.readiness.setObjectName("statusAlert"); self.readiness.setWordWrap(True); layout.addWidget(self.readiness)
+        cards=QGridLayout(); cards.setSpacing(12)
+        self.source_card=HealthCard("视频与相机")
+        self.roi_card=HealthCard("ROI 与标定")
+        self.pump_card=HealthCard("泵机通信")
+        self.flow_card=HealthCard("初始流量")
+        cards.addWidget(self.source_card,0,0); cards.addWidget(self.roi_card,0,1); cards.addWidget(self.pump_card,1,0); cards.addWidget(self.flow_card,1,1)
+        cards.setColumnStretch(0,1); cards.setColumnStretch(1,1); layout.addLayout(cards)
+        actions=QHBoxLayout()
+        self.status=QLabel("未初始化"); self.status.setObjectName("runtimeStateBadge"); actions.addWidget(self.status); actions.addStretch()
+        self.back_button=QPushButton("返回泵机配置"); set_button_role(self.back_button,"secondary"); self.back_button.clicked.connect(self._go_back); actions.addWidget(self.back_button)
+        self.button=QPushButton("确认配置并初始化系统"); self.button.clicked.connect(self.initialize); actions.addWidget(self.button)
+        layout.addLayout(actions); layout.addStretch()
+        self._back_target="pump"
 
     def on_show(self):
         cfg=self.app.frontend_config
-        self.q1.setValue(float(cfg.get("initial_q1",50)))
-        self.q2.setValue(float(cfg.get("initial_q2",20)))
-        self.address.setValue(int(cfg.get("pump_address",1)))
-        self.baud.setValue(int(cfg.get("pump_baudrate",1200)))
-        self.port.setText(str(cfg.get("pump_port","")))
-        self.parity.setCurrentText(str(cfg.get("pump_parity","N")))
-        source="本地视频" if cfg.get("video_source_type")=="file" else "实时相机"
-        calibration="已就绪" if cfg.get("calibration") else "缺少版本化标定（只能预览）"
-        pump="仿真/本地视频模式可留空" if source=="本地视频" and not self.port.text().strip() else (self.port.text().strip() or "未设置串口")
-        self.check_summary.setText(f"视频来源：{source}\n标定：{calibration}\n泵连接：{pump}\n\n初始化会准备视频、泵通信和控制服务。")
+        verification=dict(getattr(self.app,"device_verification",{}) or {})
+        source_type=str(cfg.get("video_source_type","") or "")
+        source_value=str(cfg.get("video_source","") or "")
+        is_file=source_type=="file"
+        self._back_target="video" if is_file else "pump"
+        self.back_button.setText("返回相机与 ROI 配置" if is_file else "返回泵机配置")
+        file_available=is_file and bool(source_value) and Path(source_value).is_file()
+        camera_verified=bool(verification.get("camera",False))
+        if is_file and file_available:self.source_card.set_status("ok","文件可用",f"本地视频 · {Path(source_value).name}")
+        elif is_file and source_value:self.source_card.set_status("error","文件不可用",f"已保存路径不存在 · {source_value}")
+        elif not is_file and source_value and camera_verified:self.source_card.set_status("ok","本次已验证",f"实时相机 · 设备 {source_value} · 后端 {cfg.get('camera_backend','--') or '--'}")
+        elif not is_file and source_value:self.source_card.set_status("warning","仅保存配置",f"设备 {source_value} 尚未在本次启动中测试取帧")
+        else:self.source_card.set_status("error","缺失","尚未选择视频来源")
+        roi=dict(cfg.get("recognition_roi",{}) or {})
+        roi_state="已启用" if roi.get("enabled") else "整帧识别"
+        calibration=dict(cfg.get("calibration",{}) or {})
+        channel_cal=bool(roi.get("channel_calibration_enabled",False))
+        if calibration:self.roi_card.set_status("ok","配置可用",f"{roi_state} · 已保存版本化像素标定")
+        elif channel_cal:self.roi_card.set_status("warning","待初始化检定",f"{roi_state} · 配置的已知管宽 {float(roi.get('channel_width_um',430.0)):g} μm 尚未实际检定")
+        else:self.roi_card.set_status("warning","仅保存配置",f"{roi_state} · 闭环前需要版本化标定")
+        port=str(cfg.get("pump_port","") or "").strip().upper()
+        pump_verified=bool(verification.get("pump",False))
+        if port and pump_verified:self.pump_card.set_status("ok","本次已验证",f"{port} · 地址 {int(cfg.get('pump_address',1))} · {int(cfg.get('pump_baudrate',1200))} baud · {cfg.get('pump_parity','N')}")
+        elif port:self.pump_card.set_status("warning","仅保存配置",f"{port} 尚未在本次启动中完成泵协议读取与回读校验")
+        elif is_file:self.pump_card.set_status("idle","本地模式","本地视频预览允许不连接泵机")
+        else:self.pump_card.set_status("error","未验证","请返回泵机页面完成协议识别与回读校验")
+        q1=float(cfg.get("initial_q1",50)); q2=float(cfg.get("initial_q2",20))
+        flow_ok=0<q1<=5000 and 0<q2<=5000 and q1>=q2+0.2
+        self.flow_card.set_status("idle" if flow_ok else "error","已保存" if flow_ok else "无效",f"Q1 {q1:g} / Q2 {q2:g} μL/min · 初始化时才会写入泵机")
+        source_ready=file_available if is_file else (bool(source_value) and camera_verified)
+        pump_ready=is_file or (bool(port) and pump_verified)
+        ready=source_ready and pump_ready and flow_ok
+        missing=[]
+        if not source_ready:missing.append("本次相机测试取帧" if not is_file else "有效的本地视频文件")
+        if not pump_ready:missing.append("本次泵协议读取与回读校验")
+        calibration_note="；当前缺少版本化标定，只能完成预览初始化，实验前检查会禁止闭环" if not calibration and not channel_cal else ""
+        readiness_text="本次会话的设备验证已完成，可以初始化" if ready else "不能初始化，尚缺："+"、".join(missing or ["有效配置"])
+        self.readiness.setProperty("status","ok" if ready else "error"); self.readiness.setText(readiness_text+calibration_note); self.readiness.style().unpolish(self.readiness); self.readiness.style().polish(self.readiness)
+        self.button.setEnabled(ready)
+
+    def _go_back(self):self.app.show_page(self._back_target)
 
     def initialize(self):
+        cfg=self.app.frontend_config
         try:
-            q1,q2=self.q1.value(),self.q2.value(); address,baud=self.address.value(),self.baud.value(); port=self.port.text().strip().upper()
+            q1,q2=float(cfg.get("initial_q1",50)),float(cfg.get("initial_q2",20)); address,baud=int(cfg.get("pump_address",1)),int(cfg.get("pump_baudrate",1200)); port=str(cfg.get("pump_port","") or "").strip().upper()
             if min(q1,q2,baud)<=0 or max(q1,q2)>5000 or not 1<=address<=31: raise ValueError("泵地址必须为 1–31，流量必须在 (0, 5000] μL/min")
-            if self.app.frontend_config.get("video_source_type")!="file" and not port: raise ValueError("泵串口不能为空")
+            if q1<q2+0.2: raise ValueError("油相 Q1 必须至少比水相 Q2 大 0.2 μL/min")
+            verification=dict(getattr(self.app,"device_verification",{}) or {})
+            if cfg.get("video_source_type")=="file":
+                if not Path(str(cfg.get("video_source","") or "")).is_file(): raise ValueError("本地视频文件不存在")
+            elif not verification.get("camera",False): raise ValueError("相机尚未在本次启动中成功测试取帧")
+            if cfg.get("video_source_type")!="file" and (not port or not verification.get("pump",False)): raise ValueError("泵机尚未在本次启动中完成协议识别与回读校验")
         except ValueError as exc: return self.app.error("初始化参数错误",str(exc))
-        self.app.save(initial_q1=q1,initial_q2=q2,pump_port=port,pump_address=address,pump_baudrate=baud,pump_parity=self.parity.currentText())
+        self.app.save(initial_q1=q1,initial_q2=q2,pump_port=port,pump_address=address,pump_baudrate=baud,pump_parity=str(cfg.get("pump_parity","N")))
         self.status.setText("初始化中…"); self.app.task(self.app.configure_prepare_initialize,self.done,self.failed,self.button)
 
     def done(self,_=None): self.status.setText("初始化完成"); self.app.show_page("monitor")
@@ -1654,7 +1716,7 @@ class TuningPage(Page):
 class FrontendApp(QMainWindow):
     def __init__(self, orchestrator=None, settings_store=None):
         super().__init__(); self.setWindowTitle(APP_TITLE); self.resize(1360,860); self.setMinimumSize(QSize(1180,700))
-        self.runtime_logger=create_runtime_logger(); self.orchestrator=orchestrator or OrchestratorService(logger=self.runtime_logger); self.settings_store=settings_store or FrontendSettingsStore(); self.vision_tuning_settings_store=VisionTuningSettingsStore(); self.frontend_config=self.settings_store.load(); self.refresh_interval_ms=DEFAULT_REFRESH_INTERVAL_MS
+        self.runtime_logger=create_runtime_logger(); self.orchestrator=orchestrator or OrchestratorService(logger=self.runtime_logger); self.settings_store=settings_store or FrontendSettingsStore(); self.vision_tuning_settings_store=VisionTuningSettingsStore(); self.frontend_config=self.settings_store.load(); self.device_verification={"camera":False,"pump":False}; self.refresh_interval_ms=DEFAULT_REFRESH_INTERVAL_MS
         self.pool=QThreadPool.globalInstance(); self.workers=set(); self.current=None; self._build(); self.show_page("parameter")
 
     def _build(self):
