@@ -14,10 +14,10 @@ from typing import Callable
 
 from PySide6.QtCore import QLockFile, QObject, QPoint, QRect, QRunnable, QSize, Qt, QThread, QThreadPool, QTimer, Signal, Slot
 from PySide6.QtGui import QColor, QCloseEvent, QFont, QFontDatabase, QImage, QMouseEvent, QPainter, QPen, QPixmap
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout,
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout,
     QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QInputDialog, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSplitter, QStackedWidget,
-    QVBoxLayout, QWidget)
+    QInputDialog, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QSpinBox,
+    QSplitter, QStackedWidget, QStyle, QToolButton, QVBoxLayout, QWidget)
 
 from backend.orchestrator import BayesianOptimizationConfig, OrchestratorService
 from backend.orchestrator.models import SystemConfig
@@ -74,6 +74,110 @@ class Worker(QRunnable):
             self.signals.finished.emit()
 
 
+def set_button_role(button: QPushButton | QToolButton, role: str) -> None:
+    """Assign a semantic role consumed by the application stylesheet."""
+    button.setProperty("role", role)
+
+
+class CollapsibleSection(QWidget):
+    def __init__(self, title: str, parent=None, *, expanded: bool = False):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        self.toggle = QToolButton()
+        self.toggle.setCheckable(True)
+        self.toggle.setChecked(expanded)
+        self.toggle.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.toggle.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.toggle.setProperty("role", "section")
+        self._title = title
+        self.body = QWidget()
+        self.body.setVisible(expanded)
+        self.toggle.toggled.connect(self._set_expanded)
+        layout.addWidget(self.toggle)
+        layout.addWidget(self.body)
+        self._update_text(expanded)
+
+    def _set_expanded(self, expanded: bool) -> None:
+        self.body.setVisible(expanded)
+        self._update_text(expanded)
+
+    def _update_text(self, expanded: bool) -> None:
+        self.toggle.setText(("▾  " if expanded else "▸  ") + self._title)
+
+
+class StatusModule(QWidget):
+    """Compact key-metric view with opt-in full diagnostic text."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._text = ""
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        self.summary = QLabel("等待数据…")
+        self.summary.setObjectName("metricSummary")
+        self.summary.setWordWrap(True)
+        self.summary.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        layout.addWidget(self.summary, 1)
+        self.details = QPlainTextEdit()
+        self.details.setReadOnly(True)
+        self.details.setLineWrapMode(QPlainTextEdit.WidgetWidth)
+        self.details.setVisible(False)
+        self.details.setMaximumHeight(170)
+        layout.addWidget(self.details)
+        self.toggle = QToolButton()
+        self.toggle.setCheckable(True)
+        self.toggle.setText("查看详情")
+        self.toggle.setProperty("role", "link")
+        self.toggle.toggled.connect(self._toggle_details)
+        layout.addWidget(self.toggle, 0, Qt.AlignRight)
+
+    def _toggle_details(self, checked: bool) -> None:
+        self.details.setVisible(checked)
+        self.toggle.setText("收起详情" if checked else "查看详情")
+
+    def setPlainText(self, text: str) -> None:
+        self._text = str(text)
+        self.details.setPlainText(self._text)
+        lines = [line.strip() for line in self._text.splitlines() if line.strip()]
+        self.summary.setText("\n".join(lines[:6]) or "等待数据…")
+
+    def toPlainText(self) -> str:
+        return self._text
+
+
+class HealthCard(QFrame):
+    def __init__(self, title: str, parent=None):
+        super().__init__(parent)
+        self.setObjectName("healthCard")
+        self.setProperty("health", "idle")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(6)
+        header = QHBoxLayout()
+        title_label = QLabel(title)
+        title_label.setObjectName("healthTitle")
+        self.badge = QLabel("等待")
+        self.badge.setObjectName("healthBadge")
+        header.addWidget(title_label)
+        header.addStretch()
+        header.addWidget(self.badge)
+        self.detail = QLabel("尚无状态数据")
+        self.detail.setObjectName("healthDetail")
+        self.detail.setWordWrap(True)
+        layout.addLayout(header)
+        layout.addWidget(self.detail)
+
+    def set_status(self, status: str, badge: str, detail: str) -> None:
+        self.setProperty("health", status)
+        self.badge.setText(badge)
+        self.detail.setText(detail)
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+
 class StatusPoller(QObject):
     snapshotReady = Signal(object)
     failed = Signal(object)
@@ -109,6 +213,42 @@ class Page(QWidget):
     def field(form, label, value=""):
         edit = QLineEdit(str(value)); form.addRow(label, edit); return edit
 
+    @staticmethod
+    def number_field(
+        form: QFormLayout,
+        label: str,
+        value: float,
+        minimum: float,
+        maximum: float,
+        *,
+        decimals: int = 2,
+        suffix: str = "",
+        integer: bool = False,
+    ) -> QDoubleSpinBox | QSpinBox:
+        if integer:
+            spin = QSpinBox()
+            spin.setRange(int(minimum), int(maximum))
+            spin.setValue(int(value))
+        else:
+            spin = QDoubleSpinBox()
+            spin.setDecimals(decimals)
+            spin.setRange(float(minimum), float(maximum))
+            spin.setValue(float(value))
+            spin.setSingleStep(10 ** -min(decimals, 3))
+        spin.setAccelerated(True)
+        spin.setKeyboardTracking(False)
+        if suffix:
+            spin.setSuffix(f" {suffix}")
+        form.addRow(label, spin)
+        return spin
+
+    @staticmethod
+    def summary_box(title: str) -> tuple[QGroupBox, QVBoxLayout]:
+        box = QGroupBox(title)
+        layout = QVBoxLayout(box)
+        layout.setSpacing(10)
+        return box, layout
+
 
 class RoiImageLabel(QLabel):
     roiChanged = Signal(float, float, float, float)
@@ -116,7 +256,7 @@ class RoiImageLabel(QLabel):
 
     def __init__(self):
         super().__init__("完成相机测试后，可在测试帧上拖拽选择 ROI")
-        self.setAlignment(Qt.AlignCenter); self.setMinimumSize(640,360)
+        self.setAlignment(Qt.AlignCenter); self.setMinimumSize(520,300)
         self.setStyleSheet("background:#080c12;color:#94a3b8;border:1px solid #334155;border-radius:6px")
         self._source=QPixmap(); self._start=QPoint(); self._selection=QRect(); self._dragging=False; self._line_candidates=[]; self._selected_line_ids=[]; self._line_click_tolerance=24.0
 
@@ -285,20 +425,53 @@ class ParameterPage(Page):
         super().__init__(app); cfg = app.frontend_config
         layout = QVBoxLayout(self); layout.addWidget(app.title("基础参数", "设定控制目标与光学标定"))
         box = QGroupBox("参数设定"); form = QFormLayout(box)
-        self.target = self.field(form, "目标液滴直径 (μm)", cfg.get("target_diameter", 60))
-        self.mag = self.field(form, "总放大倍率", cfg.get("magnification", 10))
-        self.pixel = self.field(form, "相机像元尺寸 (μm)", cfg.get("camera_pixel_size_um", 6.9))
-        self.interval = self.field(
+        self.target = self.number_field(form, "目标液滴直径", cfg.get("target_diameter", 60), 0.01, 10000, decimals=2, suffix="μm")
+        self.mag = self.number_field(form, "总放大倍率", cfg.get("magnification", 10), 0.01, 10000, decimals=3, suffix="×")
+        self.pixel = self.number_field(form, "相机像元尺寸", cfg.get("camera_pixel_size_um", 6.9), 0.001, 1000, decimals=4, suffix="μm")
+        self.interval = self.number_field(
             form,
-            f"控制周期 (ms，最低 {MIN_CONTROL_INTERVAL_MS})",
+            f"控制周期（最低 {MIN_CONTROL_INTERVAL_MS} ms）",
             int(cfg.get("control_interval_ms", DEFAULT_CONTROL_INTERVAL_MS)),
+            MIN_CONTROL_INTERVAL_MS,
+            MAX_CONTROL_INTERVAL_MS,
+            suffix="ms",
+            integer=True,
         )
         calibration_row=QWidget(); calibration_layout=QHBoxLayout(calibration_row); calibration_layout.setContentsMargins(0,0,0,0)
-        self.calibration_path=QLineEdit(str(cfg.get("calibration_path",""))); calibration_button=QPushButton("选择…"); calibration_button.clicked.connect(self._browse_calibration)
+        self.calibration_path=QLineEdit(str(cfg.get("calibration_path",""))); calibration_button=QPushButton("选择…"); set_button_role(calibration_button,"secondary"); calibration_button.clicked.connect(self._browse_calibration)
         calibration_layout.addWidget(self.calibration_path,1); calibration_layout.addWidget(calibration_button); form.addRow("版本化标定 JSON（可选）",calibration_row)
-        form.addRow("", QLabel("没有标定文件可留空；将使用像元尺寸÷放大倍率，仅允许预览，闭环控制前需补充标定 JSON。"))
-        button = QPushButton("保存并选择视频源"); button.clicked.connect(self.submit); form.addRow("", button)
-        layout.addWidget(box); layout.addStretch()
+        hint=QLabel("没有标定文件可留空；将使用像元尺寸÷放大倍率，仅允许预览，闭环控制前需补充标定 JSON。"); hint.setWordWrap(True); hint.setObjectName("formHint"); form.addRow("", hint)
+        button = QPushButton("保存并进入相机配置"); button.clicked.connect(self.submit); form.addRow("", button)
+
+        summary, summary_layout = self.summary_box("配置摘要")
+        self.scale_summary = QLabel()
+        self.scale_summary.setWordWrap(True)
+        self.calibration_summary = QLabel()
+        self.calibration_summary.setWordWrap(True)
+        next_hint = QLabel("下一步将选择实时相机或本地视频，并完成测试取帧和 ROI 设置。")
+        next_hint.setWordWrap(True)
+        next_hint.setObjectName("formHint")
+        summary_layout.addWidget(self.scale_summary)
+        summary_layout.addWidget(self.calibration_summary)
+        summary_layout.addSpacing(8)
+        summary_layout.addWidget(next_hint)
+        summary_layout.addStretch()
+        content = QHBoxLayout()
+        content.addWidget(box, 3)
+        content.addWidget(summary, 2)
+        layout.addLayout(content)
+        layout.addStretch()
+        for field in (self.target,self.mag,self.pixel,self.interval): field.valueChanged.connect(self._refresh_summary)
+        self.calibration_path.textChanged.connect(self._refresh_summary)
+        self._refresh_summary()
+
+    def _refresh_summary(self, *_args):
+        scale=self.pixel.value()/max(self.mag.value(),0.001)
+        self.scale_summary.setText(f"预估比例\n{scale:.6f} μm/px\n\n目标直径\n{self.target.value():.2f} μm")
+        path=self.calibration_path.text().strip()
+        self.calibration_summary.setText("标定状态\n已选择版本化标定文件" if path else "标定状态\n仅可预览；闭环控制前需要标定 JSON")
+        self.calibration_summary.setProperty("status","ok" if path else "warning")
+        self.calibration_summary.style().unpolish(self.calibration_summary); self.calibration_summary.style().polish(self.calibration_summary)
 
     def _browse_calibration(self):
         path,_=QFileDialog.getOpenFileName(self,"选择像素标定文件",self.calibration_path.text(),"JSON 文件 (*.json)")
@@ -306,8 +479,8 @@ class ParameterPage(Page):
 
     def submit(self):
         try:
-            target, mag, pixel = float(self.target.text()), float(self.mag.text()), float(self.pixel.text())
-            interval = int(float(self.interval.text()))
+            target, mag, pixel = self.target.value(), self.mag.value(), self.pixel.value()
+            interval = self.interval.value()
             if min(target, mag, pixel) <= 0 or not MIN_CONTROL_INTERVAL_MS<=interval<=MAX_CONTROL_INTERVAL_MS: raise ValueError(f"光学参数必须大于 0，实时控制周期必须为 {MIN_CONTROL_INTERVAL_MS}–{MAX_CONTROL_INTERVAL_MS} ms")
             calibration_path=self.calibration_path.text().strip(); calibration={}
             # 标定文件是闭环控制的前置条件，但不应阻止用户先进入视频/预览步骤。
@@ -329,24 +502,26 @@ class VideoPage(Page):
         source_box=QGroupBox("第 1 步 · 选择来源与设备"); source_row=QHBoxLayout(source_box)
         self.mode=QComboBox(); self.mode.addItem("实时相机","camera"); self.mode.addItem("本地视频","file"); self.mode.setCurrentIndex(1 if cfg.get("video_source_type")=="file" else 0)
         self.source=QLineEdit(str(cfg.get("video_source",""))); self.source.setPlaceholderText("扫描相机后自动填写设备 ID，或选择本地视频")
-        browse=QPushButton("浏览文件"); browse.clicked.connect(self.browse); scan=QPushButton("扫描相机"); scan.clicked.connect(self.scan_cameras)
-        source_row.addWidget(QLabel("来源")); source_row.addWidget(self.mode); source_row.addWidget(self.source,1); source_row.addWidget(browse); source_row.addWidget(scan); layout.addWidget(source_box)
+        self.browse_button=QPushButton("浏览文件"); set_button_role(self.browse_button,"secondary"); self.browse_button.clicked.connect(self.browse)
+        self.scan_button=QPushButton("扫描相机"); set_button_role(self.scan_button,"secondary"); self.scan_button.clicked.connect(self.scan_cameras)
+        source_row.addWidget(QLabel("来源")); source_row.addWidget(self.mode); source_row.addWidget(self.source,1); source_row.addWidget(self.browse_button); source_row.addWidget(self.scan_button); layout.addWidget(source_box)
 
         work=QSplitter(Qt.Horizontal)
-        settings=QGroupBox("第 2 步 · 设备与参数"); form=QFormLayout(settings); form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        settings=QGroupBox("第 2 步 · 设备与参数"); form=QFormLayout(settings); form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow); self.settings_form=form
         self.devices=QComboBox(); self.devices.setMinimumContentsLength(24); self.devices.currentIndexChanged.connect(self.camera_selected); form.addRow("发现的相机",self.devices)
         self.backend=QComboBox(); self.backend.addItems(["","hikrobot","opencv","gentl","basler","daheng","flir","allied_vision"]); self.backend.setCurrentText(str(cfg.get("camera_backend",""))); form.addRow("相机后端",self.backend)
-        self.exposure=self.field(form,"曝光时间 (μs)",params.get("exposure",3000)); self.gain=self.field(form,"增益",params.get("gain",0)); self.fps=self.field(form,"目标帧率",params.get("frame_rate",100))
-        self.frame_width=self.field(form,"图像宽度",params.get("width",720)); self.frame_height=self.field(form,"图像高度",params.get("height",540))
-        roi=dict(cfg.get("recognition_roi",{}) or {}); self._roi_user_modified=bool(roi.get("user_defined",False)); self._selected_wall_lines=[dict(line) for line in list(roi.get("wall_lines",[]) or [])[:2]]; self._last_test_preview_b64=""; self.roi_on=QCheckBox("启用 ROI，仅识别框选区域"); self.roi_on.setChecked(bool(roi.get("enabled",False))); form.addRow("",self.roi_on)
-        self.channel_region_on=QCheckBox("启动时自动检定管道区域（失败回退整帧）"); self.channel_region_on.setChecked(bool(roi.get("channel_region_enabled",True))); form.addRow("",self.channel_region_on)
-        self.channel_region_samples=self.field(form,"自动检定采样帧数",roi.get("channel_region_sample_frames",12))
-        values=[float(roi.get(k,d))*100 for k,d in (("x_start_ratio",0),("y_start_ratio",0),("x_end_ratio",1),("y_end_ratio",1))]; self.roi=self.field(form,"ROI 左,上,右,下 (%)",",".join(f"{v:g}" for v in values)); self.roi.textEdited.connect(self._mark_roi_modified); self.roi.editingFinished.connect(self._analyze_user_roi)
-        self.channel_cal_on=QCheckBox("用已知管道内宽自动标定 μm/px"); self.channel_cal_on.setChecked(bool(roi.get("channel_calibration_enabled",True))); form.addRow("",self.channel_cal_on)
-        self.channel_width=self.field(form,"管道内宽 (μm)",roi.get("channel_width_um",430.0))
+        self.exposure=self.number_field(form,"曝光时间",params.get("exposure",3000),1,10000000,decimals=1,suffix="μs"); self.gain=self.number_field(form,"增益",params.get("gain",0),0,1000,decimals=2); self.fps=self.number_field(form,"目标帧率",params.get("frame_rate",100),0.1,10000,decimals=1,suffix="FPS")
+        self.frame_width=self.number_field(form,"图像宽度",params.get("width",720),16,16384,integer=True,suffix="px"); self.frame_height=self.number_field(form,"图像高度",params.get("height",540),16,16384,integer=True,suffix="px")
+        advanced=CollapsibleSection("高级识别、ROI 与管道标定设置",expanded=False); advanced_form=QFormLayout(advanced.body); advanced_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        roi=dict(cfg.get("recognition_roi",{}) or {}); self._roi_user_modified=bool(roi.get("user_defined",False)); self._selected_wall_lines=[dict(line) for line in list(roi.get("wall_lines",[]) or [])[:2]]; self._last_test_preview_b64=""; self.roi_on=QCheckBox("启用 ROI，仅识别框选区域"); self.roi_on.setChecked(bool(roi.get("enabled",False))); advanced_form.addRow("",self.roi_on)
+        self.channel_region_on=QCheckBox("启动时自动检定管道区域（失败回退整帧）"); self.channel_region_on.setChecked(bool(roi.get("channel_region_enabled",True))); advanced_form.addRow("",self.channel_region_on)
+        self.channel_region_samples=self.number_field(advanced_form,"自动检定采样帧数",roi.get("channel_region_sample_frames",12),1,48,integer=True,suffix="帧")
+        values=[float(roi.get(k,d))*100 for k,d in (("x_start_ratio",0),("y_start_ratio",0),("x_end_ratio",1),("y_end_ratio",1))]; self.roi=self.field(advanced_form,"ROI 左,上,右,下 (%)",",".join(f"{v:g}" for v in values)); self.roi.textEdited.connect(self._mark_roi_modified); self.roi.editingFinished.connect(self._analyze_user_roi)
+        self.channel_cal_on=QCheckBox("用已知管道内宽自动标定 μm/px"); self.channel_cal_on.setChecked(bool(roi.get("channel_calibration_enabled",True))); advanced_form.addRow("",self.channel_cal_on)
+        self.channel_width=self.number_field(advanced_form,"管道内宽",roi.get("channel_width_um",430.0),0.01,100000,decimals=2,suffix="μm")
         calibration_hint=QLabel("标定时请完整框住两条管道内壁，ROI 尽量贴合，四周仅留约 3–5 px。标定只在启动阶段运行。")
-        calibration_hint.setWordWrap(True); form.addRow("",calibration_hint)
-        test=QPushButton("写入参数并同步测试取帧"); test.clicked.connect(self.test_camera); form.addRow("",test)
+        calibration_hint.setWordWrap(True); calibration_hint.setObjectName("formHint"); advanced_form.addRow("",calibration_hint); form.addRow("",advanced)
+        self.test_button=QPushButton("写入参数并同步测试取帧"); set_button_role(self.test_button,"secondary"); self.test_button.clicked.connect(self.test_camera); form.addRow("",self.test_button)
         save=QPushButton("保存配置并进入初始化"); save.clicked.connect(self.submit); form.addRow("",save); work.addWidget(settings)
 
         right=QWidget(); right_layout=QVBoxLayout(right); right_layout.setContentsMargins(0,0,0,0)
@@ -354,12 +529,26 @@ class VideoPage(Page):
         hough=dict(cfg.get("hough_line_parameters",{}) or {})
         try:self._hough_values=self._validate_hough_parameters(hough)
         except (TypeError,ValueError):self._hough_values=self._validate_hough_parameters({})
-        hough_actions=QHBoxLayout(); hough_actions.addStretch(); hough_button=QPushButton("调整霍夫参数…"); hough_button.clicked.connect(self._open_hough_parameters); hough_actions.addWidget(hough_button); preview_layout.addLayout(hough_actions)
+        hough_actions=QHBoxLayout(); hough_actions.addStretch(); hough_button=QPushButton("调整霍夫参数…"); set_button_role(hough_button,"secondary"); hough_button.clicked.connect(self._open_hough_parameters); hough_actions.addWidget(hough_button); preview_layout.addLayout(hough_actions)
         self.preview.set_line_click_tolerance(self._hough_values["click_tolerance_px"])
         self.roi_status=QLabel("测试取帧后会叠加霍夫直线。单击直线附近即可选取，两条橙色线表示已选管壁；拖拽空白区域可使用普通矩形 ROI。霍夫阈值为 0 时自动取图像宽度的 10%。"); self.roi_status.setWordWrap(True); preview_layout.addWidget(self.roi_status); right_layout.addWidget(preview_box,3)
         result_box=QGroupBox("连接结果与诊断"); result_layout=QVBoxLayout(result_box); self.camera_result=QPlainTextEdit(); self.camera_result.setReadOnly(True); self.camera_result.setMaximumHeight(150); result_layout.addWidget(self.camera_result)
-        result_actions=QHBoxLayout(); log_button=QPushButton("导出日志"); log_button.clicked.connect(self.export_log); result_actions.addStretch(); result_actions.addWidget(log_button); result_layout.addLayout(result_actions); right_layout.addWidget(result_box,1); work.addWidget(right)
+        result_actions=QHBoxLayout(); log_button=QPushButton("导出日志"); set_button_role(log_button,"secondary"); log_button.clicked.connect(self.export_log); result_actions.addStretch(); result_actions.addWidget(log_button); result_layout.addLayout(result_actions); right_layout.addWidget(result_box,1); work.addWidget(right)
         work.setStretchFactor(0,1); work.setStretchFactor(1,3); work.setSizes([330,760]); layout.addWidget(work,1)
+        self._camera_only_fields=(self.devices,self.backend,self.exposure,self.gain,self.fps,self.frame_width,self.frame_height,self.test_button)
+        self.mode.currentIndexChanged.connect(self._source_mode_changed)
+        self._source_mode_changed()
+
+    def _source_mode_changed(self, *_args):
+        is_camera=self.mode.currentData()=="camera"
+        self.scan_button.setVisible(is_camera)
+        self.browse_button.setVisible(not is_camera)
+        self.source.setPlaceholderText("扫描相机后自动填写设备 ID" if is_camera else "选择本地视频文件")
+        for field in self._camera_only_fields:
+            field.setVisible(is_camera)
+            label=self.settings_form.labelForField(field)
+            if label is not None: label.setVisible(is_camera)
+        self.roi_status.setText("实时相机模式：请扫描设备并完成同步测试取帧。" if is_camera else "本地视频模式：相机通信参数已隐藏；ROI 将在视频准备阶段应用。")
 
     def export_log(self):
         source=Path(self.app.runtime_logger.path); target,_=QFileDialog.getSaveFileName(self,"保存相机运行日志",source.name,"日志文件 (*.log);;所有文件 (*)")
@@ -461,13 +650,13 @@ class VideoPage(Page):
         )
 
     def _channel_region_sample_count(self):
-        sample_frames=int(float(self.channel_region_samples.text()))
+        sample_frames=int(self.channel_region_samples.value())
         if not 1<=sample_frames<=48: raise ValueError("自动检定采样帧数必须在 1–48 之间")
         return sample_frames
 
     def roi_drawn(self,x0,y0,x1,y1):
         self._roi_user_modified=True; self._selected_wall_lines=[]; self.preview.set_hough_lines(self.preview._line_candidates,[]); self.roi_on.setChecked(True); values=(x0*100,y0*100,x1*100,y1*100); self.roi.setText(",".join(f"{v:.2f}" for v in values))
-        try: channel_width=float(self.channel_width.text()); sample_frames=self._channel_region_sample_count()
+        try: channel_width=float(self.channel_width.value()); sample_frames=self._channel_region_sample_count()
         except ValueError as exc: self.roi_status.setText(str(exc)); return
         roi={"enabled":True,"x_start_ratio":x0,"y_start_ratio":y0,"x_end_ratio":x1,"y_end_ratio":y1,"user_defined":True,"wall_lines":[],"channel_region_enabled":self.channel_region_on.isChecked(),"channel_region_sample_frames":sample_frames,"channel_calibration_enabled":self.channel_cal_on.isChecked(),"channel_width_um":channel_width}; self.app.save(recognition_roi=roi)
         self.roi_status.setText(f"已选择 ROI：左 {values[0]:.2f}% / 上 {values[1]:.2f}% / 右 {values[2]:.2f}% / 下 {values[3]:.2f}%。请确认两条内壁均完整可见。")
@@ -491,7 +680,7 @@ class VideoPage(Page):
     def _roi_payload(self):
         coords=[float(x.strip())/100 for x in self.roi.text().split(",")]
         if len(coords)!=4 or not (0<=coords[0]<coords[2]<=1 and 0<=coords[1]<coords[3]<=1): raise ValueError("ROI 范围无效")
-        width=float(self.channel_width.text())
+        width=float(self.channel_width.value())
         if width<=0: raise ValueError("管道内宽必须大于 0 μm")
         sample_frames=self._channel_region_sample_count()
         return {"enabled":self.roi_on.isChecked(),"x_start_ratio":coords[0],"y_start_ratio":coords[1],"x_end_ratio":coords[2],"y_end_ratio":coords[3],"user_defined":self._roi_user_modified,"wall_lines":[dict(line) for line in self._selected_wall_lines] if len(self._selected_wall_lines)==2 else [],"channel_region_enabled":self.channel_region_on.isChecked(),"channel_region_sample_frames":sample_frames,"channel_calibration_enabled":self.channel_cal_on.isChecked(),"channel_width_um":width}
@@ -516,7 +705,7 @@ class VideoPage(Page):
             self.roi.setText(",".join(f"{v:.2f}" for v in values)); self.roi_on.setChecked(True)
             try: sample_frames=self._channel_region_sample_count()
             except ValueError as exc: self.roi_status.setText(str(exc)); return
-            applied["channel_region_enabled"]=self.channel_region_on.isChecked(); applied["channel_region_sample_frames"]=sample_frames; applied["channel_calibration_enabled"]=self.channel_cal_on.isChecked(); applied["channel_width_um"]=float(self.channel_width.text()); applied["user_defined"]=False; self.app.save(recognition_roi=applied)
+            applied["channel_region_enabled"]=self.channel_region_on.isChecked(); applied["channel_region_sample_frames"]=sample_frames; applied["channel_calibration_enabled"]=self.channel_cal_on.isChecked(); applied["channel_width_um"]=float(self.channel_width.value()); applied["user_defined"]=False; self.app.save(recognition_roi=applied)
         if analysis.get("ok"):
             source="用户 ROI" if analysis.get("used_user_roi") else "自动 ROI"
             self.roi_status.setText(f"{source} 管壁拟合成功：内宽 {float(analysis.get('channel_width_px')):.2f} px，比例 {float(analysis.get('pixel_to_micron')):.6f} μm/px；共显示 {len(hough_lines)} 条候选线。单击候选线附近即可选择，橙色表示已选。")
@@ -549,7 +738,7 @@ class VideoPage(Page):
     def test_camera(self):
         data=self.devices.currentData()
         if not data: return self.app.error("未选择相机","请先扫描并选择一台相机")
-        try: params={"exposure":float(self.exposure.text()),"gain":float(self.gain.text()),"frame_rate":float(self.fps.text()),"width":int(float(self.frame_width.text())),"height":int(float(self.frame_height.text()))}; roi_request=self._roi_payload(); hough_parameters=self._hough_parameters()
+        try: params={"exposure":self.exposure.value(),"gain":self.gain.value(),"frame_rate":self.fps.value(),"width":self.frame_width.value(),"height":self.frame_height.value()}; roi_request=self._roi_payload(); hough_parameters=self._hough_parameters()
         except ValueError as exc: return self.app.error("相机参数错误",str(exc))
         self.camera_result.setPlainText("正在连接相机、写入参数、采集测试帧并回读…")
         def operation():
@@ -589,7 +778,7 @@ class VideoPage(Page):
             if mode == "file" and not Path(source).is_file(): raise ValueError("请选择有效的视频文件")
             roi_config=self._roi_payload(); channel_width=float(roi_config["channel_width_um"])
             if self.channel_cal_on.isChecked() and not self.roi_on.isChecked(): raise ValueError("使用管道标定前必须启用并框选 ROI")
-            params = {"exposure":float(self.exposure.text()), "gain":float(self.gain.text()), "frame_rate":float(self.fps.text()), "width":int(float(self.frame_width.text())), "height":int(float(self.frame_height.text()))}; hough_parameters=self._hough_parameters()
+            params = {"exposure":self.exposure.value(), "gain":self.gain.value(), "frame_rate":self.fps.value(), "width":self.frame_width.value(), "height":self.frame_height.value()}; hough_parameters=self._hough_parameters()
         except ValueError as exc: return self.app.error("视频参数错误", str(exc))
         self.app.save(video_source_type=mode, video_source=source, camera_backend=self.backend.currentText(), camera_parameters=params,
                       recognition_roi=roi_config, hough_line_parameters=hough_parameters)
@@ -602,12 +791,12 @@ class PumpPage(Page):
         layout=QVBoxLayout(self); layout.addWidget(app.title("泵机识别与读写","扫描串口、验证泵协议、读取通道并安全写入回读"))
         box=QGroupBox("泵机通信"); form=QFormLayout(box)
         self.ports=QComboBox(); form.addRow("发现的串口",self.ports)
-        scan=QPushButton("扫描串口设备"); scan.clicked.connect(self.scan_ports); form.addRow("",scan)
-        self.address=self.field(form,"泵地址",cfg.get("pump_address",1)); self.baud=self.field(form,"波特率",cfg.get("pump_baudrate",1200))
+        scan=QPushButton("扫描串口设备"); set_button_role(scan,"secondary"); scan.clicked.connect(self.scan_ports); form.addRow("",scan)
+        self.address=self.number_field(form,"泵地址",cfg.get("pump_address",1),1,31,integer=True); self.baud=self.number_field(form,"波特率",cfg.get("pump_baudrate",1200),1,2000000,integer=True,suffix="baud")
         self.parity=QComboBox(); self.parity.addItems(["N","E"]); self.parity.setCurrentText(str(cfg.get("pump_parity","N"))); form.addRow("校验位",self.parity)
-        self.q1=self.field(form,"写入 Q1 (μL/min)",cfg.get("initial_q1",50)); self.q2=self.field(form,"写入 Q2 (μL/min)",cfg.get("initial_q2",20))
+        self.q1=self.number_field(form,"写入 Q1",cfg.get("initial_q1",50),0.01,5000,decimals=2,suffix="μL/min"); self.q2=self.number_field(form,"写入 Q2",cfg.get("initial_q2",20),0.01,5000,decimals=2,suffix="μL/min")
         actions=QWidget(); row=QHBoxLayout(actions); row.setContentsMargins(0,0,0,0)
-        read=QPushButton("连接并读取全部数据"); read.clicked.connect(self.read_pump); write=QPushButton("写入 Q1/Q2 并回读校验"); write.clicked.connect(self.write_pump); row.addWidget(read); row.addWidget(write); form.addRow("",actions)
+        read=QPushButton("连接并读取全部数据"); set_button_role(read,"secondary"); read.clicked.connect(self.read_pump); write=QPushButton("写入 Q1/Q2 并回读校验"); set_button_role(write,"warning"); write.clicked.connect(self.write_pump); row.addWidget(read); row.addWidget(write); form.addRow("",actions)
         self.result=QPlainTextEdit(); self.result.setReadOnly(True); form.addRow("识别与读写结果",self.result)
         layout.addWidget(box)
 
@@ -632,7 +821,7 @@ class PumpPage(Page):
     def values(self):
         data=self.ports.currentData()
         if not data: raise ValueError("未发现或未选择串口设备")
-        address=int(self.address.text()); baud=int(self.baud.text()); q1=float(self.q1.text()); q2=float(self.q2.text())
+        address=self.address.value(); baud=self.baud.value(); q1=self.q1.value(); q2=self.q2.value()
         if not 1<=address<=31 or min(baud,q1,q2)<=0 or max(q1,q2)>5000: raise ValueError("泵地址必须为 1–31，流量必须在 (0, 5000] μL/min")
         if q1 < q2 + 0.2: raise ValueError("油相 Q1 必须至少比水相 Q2 大 0.2 uL/min")
         return {"port":str(data["device"]),"address":address,"baudrate":baud,"parity":self.parity.currentText(),"q1":q1,"q2":q2}
@@ -667,19 +856,32 @@ class InitPage(Page):
     def __init__(self, app):
         super().__init__(app); layout = QVBoxLayout(self); layout.addWidget(app.title("系统初始化", "配置泵通信并启动后端服务"))
         box = QGroupBox("泵与初始流量"); form = QFormLayout(box)
-        self.q1=self.field(form,"Q1 (μL/min)",50); self.q2=self.field(form,"Q2 (μL/min)",20); self.port=self.field(form,"串口","")
-        self.address=self.field(form,"地址",1); self.baud=self.field(form,"波特率",1200); self.parity=QComboBox(); self.parity.addItems(["N","E"]); form.addRow("校验位",self.parity)
+        self.q1=self.number_field(form,"Q1",50,0.01,5000,decimals=2,suffix="μL/min"); self.q2=self.number_field(form,"Q2",20,0.01,5000,decimals=2,suffix="μL/min"); self.port=self.field(form,"串口","")
+        self.address=self.number_field(form,"地址",1,1,31,integer=True); self.baud=self.number_field(form,"波特率",1200,1,2000000,integer=True,suffix="baud"); self.parity=QComboBox(); self.parity.addItems(["N","E"]); form.addRow("校验位",self.parity)
         self.status=QLabel("未初始化"); form.addRow("状态",self.status); self.button=QPushButton("初始化系统"); self.button.clicked.connect(self.initialize); form.addRow("",self.button)
-        layout.addWidget(box); layout.addStretch()
+        summary, summary_layout=self.summary_box("初始化前检查")
+        self.check_summary=QLabel("等待配置")
+        self.check_summary.setWordWrap(True)
+        summary_layout.addWidget(self.check_summary)
+        summary_layout.addStretch()
+        content=QHBoxLayout(); content.addWidget(box,3); content.addWidget(summary,2); layout.addLayout(content); layout.addStretch()
 
     def on_show(self):
         cfg=self.app.frontend_config
-        for w,k,d in ((self.q1,"initial_q1",50),(self.q2,"initial_q2",20),(self.port,"pump_port",""),(self.address,"pump_address",1),(self.baud,"pump_baudrate",1200)): w.setText(str(cfg.get(k,d)))
+        self.q1.setValue(float(cfg.get("initial_q1",50)))
+        self.q2.setValue(float(cfg.get("initial_q2",20)))
+        self.address.setValue(int(cfg.get("pump_address",1)))
+        self.baud.setValue(int(cfg.get("pump_baudrate",1200)))
+        self.port.setText(str(cfg.get("pump_port","")))
         self.parity.setCurrentText(str(cfg.get("pump_parity","N")))
+        source="本地视频" if cfg.get("video_source_type")=="file" else "实时相机"
+        calibration="已就绪" if cfg.get("calibration") else "缺少版本化标定（只能预览）"
+        pump="仿真/本地视频模式可留空" if source=="本地视频" and not self.port.text().strip() else (self.port.text().strip() or "未设置串口")
+        self.check_summary.setText(f"视频来源：{source}\n标定：{calibration}\n泵连接：{pump}\n\n初始化会准备视频、泵通信和控制服务。")
 
     def initialize(self):
         try:
-            q1,q2=float(self.q1.text()),float(self.q2.text()); address,baud=int(self.address.text()),int(self.baud.text()); port=self.port.text().strip().upper()
+            q1,q2=self.q1.value(),self.q2.value(); address,baud=self.address.value(),self.baud.value(); port=self.port.text().strip().upper()
             if min(q1,q2,baud)<=0 or max(q1,q2)>5000 or not 1<=address<=31: raise ValueError("泵地址必须为 1–31，流量必须在 (0, 5000] μL/min")
             if self.app.frontend_config.get("video_source_type")!="file" and not port: raise ValueError("泵串口不能为空")
         except ValueError as exc: return self.app.error("初始化参数错误",str(exc))
@@ -775,30 +977,36 @@ class MonitorPage(Page):
         self._replay_dialog = None
         layout = QVBoxLayout(self)
         layout.addWidget(app.title("运行监控", "视频、识别、泵机与 PID 状态分别刷新"))
-        controls=QHBoxLayout()
+        control_bar=QFrame(); control_bar.setObjectName("controlBar"); control_layout=QVBoxLayout(control_bar); control_layout.setContentsMargins(10,8,10,8); control_layout.setSpacing(7)
+        lifecycle=QHBoxLayout(); lifecycle.setSpacing(7)
+        self.state_badge=QLabel("等待状态"); self.state_badge.setObjectName("runtimeStateBadge"); lifecycle.addWidget(self.state_badge)
         self.action_buttons={}
-        for text,callback in (("初始化",app.configure_prepare_initialize),("开始",app.orchestrator.start),("暂停",app.orchestrator.pause),("继续",app.orchestrator.resume),("复位安全锁",app.orchestrator.reset_safety_latch)):
-            button=QPushButton(text); button.clicked.connect(lambda _=False,cb=callback:app.task(cb)); controls.addWidget(button); self.action_buttons[text]=button
-        self.bo_button=QPushButton("BO寻优"); self.bo_button.clicked.connect(self._start_bo); controls.addWidget(self.bo_button)
-        self.preflight_button=QPushButton("实验前检查"); self.preflight_button.clicked.connect(self._run_preflight); controls.addWidget(self.preflight_button)
-        self.stop_button=QPushButton("停止"); self.stop_button.clicked.connect(self._stop_pid); controls.addWidget(self.stop_button)
-        self.target_button=QPushButton("更改目标"); self.target_button.clicked.connect(self._change_target_diameter); controls.addWidget(self.target_button)
-        self.save_data_button=QPushButton("保存数据"); self.save_data_button.clicked.connect(self._save_pid_data); controls.addWidget(self.save_data_button)
-        self.import_data_button=QPushButton("导入数据"); self.import_data_button.clicked.connect(self._import_pid_data); controls.addWidget(self.import_data_button)
+        initialize_button=QPushButton("初始化"); set_button_role(initialize_button,"secondary"); initialize_button.clicked.connect(lambda:app.task(app.configure_prepare_initialize)); lifecycle.addWidget(initialize_button); self.action_buttons["初始化"]=initialize_button
+        start_button=QPushButton("开始"); start_button.clicked.connect(lambda:app.task(app.orchestrator.start)); lifecycle.addWidget(start_button); self.action_buttons["开始"]=start_button
+        self.pause_button=QPushButton("暂停"); set_button_role(self.pause_button,"secondary"); self.pause_button.clicked.connect(self._pause_or_resume); lifecycle.addWidget(self.pause_button); self.action_buttons["暂停/继续"]=self.pause_button
+        self.stop_button=QPushButton("停止"); set_button_role(self.stop_button,"danger"); self.stop_button.clicked.connect(self._stop_pid); lifecycle.addWidget(self.stop_button)
+        safety_button=QPushButton("复位安全锁"); set_button_role(safety_button,"warning"); safety_button.clicked.connect(lambda:app.task(app.orchestrator.reset_safety_latch)); lifecycle.addWidget(safety_button); self.action_buttons["复位安全锁"]=safety_button
+        lifecycle.addStretch()
+        self.fps_label=QLabel("视频显示：0.0 / 30 FPS"); self.fps_label.setObjectName("fpsLabel"); lifecycle.addWidget(self.fps_label)
+        tools=QHBoxLayout(); tools.setSpacing(7); tools.addWidget(QLabel("实验工具"))
+        self.preflight_button=QPushButton("实验前检查"); set_button_role(self.preflight_button,"secondary"); self.preflight_button.clicked.connect(self._run_preflight); tools.addWidget(self.preflight_button)
+        self.bo_button=QPushButton("BO 寻优"); set_button_role(self.bo_button,"warning"); self.bo_button.clicked.connect(self._start_bo); tools.addWidget(self.bo_button)
+        self.target_button=QPushButton("更改目标"); set_button_role(self.target_button,"secondary"); self.target_button.clicked.connect(self._change_target_diameter); tools.addWidget(self.target_button)
+        tools.addSpacing(12); tools.addWidget(QLabel("数据"))
+        self.save_data_button=QPushButton("保存数据"); set_button_role(self.save_data_button,"secondary"); self.save_data_button.clicked.connect(self._save_pid_data); tools.addWidget(self.save_data_button)
+        self.import_data_button=QPushButton("导入数据"); set_button_role(self.import_data_button,"secondary"); self.import_data_button.clicked.connect(self._import_pid_data); tools.addWidget(self.import_data_button)
         self.gallery_button = QPushButton("上一周期识别帧")
+        set_button_role(self.gallery_button,"secondary")
         self.gallery_button.clicked.connect(self._show_last_period_droplets)
-        controls.addWidget(self.gallery_button)
-        controls.addStretch()
-        self.fps_label=QLabel("视频显示：0.0 / 30 FPS")
-        controls.addWidget(self.fps_label)
-        layout.addLayout(controls)
+        tools.addWidget(self.gallery_button); tools.addStretch()
+        control_layout.addLayout(lifecycle); control_layout.addLayout(tools); layout.addWidget(control_bar)
 
-        row=QHBoxLayout()
+        row=QSplitter(Qt.Horizontal)
         self.video=QLabel("等待视频帧")
         self.video.setAlignment(Qt.AlignCenter)
-        self.video.setMinimumSize(600,420)
+        self.video.setMinimumSize(480,320)
         self.video.setStyleSheet("background:#080c12;color:#8b98aa;border-radius:8px")
-        row.addWidget(self.video, 6)
+        row.addWidget(self.video)
 
         modules = QWidget(self)
         module_grid = QGridLayout(modules)
@@ -811,8 +1019,9 @@ class MonitorPage(Page):
         module_grid.setRowStretch(1, 1)
         module_grid.setColumnStretch(0, 1)
         module_grid.setColumnStretch(1, 1)
-        row.addWidget(modules, 5)
-        layout.addLayout(row,1)
+        row.addWidget(modules)
+        row.setStretchFactor(0,6); row.setStretchFactor(1,5); row.setSizes([620,480])
+        layout.addWidget(row,1)
 
         self.video_timer=QTimer(self)
         self.video_timer.setTimerType(Qt.PreciseTimer)
@@ -833,13 +1042,18 @@ class MonitorPage(Page):
     def _make_status_module(grid, title, row, column):
         box = QGroupBox(title)
         box_layout = QVBoxLayout(box)
-        panel = QPlainTextEdit()
-        panel.setReadOnly(True)
-        panel.setMinimumSize(220, 180)
-        panel.setLineWrapMode(QPlainTextEdit.WidgetWidth)
+        panel = StatusModule()
+        panel.setMinimumSize(190, 150)
         box_layout.addWidget(panel)
         grid.addWidget(box, row, column)
         return panel
+
+    def _pause_or_resume(self):
+        try: snapshot=self.app.orchestrator.get_snapshot()
+        except Exception as exc: return self.app.error("状态读取失败",str(exc))
+        state=str(getattr(getattr(snapshot,"system_state",None),"value",getattr(snapshot,"system_state",""))).upper()
+        operation=self.app.orchestrator.resume if state=="PAUSED" else self.app.orchestrator.pause
+        self.app.task(operation,disable=self.pause_button)
 
     def on_show(self):
         self.video_timer.start()
@@ -1116,18 +1330,23 @@ class MonitorPage(Page):
         allowed={
             "初始化":{"IDLE","CONFIGURED","VIDEO_READY","STOPPED","ERROR"},
             "开始":{"INITIALIZED","PAUSED","STOPPED"},
-            "暂停":{"OPTIMIZING","STABILIZING","RUNNING"},
-            "继续":{"PAUSED"},
+            "暂停/继续":{"OPTIMIZING","STABILIZING","RUNNING","PAUSED"},
             "复位安全锁":{"ERROR"},
         }
         for name,button in self.action_buttons.items():
             button.setEnabled(state in allowed[name])
+        state_cn, _yes, _number=self._display_helpers(snapshot)
+        self.state_badge.setText(state_cn)
+        self.state_badge.setProperty("state","error" if state=="ERROR" else ("active" if state in {"OPTIMIZING","STABILIZING","RUNNING"} else "idle"))
+        self.state_badge.style().unpolish(self.state_badge); self.state_badge.style().polish(self.state_badge)
+        self.pause_button.setText("继续" if state=="PAUSED" else "暂停")
         config=getattr(snapshot,"config",None)
         source_type=str(getattr(config,"video_source_type","") or "").strip().lower()
         realtime=source_type not in {"file","local","local_video","video"}
         self.bo_button.setEnabled(realtime and state in {"INITIALIZED","PAUSED","STOPPED"})
         self.stop_button.setEnabled(state in {"OPTIMIZING","STABILIZING","RUNNING","PAUSED","INITIALIZING","ERROR"})
         self.target_button.setEnabled(state in {"CONFIGURED","VIDEO_READY","INITIALIZED","RUNNING","PAUSED","STOPPED"})
+        self.app.refresh_navigation(snapshot)
 
     def refresh_vision_panel(self):
         try:
@@ -1268,22 +1487,21 @@ class MonitorPage(Page):
         else:
             adaptive_status = "未启用"
         return "\n".join([
+            f"当前设定目标：{number(getattr(config,'target_diameter',None),3)} μm",
+            f"本周期采用目标：{number(getattr(ctrl,'target_diameter_um',None),3)} μm",
+            f"直径误差：{number(getattr(ctrl,'diameter_error',None))} μm",
+            f"Q1/Q2 指令：{number(getattr(ctrl,'q1_command',None))} / {number(getattr(ctrl,'q2_command',None))} μL/min",
+            f"PID / 前馈 / 最终输出：{number(getattr(ctrl,'pid_output',None),4)} / {number(getattr(ctrl,'feedforward_output',None),4)} / {number(getattr(ctrl,'final_output',None),4)}",
+            f"执行器饱和：{yes(getattr(ctrl,'actuator_saturated',False))}",
             f"控制权所有者：{getattr(ctrl,'control_owner','--')}",
             f"控制模式：{getattr(ctrl,'control_mode','--')}",
             f"自适应状态：{adaptive_status}",
             f"自适应说明：{getattr(ctrl,'adaptive_reason','') or '无'}",
             f"Kp / Ki / Kd：{number(getattr(ctrl,'kp',None),6)} / {number(getattr(ctrl,'ki',None),6)} / {number(getattr(ctrl,'kd',None),6)}",
             f"Q1/Q2 调节倍率：{number(getattr(ctrl,'q1_output_gain',None),2)} : {number(getattr(ctrl,'q2_output_gain',None),2)}",
-            f"当前设定目标：{number(getattr(config,'target_diameter',None),3)} μm",
-            f"本周期采用目标：{number(getattr(ctrl,'target_diameter_um',None),3)} μm",
-            f"直径误差：{number(getattr(ctrl,'diameter_error',None))} μm",
-            f"PID / 前馈 / 最终输出：{number(getattr(ctrl,'pid_output',None),4)} / {number(getattr(ctrl,'feedforward_output',None),4)} / {number(getattr(ctrl,'final_output',None),4)}",
             f"请求/实际分配输出：{number(getattr(ctrl,'requested_output',None),4)} / {number(getattr(ctrl,'realized_output',None),4)}",
-            f"执行器饱和：{yes(getattr(ctrl,'actuator_saturated',False))}",
             f"BO/PID 工作点 Q1/Q2：{number(getattr(ctrl,'operating_point_q1',None))} / {number(getattr(ctrl,'operating_point_q2',None))} μL/min",
             f"前馈状态：{yes(getattr(ctrl,'feedforward_active',False))}；{getattr(ctrl,'feedforward_reason','') or '无'}",
-            f"Q1 指令：{number(getattr(ctrl,'q1_command',None))} μL/min",
-            f"Q2 指令：{number(getattr(ctrl,'q2_command',None))} μL/min",
             f"反馈冻结：{yes(getattr(ctrl,'freeze_feedback',False))}",
             f"控制说明：{getattr(ctrl,'reason','') or '无'}",
         ])
@@ -1301,13 +1519,84 @@ class MonitorPage(Page):
 
 class StatusPage(Page):
     def __init__(self, app):
-        super().__init__(app); layout=QVBoxLayout(self); layout.addWidget(app.title("系统状态","SystemSnapshot 完整诊断视图")); self.text=QPlainTextEdit(); self.text.setReadOnly(True); layout.addWidget(self.text)
+        super().__init__(app)
+        layout=QVBoxLayout(self)
+        layout.addWidget(app.title("系统状态","先查看关键健康状态，需要时再展开完整 SystemSnapshot"))
+        self.cards={}
+        card_grid=QGridLayout(); card_grid.setSpacing(10)
+        for index,(key,title) in enumerate((("system","系统"),("vision","液滴识别"),("camera","视频源"),("pump","泵机"),("pid","PID 控制"))):
+            card=HealthCard(title); self.cards[key]=card; card_grid.addWidget(card,index//3,index%3)
+        for column in range(3): card_grid.setColumnStretch(column,1)
+        layout.addLayout(card_grid)
+        self.alert=QLabel("等待系统快照…"); self.alert.setObjectName("statusAlert"); self.alert.setWordWrap(True); layout.addWidget(self.alert)
+        actions=QHBoxLayout()
+        self.updated=QLabel("最后更新：--"); self.updated.setObjectName("mutedText"); actions.addWidget(self.updated); actions.addStretch()
+        self.raw_toggle=QPushButton("展开原始 JSON"); set_button_role(self.raw_toggle,"secondary"); self.raw_toggle.setCheckable(True); self.raw_toggle.toggled.connect(self._toggle_raw); actions.addWidget(self.raw_toggle)
+        copy_button=QPushButton("复制 JSON"); set_button_role(copy_button,"secondary"); copy_button.clicked.connect(self._copy_json); actions.addWidget(copy_button)
+        export_button=QPushButton("导出 JSON"); set_button_role(export_button,"secondary"); export_button.clicked.connect(self._export_json); actions.addWidget(export_button)
+        layout.addLayout(actions)
+        self.text=QPlainTextEdit(); self.text.setReadOnly(True); self.text.setVisible(False); layout.addWidget(self.text,1)
+        layout.addStretch(1)
         self.timer=QTimer(self); self.timer.setInterval(app.refresh_interval_ms); self.timer.timeout.connect(self.refresh)
     def on_show(self): self.timer.start(); self.refresh()
     def on_hide(self): self.timer.stop()
+
+    def _toggle_raw(self, expanded):
+        self.text.setVisible(expanded)
+        self.raw_toggle.setText("收起原始 JSON" if expanded else "展开原始 JSON")
+
+    def _copy_json(self):
+        QApplication.clipboard().setText(self.text.toPlainText())
+        self.alert.setText("完整 SystemSnapshot JSON 已复制到剪贴板。")
+
+    def _export_json(self):
+        target,_=QFileDialog.getSaveFileName(self,"导出系统状态","system_snapshot.json","JSON 文件 (*.json)")
+        if not target:return
+        try: Path(target).write_text(self.text.toPlainText(),encoding="utf-8")
+        except OSError as exc:return self.app.error("导出失败",str(exc))
+        self.alert.setText(f"系统状态已导出：{target}")
+
+    @staticmethod
+    def _overview(snapshot):
+        state=str(getattr(getattr(snapshot,"system_state",None),"value",getattr(snapshot,"system_state","--"))).upper()
+        error=str(getattr(snapshot,"error","") or "")
+        message=str(getattr(snapshot,"message","") or "")
+        state_cn,yes,number=MonitorPage._display_helpers(snapshot)
+        system_status="error" if error or state=="ERROR" else ("ok" if state in {"INITIALIZED","RUNNING","PAUSED","STOPPED"} else ("active" if state in {"INITIALIZING","OPTIMIZING","STABILIZING","STOPPING"} else "idle"))
+        system_badge="异常" if system_status=="error" else ("进行中" if system_status=="active" else ("正常" if system_status=="ok" else "等待"))
+        recognition=getattr(snapshot,"recognition",None)
+        if recognition is None: vision=("idle","等待","尚无识别数据")
+        elif bool(getattr(recognition,"valid_for_control",False)): vision=("ok","有效",f"平均直径 {number(getattr(recognition,'avg_diameter',None))} μm · 本周期 {getattr(recognition,'frame_droplet_count',0)} 个")
+        else: vision=("warning","暂不可控",str(getattr(recognition,"reason","") or "识别数据尚未达到控制条件"))
+        frame=getattr(snapshot,"frame",None)
+        if frame is None: camera=("idle","等待","尚无视频帧")
+        elif bool(getattr(frame,"valid",False)): camera=("ok","在线",f"帧 #{getattr(frame,'frame_id',0)} · {getattr(frame,'width',0)}×{getattr(frame,'height',0)}")
+        else: camera=("warning","无效帧",str(getattr(frame,"reason","") or "视频帧不可用"))
+        pump_state=getattr(snapshot,"pump_state",None)
+        if pump_state is None: pump=("idle","等待","尚无泵机状态")
+        elif str(getattr(pump_state,"last_error","") or ""): pump=("error","异常",str(getattr(pump_state,"last_error","")))
+        elif bool(getattr(pump_state,"connected",False)) and bool(getattr(pump_state,"comm_established",False)): pump=("ok","已连接",f"Q1/Q2 {number(getattr(pump_state,'q1',None))} / {number(getattr(pump_state,'q2',None))} μL/min")
+        else: pump=("warning","未就绪",str(getattr(pump_state,"last_update_reason","") or "泵机尚未建立完整通信"))
+        control=getattr(snapshot,"control",None)
+        if control is None: pid=("idle","等待","尚无控制周期数据")
+        elif bool(getattr(control,"suggested_stop",False)): pid=("error","建议停止",str(getattr(control,"reason","") or "控制器建议安全停止"))
+        elif bool(getattr(control,"freeze_feedback",False)): pid=("warning","反馈冻结",str(getattr(control,"reason","") or "当前周期未更新反馈"))
+        else: pid=("ok","运行正常",f"误差 {number(getattr(control,'diameter_error',None))} μm · 输出 {number(getattr(control,'final_output',None),4)}")
+        alert=error or message or "系统没有报告异常。"
+        return {"system":(system_status,system_badge,f"{state_cn} · {message or '无附加信息'}"),"vision":vision,"camera":camera,"pump":pump,"pid":pid,"alert":alert}
+
     def refresh(self):
-        try: self.text.setPlainText(json.dumps(jsonable(self.app.orchestrator.get_snapshot()),ensure_ascii=False,indent=2))
-        except Exception as exc: self.text.setPlainText(str(exc))
+        try:
+            snapshot=self.app.orchestrator.get_snapshot(); overview=self._overview(snapshot)
+            self.text.setPlainText(json.dumps(jsonable(snapshot),ensure_ascii=False,indent=2))
+            for key,card in self.cards.items(): card.set_status(*overview[key])
+            has_error=overview["system"][0]=="error"
+            self.alert.setProperty("status","error" if has_error else "ok"); self.alert.setText(("需要处理：" if has_error else "当前提示：")+overview["alert"]); self.alert.style().unpolish(self.alert); self.alert.style().polish(self.alert)
+            timestamp=float(getattr(snapshot,"timestamp",0) or 0); stamp=time.strftime("%Y-%m-%d %H:%M:%S",time.localtime(timestamp)) if timestamp>1_000_000_000 else time.strftime("%Y-%m-%d %H:%M:%S")
+            self.updated.setText(f"最后更新：{stamp}")
+            self.app.refresh_navigation(snapshot)
+        except Exception as exc:
+            self.text.setPlainText(str(exc)); self.alert.setProperty("status","error"); self.alert.setText(f"状态读取失败：{exc}")
 
 
 class TuningPage(Page):
@@ -1333,45 +1622,123 @@ class TuningPage(Page):
 
 class FrontendApp(QMainWindow):
     def __init__(self, orchestrator=None, settings_store=None):
-        super().__init__(); self.setWindowTitle(APP_TITLE); self.resize(1360,860); self.setMinimumSize(QSize(1280,760))
+        super().__init__(); self.setWindowTitle(APP_TITLE); self.resize(1360,860); self.setMinimumSize(QSize(1180,700))
         self.runtime_logger=create_runtime_logger(); self.orchestrator=orchestrator or OrchestratorService(logger=self.runtime_logger); self.settings_store=settings_store or FrontendSettingsStore(); self.vision_tuning_settings_store=VisionTuningSettingsStore(); self.frontend_config=self.settings_store.load(); self.refresh_interval_ms=DEFAULT_REFRESH_INTERVAL_MS
         self.pool=QThreadPool.globalInstance(); self.workers=set(); self.current=None; self._build(); self.show_page("parameter")
 
     def _build(self):
         root=QWidget(); self.setCentralWidget(root); outer=QHBoxLayout(root); outer.setContentsMargins(0,0,0,0); outer.setSpacing(0)
-        self.nav_panel=QFrame(); self.nav_panel.setObjectName("navPanel"); self.nav_panel.setFixedWidth(248)
+        self.nav_panel=QFrame(); self.nav_panel.setObjectName("navPanel"); self.nav_panel.setFixedWidth(238)
         nav_layout=QVBoxLayout(self.nav_panel); nav_layout.setContentsMargins(12,14,12,14); nav_layout.setSpacing(10)
         self.nav_toggle=QPushButton("收起导航"); self.nav_toggle.setObjectName("navToggle"); self.nav_toggle.setToolTip("收起左侧导航栏"); self.nav_toggle.clicked.connect(self._toggle_nav)
         nav_layout.addWidget(self.nav_toggle)
-        self.nav=QListWidget(); self.nav.setObjectName("nav"); nav_layout.addWidget(self.nav,1)
+        self.nav=QListWidget(); self.nav.setObjectName("nav"); self.nav.setSpacing(2); nav_layout.addWidget(self.nav,1)
         self.stack=QStackedWidget(); outer.addWidget(self.nav_panel); outer.addWidget(self.stack,1)
         self._nav_collapsed=False
-        self._nav_entries=(("parameter","1  基础参数"),("video","2  相机识别与读写"),("pump","3  泵机识别与读写"),("init","4  系统初始化"),("monitor","5  运行监控"),("status","6  系统状态"),("tuning","7  液滴算法调参"))
+        self._nav_entries=(("parameter","基础参数",1),("video","相机识别与读写",2),("pump","泵机识别与读写",3),("init","系统初始化",4),("monitor","运行监控",5),("status","系统状态",None),("tuning","液滴算法调参",None))
         self.pages={"parameter":ParameterPage(self),"video":VideoPage(self),"pump":PumpPage(self),"init":InitPage(self),"monitor":MonitorPage(self),"status":StatusPage(self),"tuning":TuningPage(self)}
-        for key,label in self._nav_entries:
-            item=QListWidgetItem(label); item.setData(Qt.UserRole,key); item.setToolTip(label); item.setSizeHint(QSize(220,48)); self.nav.addItem(item); self.stack.addWidget(self.pages[key])
+        self._nav_items={}; self._nav_headers=[]
+        icon_map={"parameter":QStyle.SP_FileDialogDetailedView,"video":QStyle.SP_ComputerIcon,"pump":QStyle.SP_DriveNetIcon,"init":QStyle.SP_BrowserReload,"monitor":QStyle.SP_MediaPlay,"status":QStyle.SP_MessageBoxInformation,"tuning":QStyle.SP_FileDialogContentsView}
+        for group,keys in (("实验流程",("parameter","video","pump","init","monitor")),("工具与诊断",("status","tuning"))):
+            header=QListWidgetItem(group); header.setFlags(Qt.ItemIsEnabled); header.setData(Qt.UserRole,"__header__"); header.setSizeHint(QSize(210,30)); font=header.font(); font.setBold(True); header.setFont(font); header.setForeground(QColor("#8fa4bf")); self.nav.addItem(header); self._nav_headers.append(header)
+            for key,label,step in self._nav_entries:
+                if key not in keys: continue
+                item=QListWidgetItem(self.style().standardIcon(icon_map[key]),label); item.setData(Qt.UserRole,key); item.setData(Qt.UserRole+1,label); item.setData(Qt.UserRole+2,step); item.setToolTip(label); item.setSizeHint(QSize(210,46)); self.nav.addItem(item); self._nav_items[key]=item; self.stack.addWidget(self.pages[key])
         self.nav.currentItemChanged.connect(lambda current,_: current and self.show_page(str(current.data(Qt.UserRole))))
-        self.setStyleSheet("QMainWindow,QWidget{background:#f4f7fb;color:#172033;font-size:14px}#navPanel{background:#152238}#navToggle{background:#223554;color:#dbe7f7;border:1px solid #3b5275;border-radius:8px;padding:9px 12px;text-align:left}#navToggle:hover{background:#2b6de5;color:white}#nav{background:transparent;color:#dbe7f7;border:0;padding:4px 0}#nav::item{border-radius:8px;padding:10px 12px;margin:2px 0}#nav::item:hover{background:#203554}#nav::item:selected{background:#2b6de5;color:white}QGroupBox{background:white;border:1px solid #dce3ed;border-radius:10px;margin-top:14px;padding:20px;font-weight:600}QGroupBox::title{subcontrol-origin:margin;left:16px;padding:0 6px}QLineEdit,QComboBox,QPlainTextEdit{background:white;border:1px solid #cbd5e1;border-radius:6px;padding:7px}QPushButton{background:#2b6de5;color:white;border:0;border-radius:6px;padding:8px 16px}QPushButton:disabled{background:#aab5c4}")
+        self.setStyleSheet("""
+            QMainWindow,QWidget{background:#f4f7fb;color:#172033;font-size:14px}
+            #navPanel{background:#152238}
+            #navToggle{background:#223554;color:#dbe7f7;border:1px solid #3b5275;border-radius:8px;padding:9px 12px;text-align:left}
+            #navToggle:hover{background:#2b6de5;color:white}
+            #nav{background:transparent;color:#dbe7f7;border:0;padding:2px 0;outline:0}
+            #nav::item{border-radius:8px;padding:8px 10px;margin:1px 0}
+            #nav::item:hover{background:#203554}
+            #nav::item:selected{background:#2b6de5;color:white}
+            #nav::item:disabled{color:#71839a}
+            QGroupBox{background:white;border:1px solid #dce3ed;border-radius:10px;margin-top:14px;padding:18px;font-weight:600}
+            QGroupBox::title{subcontrol-origin:margin;left:14px;padding:0 6px}
+            QLineEdit,QComboBox,QPlainTextEdit,QDoubleSpinBox,QSpinBox{background:white;border:1px solid #cbd5e1;border-radius:6px;padding:7px;selection-background-color:#2b6de5}
+            QLineEdit:focus,QComboBox:focus,QPlainTextEdit:focus,QDoubleSpinBox:focus,QSpinBox:focus{border:2px solid #2b6de5;padding:6px}
+            QLineEdit:read-only,QPlainTextEdit:read-only{background:#f8fafc}
+            QPushButton,QToolButton{background:#2b6de5;color:white;border:1px solid #2b6de5;border-radius:6px;padding:8px 14px}
+            QPushButton:hover,QToolButton:hover{background:#1f5fcf;border-color:#1f5fcf}
+            QPushButton:pressed,QToolButton:pressed{background:#194fae}
+            QPushButton:focus,QToolButton:focus{border:2px solid #0f3f99;padding:7px 13px}
+            QPushButton:disabled,QToolButton:disabled{background:#e2e8f0;color:#94a3b8;border-color:#e2e8f0}
+            QPushButton[role="secondary"]{background:white;color:#2457a7;border:1px solid #9bb7e6}
+            QPushButton[role="secondary"]:hover{background:#eef4ff;border-color:#2b6de5}
+            QPushButton[role="danger"]{background:#c93838;color:white;border-color:#c93838}
+            QPushButton[role="danger"]:hover{background:#a92626;border-color:#a92626}
+            QPushButton[role="warning"]{background:#fff7e8;color:#8a4b08;border:1px solid #e8b35d}
+            QPushButton[role="warning"]:hover{background:#ffedc7;border-color:#d89224}
+            QToolButton[role="section"]{background:#eef4ff;color:#2457a7;border:1px solid #c7d8f3;text-align:left;padding:9px 12px}
+            QToolButton[role="link"]{background:transparent;color:#2b6de5;border:0;padding:3px 6px}
+            #controlBar{background:white;border:1px solid #dce3ed;border-radius:10px}
+            #runtimeStateBadge{background:#edf2f7;color:#526071;border-radius:10px;padding:5px 10px;font-weight:700}
+            #runtimeStateBadge[state="active"]{background:#e7f0ff;color:#1f5fcf}
+            #runtimeStateBadge[state="error"]{background:#fde8e8;color:#a92626}
+            #fpsLabel,#mutedText,#formHint{color:#64748b}
+            #metricSummary{background:#f8fafc;border:1px solid #e2e8f0;border-radius:7px;padding:9px;line-height:1.3}
+            #healthCard{background:white;border:1px solid #dce3ed;border-left:4px solid #94a3b8;border-radius:9px}
+            #healthCard[health="ok"]{border-left-color:#24935a}
+            #healthCard[health="active"]{border-left-color:#2b6de5}
+            #healthCard[health="warning"]{border-left-color:#d89224}
+            #healthCard[health="error"]{border-left-color:#c93838}
+            #healthTitle{font-weight:700}
+            #healthBadge{background:#edf2f7;border-radius:9px;padding:3px 8px;font-weight:700}
+            #healthDetail{color:#526071}
+            #statusAlert{background:#edf7f1;color:#226943;border:1px solid #b9dfc9;border-radius:7px;padding:10px}
+            #statusAlert[status="error"]{background:#fdecec;color:#9e2929;border-color:#efb6b6}
+            QLabel[status="warning"]{color:#9a5a0a}
+            QLabel[status="ok"]{color:#247548}
+        """)
+        self.refresh_navigation()
 
     def _toggle_nav(self):
         self._nav_collapsed=not self._nav_collapsed
-        width=68 if self._nav_collapsed else 248
+        width=68 if self._nav_collapsed else 238
         self.nav_panel.setFixedWidth(width)
         self.nav_toggle.setText("展开" if self._nav_collapsed else "收起导航")
         self.nav_toggle.setToolTip("展开左侧导航栏" if self._nav_collapsed else "收起左侧导航栏")
-        for index,(_, label) in enumerate(self._nav_entries):
-            item=self.nav.item(index)
-            item.setText(label.split("  ",1)[0] if self._nav_collapsed else label)
-            item.setSizeHint(QSize(42 if self._nav_collapsed else 220,48))
+        for header in self._nav_headers: header.setHidden(self._nav_collapsed)
+        for key,item in self._nav_items.items():
+            label=str(item.data(Qt.UserRole+1)); step=item.data(Qt.UserRole+2)
+            item.setText("" if self._nav_collapsed else self._navigation_label(key,label,step))
+            item.setSizeHint(QSize(42 if self._nav_collapsed else 210,46))
         self.nav.repaint()
 
     def title(self,heading,subtitle):
-        widget=QFrame(); layout=QVBoxLayout(widget); label=QLabel(heading); label.setStyleSheet("font-size:26px;font-weight:700"); detail=QLabel(subtitle); detail.setStyleSheet("color:#64748b"); layout.addWidget(label); layout.addWidget(detail); return widget
+        widget=QFrame(); layout=QVBoxLayout(widget); layout.setContentsMargins(0,2,0,2); layout.setSpacing(2); label=QLabel(heading); label.setStyleSheet("font-size:24px;font-weight:700"); detail=QLabel(subtitle); detail.setStyleSheet("color:#64748b"); layout.addWidget(label); layout.addWidget(detail); return widget
+
+    def _navigation_label(self,key,label,step):
+        item=self._nav_items.get(key); status=str(item.data(Qt.UserRole+3) or "") if item else ""
+        prefix=f"{step}  " if step else ""
+        suffix={"complete":"  ✓","active":"  ●","error":"  !","locked":"  ·"}.get(status,"")
+        return prefix+label+suffix
+
+    def refresh_navigation(self,snapshot=None):
+        cfg=self.frontend_config
+        state=""
+        if snapshot is not None: state=str(getattr(getattr(snapshot,"system_state",None),"value",getattr(snapshot,"system_state",""))).upper()
+        base=all(cfg.get(key) not in (None,"") for key in ("target_diameter","pixel_to_micron","control_interval_ms"))
+        video=bool(cfg.get("video_source_type") and cfg.get("video_source"))
+        pump=bool(cfg.get("pump_port")) or cfg.get("video_source_type")=="file"
+        initialized=state in {"INITIALIZED","OPTIMIZING","STABILIZING","RUNNING","PAUSED","STOPPING","STOPPED"}
+        monitor_available=initialized or state=="ERROR"
+        running=state in {"OPTIMIZING","STABILIZING","RUNNING","PAUSED"}
+        status_map={"parameter":"complete" if base else "active","video":"complete" if video else ("active" if base else "locked"),"pump":"complete" if pump else ("active" if video else "locked"),"init":"error" if state=="ERROR" else ("complete" if initialized else ("active" if video and pump else "locked")),"monitor":"error" if state=="ERROR" else ("active" if running else ("complete" if state=="STOPPED" else ("locked" if not initialized else "active"))),"status":"error" if state=="ERROR" else "","tuning":""}
+        enabled={"parameter":True,"video":base,"pump":video,"init":video and pump,"monitor":monitor_available,"status":True,"tuning":True}
+        for key,item in self._nav_items.items():
+            item.setData(Qt.UserRole+3,status_map[key])
+            item.setFlags((Qt.ItemIsSelectable|Qt.ItemIsEnabled) if enabled[key] else Qt.NoItemFlags)
+            item.setText("" if self._nav_collapsed else self._navigation_label(key,str(item.data(Qt.UserRole+1)),item.data(Qt.UserRole+2)))
     def show_page(self,key):
+        if key not in self.pages:return
         if self.current: self.current.on_hide()
         page=self.pages[key]; self.stack.setCurrentWidget(page); self.current=page; page.on_show()
-        for i in range(self.nav.count()):
-            if self.nav.item(i).data(Qt.UserRole)==key: self.nav.blockSignals(True); self.nav.setCurrentRow(i); self.nav.blockSignals(False); break
+        item=self._nav_items.get(key)
+        if item is not None:
+            self.nav.blockSignals(True); self.nav.setCurrentItem(item); self.nav.blockSignals(False)
     def save_tuning_sample(self, path: str):
         self.save(tuning_sample=path)
 
@@ -1379,6 +1746,7 @@ class FrontendApp(QMainWindow):
         self.frontend_config.update(values)
         try: self.settings_store.save(self.frontend_config)
         except Exception as exc: self.runtime_logger(f"[APP][SETTINGS][ERROR] {exc}")
+        if hasattr(self,"_nav_items"): self.refresh_navigation()
     def build_system_config(self):
         cfg=self.frontend_config; required=("target_diameter","pixel_to_micron","video_source_type","video_source","initial_q1","initial_q2","control_interval_ms"); missing=[k for k in required if k not in cfg]
         if missing: raise ValueError(f"缺少配置字段: {', '.join(missing)}")
