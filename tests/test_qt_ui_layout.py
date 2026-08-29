@@ -102,6 +102,13 @@ def test_video_page_hides_camera_transport_fields_for_local_video() -> None:
     app.processEvents()
     assert page.devices.isVisible()
     assert page.scan_button.isVisible()
+    assert "自动检定" in page.advanced_summary.text()
+
+    page.advanced_dialog.open()
+    app.processEvents()
+    assert page.advanced_dialog.isVisible()
+    assert page.advanced_dialog.minimumWidth() >= 780
+    page.advanced_dialog.close()
 
     page.mode.setCurrentIndex(1)
     app.processEvents()

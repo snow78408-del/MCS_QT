@@ -512,15 +512,36 @@ class VideoPage(Page):
         self.backend=QComboBox(); self.backend.addItems(["","hikrobot","opencv","gentl","basler","daheng","flir","allied_vision"]); self.backend.setCurrentText(str(cfg.get("camera_backend",""))); form.addRow("相机后端",self.backend)
         self.exposure=self.number_field(form,"曝光时间",params.get("exposure",3000),1,10000000,decimals=1,suffix="μs"); self.gain=self.number_field(form,"增益",params.get("gain",0),0,1000,decimals=2); self.fps=self.number_field(form,"目标帧率",params.get("frame_rate",100),0.1,10000,decimals=1,suffix="FPS")
         self.frame_width=self.number_field(form,"图像宽度",params.get("width",720),16,16384,integer=True,suffix="px"); self.frame_height=self.number_field(form,"图像高度",params.get("height",540),16,16384,integer=True,suffix="px")
-        advanced=CollapsibleSection("高级识别、ROI 与管道标定设置",expanded=False); advanced_form=QFormLayout(advanced.body); advanced_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
-        roi=dict(cfg.get("recognition_roi",{}) or {}); self._roi_user_modified=bool(roi.get("user_defined",False)); self._selected_wall_lines=[dict(line) for line in list(roi.get("wall_lines",[]) or [])[:2]]; self._last_test_preview_b64=""; self.roi_on=QCheckBox("启用 ROI，仅识别框选区域"); self.roi_on.setChecked(bool(roi.get("enabled",False))); advanced_form.addRow("",self.roi_on)
-        self.channel_region_on=QCheckBox("启动时自动检定管道区域（失败回退整帧）"); self.channel_region_on.setChecked(bool(roi.get("channel_region_enabled",True))); advanced_form.addRow("",self.channel_region_on)
-        self.channel_region_samples=self.number_field(advanced_form,"自动检定采样帧数",roi.get("channel_region_sample_frames",12),1,48,integer=True,suffix="帧")
-        values=[float(roi.get(k,d))*100 for k,d in (("x_start_ratio",0),("y_start_ratio",0),("x_end_ratio",1),("y_end_ratio",1))]; self.roi=self.field(advanced_form,"ROI 左,上,右,下 (%)",",".join(f"{v:g}" for v in values)); self.roi.textEdited.connect(self._mark_roi_modified); self.roi.editingFinished.connect(self._analyze_user_roi)
-        self.channel_cal_on=QCheckBox("用已知管道内宽自动标定 μm/px"); self.channel_cal_on.setChecked(bool(roi.get("channel_calibration_enabled",True))); advanced_form.addRow("",self.channel_cal_on)
-        self.channel_width=self.number_field(advanced_form,"管道内宽",roi.get("channel_width_um",430.0),0.01,100000,decimals=2,suffix="μm")
-        calibration_hint=QLabel("标定时请完整框住两条管道内壁，ROI 尽量贴合，四周仅留约 3–5 px。标定只在启动阶段运行。")
-        calibration_hint.setWordWrap(True); calibration_hint.setObjectName("formHint"); advanced_form.addRow("",calibration_hint); form.addRow("",advanced)
+        roi=dict(cfg.get("recognition_roi",{}) or {}); self._roi_user_modified=bool(roi.get("user_defined",False)); self._selected_wall_lines=[dict(line) for line in list(roi.get("wall_lines",[]) or [])[:2]]; self._last_test_preview_b64=""
+        self.advanced_dialog=QDialog(self); self.advanced_dialog.setWindowTitle("高级识别、管道检定与 ROI 设置"); self.advanced_dialog.setMinimumSize(780,520)
+        advanced_layout=QVBoxLayout(self.advanced_dialog); advanced_layout.setContentsMargins(18,16,18,16); advanced_layout.setSpacing(12)
+        advanced_title=QLabel("高级识别、管道检定与 ROI 设置"); advanced_title.setStyleSheet("font-size:20px;font-weight:700")
+        advanced_intro=QLabel("按实验需要分别配置三个区域。ROI 也可以在测试帧上直接拖拽或点击两条管壁线生成。"); advanced_intro.setObjectName("formHint"); advanced_intro.setWordWrap(True)
+        advanced_layout.addWidget(advanced_title); advanced_layout.addWidget(advanced_intro)
+        advanced_grid=QGridLayout(); advanced_grid.setHorizontalSpacing(12); advanced_grid.setVerticalSpacing(12)
+
+        roi_box=QGroupBox("1 · ROI 识别范围"); roi_form=QFormLayout(roi_box); roi_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        self.roi_on=QCheckBox("启用 ROI，仅识别框选区域"); self.roi_on.setChecked(bool(roi.get("enabled",False))); roi_form.addRow("",self.roi_on)
+        values=[float(roi.get(k,d))*100 for k,d in (("x_start_ratio",0),("y_start_ratio",0),("x_end_ratio",1),("y_end_ratio",1))]; self.roi=self.field(roi_form,"左、上、右、下",",".join(f"{v:g}" for v in values)); self.roi.setPlaceholderText("例如：10, 20, 90, 80"); self.roi.textEdited.connect(self._mark_roi_modified); self.roi.editingFinished.connect(self._analyze_user_roi)
+        roi_hint=QLabel("数值单位为图像百分比；必须满足左 < 右、上 < 下。测试取帧后优先直接在图像上选择。"); roi_hint.setObjectName("formHint"); roi_hint.setWordWrap(True); roi_form.addRow("",roi_hint)
+
+        region_box=QGroupBox("2 · 自动管道区域检定"); region_form=QFormLayout(region_box); region_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        self.channel_region_on=QCheckBox("启动时自动检定管道区域"); self.channel_region_on.setChecked(bool(roi.get("channel_region_enabled",True))); region_form.addRow("",self.channel_region_on)
+        self.channel_region_samples=self.number_field(region_form,"采样帧数",roi.get("channel_region_sample_frames",12),1,48,integer=True,suffix="帧")
+        region_hint=QLabel("使用多帧估计稳定管道区域；检定失败时自动回退整帧，不会阻止预览。"); region_hint.setObjectName("formHint"); region_hint.setWordWrap(True); region_form.addRow("",region_hint)
+
+        calibration_box=QGroupBox("3 · 已知管道宽度标定"); calibration_form=QFormLayout(calibration_box); calibration_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        self.channel_cal_on=QCheckBox("使用已知内宽标定 μm/px"); self.channel_cal_on.setChecked(bool(roi.get("channel_calibration_enabled",True))); calibration_form.addRow("",self.channel_cal_on)
+        self.channel_width=self.number_field(calibration_form,"管道实际内宽",roi.get("channel_width_um",430.0),0.01,100000,decimals=2,suffix="μm")
+        calibration_hint=QLabel("请完整框住两条管道内壁，ROI 四周仅留约 3–5 px。该标定只在启动阶段运行。"); calibration_hint.setWordWrap(True); calibration_hint.setObjectName("formHint"); calibration_form.addRow("",calibration_hint)
+
+        advanced_grid.addWidget(roi_box,0,0,1,2); advanced_grid.addWidget(region_box,1,0); advanced_grid.addWidget(calibration_box,1,1); advanced_grid.setColumnStretch(0,1); advanced_grid.setColumnStretch(1,1)
+        advanced_layout.addLayout(advanced_grid,1)
+        dialog_actions=QHBoxLayout(); dialog_actions.addStretch(); close_advanced=QPushButton("完成"); close_advanced.clicked.connect(self.advanced_dialog.accept); dialog_actions.addWidget(close_advanced); advanced_layout.addLayout(dialog_actions)
+        self.advanced_summary=QLabel(); self.advanced_summary.setObjectName("advancedSummary"); self.advanced_summary.setWordWrap(True)
+        advanced_button=QPushButton("配置高级识别与标定…"); set_button_role(advanced_button,"secondary"); advanced_button.clicked.connect(self.advanced_dialog.open)
+        advanced_entry=QVBoxLayout(); advanced_entry.setContentsMargins(0,0,0,0); advanced_entry.setSpacing(7); advanced_entry.addWidget(self.advanced_summary); advanced_entry.addWidget(advanced_button)
+        advanced_entry_widget=QWidget(); advanced_entry_widget.setLayout(advanced_entry); form.addRow("高级设置",advanced_entry_widget)
         self.test_button=QPushButton("写入参数并同步测试取帧"); set_button_role(self.test_button,"secondary"); self.test_button.clicked.connect(self.test_camera); form.addRow("",self.test_button)
         save=QPushButton("保存配置并进入初始化"); save.clicked.connect(self.submit); form.addRow("",save); work.addWidget(settings)
 
@@ -536,8 +557,18 @@ class VideoPage(Page):
         result_actions=QHBoxLayout(); log_button=QPushButton("导出日志"); set_button_role(log_button,"secondary"); log_button.clicked.connect(self.export_log); result_actions.addStretch(); result_actions.addWidget(log_button); result_layout.addLayout(result_actions); right_layout.addWidget(result_box,1); work.addWidget(right)
         work.setStretchFactor(0,1); work.setStretchFactor(1,3); work.setSizes([330,760]); layout.addWidget(work,1)
         self._camera_only_fields=(self.devices,self.backend,self.exposure,self.gain,self.fps,self.frame_width,self.frame_height,self.test_button)
+        for control in (self.roi_on,self.channel_region_on,self.channel_cal_on): control.toggled.connect(self._refresh_advanced_summary)
+        for control in (self.channel_region_samples,self.channel_width): control.valueChanged.connect(self._refresh_advanced_summary)
+        self.roi.textChanged.connect(self._refresh_advanced_summary)
         self.mode.currentIndexChanged.connect(self._source_mode_changed)
+        self._refresh_advanced_summary()
         self._source_mode_changed()
+
+    def _refresh_advanced_summary(self, *_args):
+        roi_text=self.roi.text().strip() if self.roi_on.isChecked() else "整帧"
+        region="开启" if self.channel_region_on.isChecked() else "关闭"
+        calibration=f"{self.channel_width.value():g} μm" if self.channel_cal_on.isChecked() else "关闭"
+        self.advanced_summary.setText(f"ROI：{roi_text}  ·  自动检定：{region}  ·  宽度标定：{calibration}")
 
     def _source_mode_changed(self, *_args):
         is_camera=self.mode.currentData()=="camera"
@@ -1678,6 +1709,7 @@ class FrontendApp(QMainWindow):
             #runtimeStateBadge[state="active"]{background:#e7f0ff;color:#1f5fcf}
             #runtimeStateBadge[state="error"]{background:#fde8e8;color:#a92626}
             #fpsLabel,#mutedText,#formHint{color:#64748b}
+            #advancedSummary{background:#f8fafc;color:#42526a;border:1px solid #dce3ed;border-radius:7px;padding:8px}
             #metricSummary{background:#f8fafc;border:1px solid #e2e8f0;border-radius:7px;padding:9px;line-height:1.3}
             #healthCard{background:white;border:1px solid #dce3ed;border-left:4px solid #94a3b8;border-radius:9px}
             #healthCard[health="ok"]{border-left-color:#24935a}
