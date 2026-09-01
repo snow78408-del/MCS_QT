@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
 import base64
 
+from backend.vision.config import ChannelRegionConfig, DetectorConfig
 from backend.vision.channel_calibration import (
     detect_wall_line_candidates,
     estimate_channel_width_px,
@@ -15,9 +17,51 @@ from backend.vision.channel_calibration import (
 from backend.vision.channel_calibration import ChannelWidthMeasurement
 from backend.orchestrator.vision_adapter import PipelineVisionService
 from backend.orchestrator.vision_adapter import _include_fitted_wall_candidates
+from backend.orchestrator.service import OrchestratorService
 
 
 class ChannelCalibrationTests(unittest.TestCase):
+    def test_orchestrator_forwards_saved_tuning_to_vision_service(self) -> None:
+        calls = []
+        vision = SimpleNamespace(
+            apply_tuning_config=lambda detector, channel: (
+                calls.append((detector, channel)) or {"applied": True}
+            )
+        )
+        service = OrchestratorService(vision_service=vision)
+        detector = DetectorConfig(min_radius=23.0, max_radius=41.0)
+        channel = ChannelRegionConfig(canny_low=30)
+
+        result = service.apply_vision_tuning(detector, channel)
+
+        self.assertTrue(result["applied"])
+        self.assertEqual(calls, [(detector, channel)])
+
+    def test_runtime_tuning_replaces_detector_for_subsequent_samples(self) -> None:
+        service = PipelineVisionService()
+        pipeline = service._ensure_pipeline()
+        tracker = pipeline.tracker
+        metrics = pipeline.metrics
+
+        applied = service.apply_tuning_config(
+            DetectorConfig(
+                min_radius=24.0,
+                max_radius=48.0,
+                sensitivity=0.72,
+                radius_adjustment_percent=5.0,
+            ),
+            ChannelRegionConfig(enabled=False, canny_low=28),
+        )
+
+        self.assertTrue(applied["applied"])
+        self.assertEqual(pipeline.detector.runtime_radius_range(), (24.0, 33.94112549695428, 48.0))
+        self.assertAlmostEqual(pipeline.detector._config.sensitivity, 0.72)
+        self.assertAlmostEqual(pipeline.detector._config.radius_adjustment_percent, 5.0)
+        self.assertFalse(pipeline.channel_region_detector.config.enabled)
+        self.assertEqual(pipeline.channel_region_detector.config.canny_low, 28)
+        self.assertIs(pipeline.tracker, tracker)
+        self.assertIs(pipeline.metrics, metrics)
+
     def test_fitted_lower_wall_is_added_to_clickable_candidates(self) -> None:
         measurement = ChannelWidthMeasurement(
             180.0,

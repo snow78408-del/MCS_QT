@@ -12,7 +12,7 @@ from frontend.settings_store import FrontendSettingsStore
 
 
 def test_bo_defaults_match_commissioning_flow_envelope() -> None:
-    assert DEFAULT_BO_Q1_RANGE == (15.0, 100.0)
+    assert DEFAULT_BO_Q1_RANGE == (20.0, 200.0)
     assert DEFAULT_BO_Q2_RANGE == (5.0, 25.0)
 
 

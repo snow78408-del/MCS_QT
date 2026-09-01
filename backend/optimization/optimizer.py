@@ -37,11 +37,14 @@ class SafeBayesianOptimizer:
         self._candidate_counter = 0
         self._current: OptimizationCandidate | None = None
         self._best: OperatingPoint | None = None
+        self._confirmation_point: OperatingPoint | None = None
+        self._confirmed_point: OperatingPoint | None = None
         self._confirmations = 0
         self._invalid_for_current = 0
         self._invalid_total = 0
         self._phase = OptimizationPhase.INITIAL_SAMPLING
         self._reason = "waiting for first safe candidate"
+        self._failure_kind = ""
 
     def ask(self) -> OptimizationCandidate:
         if self._phase in {OptimizationPhase.COMPLETED, OptimizationPhase.FAILED}:
@@ -49,9 +52,9 @@ class SafeBayesianOptimizer:
         if self._current is not None:
             return self._current
 
-        if self._confirmations > 0 and self._best is not None:
-            q1, q2 = self._best.q1, self._best.q2
-            reason = "repeat best point for independent confirmation"
+        if self._confirmations > 0 and self._confirmation_point is not None:
+            q1, q2 = self._confirmation_point.q1, self._confirmation_point.q2
+            reason = "repeat target-feasible point for independent confirmation"
             self._phase = OptimizationPhase.CONFIRMING
         elif self._seed is not None and not self._x:
             q1, q2 = self._seed
@@ -80,6 +83,7 @@ class SafeBayesianOptimizer:
         self._reason = str(reason or "invalid experimental observation")
         if self._invalid_for_current > int(self.config.invalid_retry_limit):
             self._phase = OptimizationPhase.FAILED
+            self._failure_kind = "measurement_quality"
             self._reason = (
                 f"candidate {self._current.candidate_id} exceeded invalid retry limit: {self._reason}"
             )
@@ -115,18 +119,30 @@ class SafeBayesianOptimizer:
 
         success = self._meets_target(observation)
         if success:
-            self._confirmations += 1
+            same_point = (
+                self._confirmation_point is not None
+                and abs(point.q1 - self._confirmation_point.q1) <= 1e-9
+                and abs(point.q2 - self._confirmation_point.q2) <= 1e-9
+            )
+            if self._confirmation_point is None or not same_point:
+                self._confirmation_point = point
+                self._confirmations = 1
+            else:
+                self._confirmations += 1
         else:
             self._confirmations = 0
+            self._confirmation_point = None
         self._current = None
         self._invalid_for_current = 0
 
         if self._confirmations >= int(self.config.confirmation_count):
             self._phase = OptimizationPhase.COMPLETED
+            self._confirmed_point = self._confirmation_point
             self._reason = "target confirmed in independent settled windows"
             return
         if len(self._observations) >= int(self.config.maximum_observations):
             self._phase = OptimizationPhase.FAILED
+            self._failure_kind = "target_not_found"
             self._reason = "maximum valid observations reached before target confirmation"
             return
         self._reason = "target met; confirming" if success else "search continues"
@@ -161,9 +177,11 @@ class SafeBayesianOptimizer:
             confirmation_count=self._confirmations,
             current_candidate=self._current,
             best_operating_point=self._best,
+            confirmed_operating_point=self._confirmed_point,
             completed=self._phase == OptimizationPhase.COMPLETED,
             failed=self._phase == OptimizationPhase.FAILED,
             reason=self._reason,
+            failure_kind=self._failure_kind,
             objective_history=list(self._y),
         )
 

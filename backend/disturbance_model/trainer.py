@@ -29,7 +29,7 @@ class DisturbanceModelTrainer:
         self.config = config
 
     def train(self, samples: list[DisturbanceSample]) -> tuple[LinearDisturbanceModel | None, ModelMetrics, str]:
-        usable: list[tuple[list[float], list[float], tuple[str, str]]] = []
+        usable: list[tuple[list[float], list[float], tuple[str, str], bool]] = []
         window = samples[-int(self.config.training_window_size) :]
         disturbance_events = self._count_disturbance_events(window)
         if disturbance_events < int(self.config.minimum_disturbance_events):
@@ -48,7 +48,17 @@ class DisturbanceModelTrainer:
                 continue
             targets = build_targets(sample, future_sample)
             if targets is not None:
-                usable.append((build_features(sample), targets, (sample.experiment_id, sample.chip_id)))
+                usable.append(
+                    (
+                        build_features(sample),
+                        targets,
+                        (sample.experiment_id, sample.chip_id),
+                        bool(
+                            sample.disturbance_stage == DisturbanceStage.BASELINE.value
+                            and abs(float(sample.disturbance_amplitude or 0.0)) <= 1e-12
+                        ),
+                    )
+                )
         if len(usable) < int(self.config.minimum_training_samples):
             suffix = " with experiment_id and chip_id" if self.config.require_group_metadata else ""
             return None, ModelMetrics(), f"insufficient paired samples{suffix}"
@@ -80,15 +90,51 @@ class DisturbanceModelTrainer:
             return None, ModelMetrics(), "empty grouped train/validation/test split"
 
         x_train = x_arr[train_indices]
-        y_train = y_arr[train_indices]
         feature_means = x_train.mean(axis=0)
         feature_scales = x_train.std(axis=0)
         feature_scales[feature_scales < 1e-12] = 1.0
-        x_train_scaled = (x_train - feature_means) / feature_scales
+        x_all_scaled = (x_arr - feature_means) / feature_scales
+        x_train_scaled = x_all_scaled[train_indices]
+        baseline_train_positions = [
+            position
+            for position, source_index in enumerate(train_indices)
+            if usable[source_index][3]
+        ]
+        minimum_baseline_pairs = max(5, int(self.config.minimum_training_samples) // 5)
+        if len(baseline_train_positions) < minimum_baseline_pairs:
+            return None, ModelMetrics(), (
+                "nominal baseline fit failed: insufficient baseline pairs "
+                f"({len(baseline_train_positions)} < {minimum_baseline_pairs})"
+            )
+        baseline_x = x_train_scaled[baseline_train_positions]
+        baseline_y = y_arr[train_indices, 1][baseline_train_positions]
+        baseline_aug = np.column_stack([np.ones(len(baseline_x)), baseline_x])
+        baseline_penalty = np.eye(baseline_aug.shape[1], dtype=float)
+        baseline_penalty[0, 0] = 0.0
+        reg = max(0.0, float(self.config.nonlinear_l2_regularization))
+        try:
+            nominal_coefficients = np.linalg.solve(
+                baseline_aug.T @ baseline_aug + reg * baseline_penalty,
+                baseline_aug.T @ baseline_y,
+            )
+        except Exception:
+            nominal_coefficients, *_ = np.linalg.lstsq(
+                baseline_aug,
+                baseline_y,
+                rcond=None,
+            )
+        nominal_change_all = (
+            np.column_stack([np.ones(len(x_all_scaled)), x_all_scaled])
+            @ nominal_coefficients
+        )
+        # The second target is deliberately the disturbance-only residual.
+        # This prevents the predictive path from relearning nominal PID/plant
+        # dynamics and then compensating them a second time.
+        y_arr[:, 1] = y_arr[:, 1] - nominal_change_all
+        y_train = y_arr[train_indices]
         x_aug = np.column_stack([np.ones(len(x_train_scaled)), x_train_scaled])
         penalty = np.eye(x_aug.shape[1], dtype=float)
         penalty[0, 0] = 0.0
-        reg = max(0.0, float(self.config.nonlinear_l2_regularization))
         try:
             coeff_matrix = np.linalg.solve(x_aug.T @ x_aug + reg * penalty, x_aug.T @ y_train)
         except Exception:
@@ -120,12 +166,15 @@ class DisturbanceModelTrainer:
             intercepts=intercepts,
             confidence=confidence,
             model_type="quadratic_ridge",
-            schema_version=2,
+            schema_version=3,
             feature_means=feature_means.tolist(),
             feature_scales=feature_scales.tolist(),
             training_data_hash=hashlib.sha256(
                 json.dumps(usable, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
             ).hexdigest(),
+            feature_version="causal-residual-v3",
+            nominal_change_coefficients=nominal_coefficients[1:].tolist(),
+            nominal_change_intercept=float(nominal_coefficients[0]),
         )
         return model, test_metrics, (
             "trained with independent grouped validation/test "

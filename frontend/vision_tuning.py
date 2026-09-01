@@ -441,6 +441,7 @@ class TuningWindow(QWidget):
         parent: QWidget | None = None,
         on_sample_loaded: Callable[[str], None] | None = None,
         settings_store: VisionTuningSettingsStore | None = None,
+        on_parameters_saved: Callable[[DetectorConfig, ChannelRegionConfig], object] | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("液滴识别算法调参工作台")
@@ -449,6 +450,7 @@ class TuningWindow(QWidget):
         self.frame_pos = 0
         self._on_sample_loaded = on_sample_loaded
         self._settings_store = settings_store
+        self._on_parameters_saved = on_parameters_saved
         self._expanded_stages: set[int] = set()
         detector_config, channel_config, self._initial_parameter_status = self._load_initial_parameters()
         self.original_config = DetectorConfig(**vars(detector_config))
@@ -953,10 +955,30 @@ class TuningWindow(QWidget):
             QMessageBox.warning(self, "保存失败", str(exc))
             return
 
+        apply_error = ""
+        if self._on_parameters_saved is not None:
+            try:
+                self._on_parameters_saved(
+                    DetectorConfig(**vars(self.current_config)),
+                    ChannelRegionConfig(**vars(self.current_channel_config)),
+                )
+            except Exception as exc:
+                apply_error = str(exc)
+
         self.original_config = DetectorConfig(**vars(self.current_config))
         self.original_channel_config = ChannelRegionConfig(**vars(self.current_channel_config))
         self.reset.setEnabled(False)
-        self.status.setText("算法参数已保存，并替代原用户参数。")
+        if apply_error:
+            self.status.setText(f"算法参数已保存，但未能应用到采样识别：{apply_error}")
+            QMessageBox.warning(
+                self,
+                "实时应用失败",
+                f"参数文件已经保存，但实时采样识别未更新：\n{apply_error}",
+            )
+        elif self._on_parameters_saved is not None:
+            self.status.setText("算法参数已保存并应用到采样识别，从下一采样帧开始生效。")
+        else:
+            self.status.setText("算法参数已保存，并替代原用户参数。")
 
 
 def main(video: str = "") -> None:

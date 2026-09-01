@@ -548,7 +548,7 @@ class PumpInteractionFlowTests(unittest.TestCase):
         token = object()
         service._run_token = token
 
-        result = service._update_flow_with_lifecycle_guard(48.0, 21.0, service._lifecycle_generation)
+        result = service._update_flow_with_lifecycle_guard(98.0, 11.0, service._lifecycle_generation)
 
         self.assertIsNotNone(result)
         self.assertEqual(heartbeat_timeouts, [15.0])

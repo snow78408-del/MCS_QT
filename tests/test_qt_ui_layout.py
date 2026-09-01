@@ -11,7 +11,10 @@ from backend.orchestrator.state import SystemState
 from frontend.qt_app import (
     CollapsibleSection,
     InitPage,
+    MonitorPage,
     ParameterPage,
+    PlantCalibrationExperimentDialog,
+    PumpPage,
     StatusModule,
     StatusPage,
     VideoPage,
@@ -25,7 +28,7 @@ def _application() -> QApplication:
 class _PageApp:
     def __init__(self, config=None):
         self.frontend_config = dict(config or {})
-        self.device_verification = {"camera": False, "pump": False}
+        self.device_verification = {"camera": False, "pump": False, "pump_write": False}
         self.saved = {}
         self.shown = ""
 
@@ -95,6 +98,110 @@ def test_parameter_page_uses_bounded_inputs_with_units() -> None:
     assert page_app.saved["target_diameter"] == page.target.value()
     assert page_app.shown == "video"
     page.close()
+
+
+def test_monitor_page_owns_plant_calibration_entry() -> None:
+    _application()
+    page_app=_PageApp({"initial_q1":50.0,"initial_q2":20.0})
+    pump_page=PumpPage(page_app)
+    monitor_page=MonitorPage(page_app)
+
+    assert not hasattr(pump_page,"plant_calibration_button")
+    assert monitor_page.plant_calibration_button.text()=="打开标定窗口"
+    assert "视频" in monitor_page.plant_calibration_summary.text()
+    pump_page.close(); monitor_page.close()
+
+
+def test_pump_write_readback_is_required_and_invalidated_by_flow_change() -> None:
+    _application()
+    page_app=_PageApp({"initial_q1":50.0,"initial_q2":20.0})
+    page=PumpPage(page_app)
+    values={"port":"COM3","address":1,"baudrate":1200,"parity":"N","q1":50.0,"q2":20.0}
+
+    assert (page.q1.minimum(),page.q1.maximum()) == (20.0,200.0)
+    assert (page.q2.minimum(),page.q2.maximum()) == (5.0,25.0)
+
+    page.pump_done("读取",values,{"recognized_as_pump":True})
+    assert page_app.device_verification["pump"]
+    assert not page_app.device_verification["pump_write"]
+
+    page.pump_done("写入",values,{"ok":True})
+    assert page_app.device_verification["pump_write"]
+
+    page.q1.setValue(51.0)
+    assert not page_app.device_verification["pump_write"]
+    page.close()
+
+
+def test_plant_calibration_dialog_tracks_progress_and_locks_configuration() -> None:
+    _application()
+    holder={
+        "snapshot":SimpleNamespace(
+            system_state=SystemState.IDLE,
+            plant_calibration=None,
+            plant_calibration_experiment={"status":"idle","completed_trials":0,"total_trials":0},
+            config=SimpleNamespace(initial_q1=50.0,initial_q2=20.0),
+            pump_state=SimpleNamespace(q1_actual=50.0,q2_actual=20.0),
+        )
+    }
+    calls=[]
+    def prepare():
+        calls.append("prepare")
+        holder["snapshot"].system_state=SystemState.INITIALIZED
+    def run_calibration(config):
+        calls.append(("run",config))
+        return "result"
+    orchestrator=SimpleNamespace(
+        get_snapshot=lambda:holder["snapshot"],
+        run_plant_calibration_experiment=run_calibration,
+    )
+    dialog_app=SimpleNamespace(
+        frontend_config={"initial_q1":50.0,"initial_q2":20.0},
+        device_verification={"camera":True,"pump":True,"pump_write":True},
+        orchestrator=orchestrator,
+        pages={},
+        save=lambda **_values:None,
+        task=lambda *_args,**_kwargs:None,
+        error=lambda _title,_message:None,
+        configure_prepare_initialize=prepare,
+    )
+    dialog=PlantCalibrationExperimentDialog(dialog_app)
+    dialog.resize(760,700)
+    dialog.show()
+    _application().processEvents()
+
+    assert dialog.start_button.text()=="运行标定"
+    assert dialog.response_limit.value()==30
+    assert dialog.stop_button.text()=="停止标定"
+    assert dialog.close_button.text()=="关闭窗口"
+    assert dialog.config_scroll.widgetResizable()
+    assert dialog.close_button.mapTo(dialog,dialog.close_button.rect().bottomRight()).y()<=dialog.contentsRect().bottom()
+    assert dialog.start_button.isEnabled()
+    assert not dialog.pause_button.isEnabled()
+    marker=object()
+    assert dialog._prepare_and_run(marker)=="result"
+    assert calls==["prepare",("run",marker)]
+    holder["snapshot"]=SimpleNamespace(
+        system_state=SystemState.CALIBRATING,
+        plant_calibration=None,
+        plant_calibration_experiment={
+            "status":"running","phase":"measuring q1-r1-plus",
+            "completed_trials":3,"total_trials":12,
+        },
+        config=SimpleNamespace(initial_q1=50.0,initial_q2=20.0),
+        pump_state=SimpleNamespace(q1_actual=52.0,q2_actual=20.0),
+    )
+    dialog.refresh_status()
+
+    assert dialog.progress.value()==3
+    assert dialog.progress.maximum()==12
+    assert dialog.pause_button.isEnabled()
+    assert dialog.stop_button.isEnabled()
+    assert not dialog.start_button.isEnabled()
+    assert all(not widget.isEnabled() for widget in dialog._config_widgets)
+    holder["snapshot"].system_state=SystemState.STOPPED
+    dialog._running=False
+    dialog.close()
 
 
 def test_video_page_hides_camera_transport_fields_for_local_video() -> None:

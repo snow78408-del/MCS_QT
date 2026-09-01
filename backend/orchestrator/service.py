@@ -5,14 +5,32 @@ import math
 import threading
 import time
 from dataclasses import asdict
+from datetime import datetime, timezone
+from statistics import median
 from typing import Any, Callable
 
 from ..disturbance_model import DisturbanceModelConfig, DisturbanceModelService
 from ..optimization import BayesianOptimizationConfig, OptimizationObservation, SafeBayesianOptimizer
-from ..pid_control import DiameterPIDController, PIDConfig, PIDInput, PumpState, TargetParams, VisionMetrics
+from ..pid_control import (
+    DiameterPIDController,
+    PIDConfig,
+    PIDInput,
+    PlantCalibrationExperimentConfig,
+    PlantCalibrationExperimentResult,
+    PlantCalibrationMeasurement,
+    PlantCalibrationObservation,
+    PlantCalibrationRecord,
+    PumpState,
+    TargetParams,
+    VisionMetrics,
+    build_plant_calibration_result,
+    identify_channel_sensitivities,
+    save_plant_calibration_result,
+)
 from ..pump_hardware import ChannelParams, PumpHardwareService
 from ..pump_hardware.invariants import effective_q1_q2_gap, q1_is_strictly_above_q2
 from .config import OrchestratorConfig
+from .drift import DriftSupervisor
 from .models import (
     ControlSnapshot,
     FrameSnapshot,
@@ -55,7 +73,34 @@ class OrchestratorService:
         self.pump_service = pump_service or PumpHardwareService(logger=logger)
         self.runtime = orchestrator_config or OrchestratorConfig()
         self.pid_config = pid_config or PIDConfig()
+        self._pid_calibration_defaults = {
+            name: copy.deepcopy(getattr(self.pid_config, name))
+            for name in (
+                "feedforward_gain",
+                "feedforward_calibrated",
+                "q1_control_sign",
+                "q2_control_sign",
+                "q1_output_gain",
+                "q2_output_gain",
+                "q1_min",
+                "q1_max",
+                "q2_min",
+                "q2_max",
+                "total_flow_max",
+                "min_q1_q2_gap",
+            )
+        }
         self._pid_controller = DiameterPIDController(self.pid_config)
+        self._plant_calibration: PlantCalibrationRecord | None = None
+        self._plant_calibration_experiment: dict[str, Any] = {
+            "status": "idle",
+            "phase": "",
+            "reason": "",
+            "completed_trials": 0,
+            "total_trials": 0,
+        }
+        self._plant_calibration_in_progress = False
+        self._drift_supervisor = DriftSupervisor()
         pump_runtime = getattr(self.pump_service, "runtime_config", None)
         if pump_runtime is not None and hasattr(pump_runtime, "min_q1_q2_gap"):
             pump_runtime.min_q1_q2_gap = float(self.pid_config.min_q1_q2_gap)
@@ -109,6 +154,8 @@ class OrchestratorService:
         self._optimization_candidate = None
         self._optimization_candidate_applied_monotonic = 0.0
         self._optimization_candidate_period_id = 0
+        self._optimization_window_observations: list[OptimizationObservation] = []
+        self._optimization_review_required = False
         self._stabilizing_until_monotonic = 0.0
         self._run_token: RunToken | None = None
         self._safety = SafetySupervisor(self._safety_stop_pump, logger=self._log)
@@ -269,13 +316,21 @@ class OrchestratorService:
         signal_lead_time_ms: float = 0.0,
         leading_signal_name: str = "",
     ) -> None:
-        self._disturbance_context = {
-            "experiment_id": experiment_id,
-            "chip_id": chip_id,
-            "disturbance_name": disturbance_name,
+        with self._lock:
+            existing = dict(self._disturbance_context)
+        context = {
+            "experiment_id": str(experiment_id or existing.get("experiment_id", "")),
+            "chip_id": str(chip_id or existing.get("chip_id", "")),
+            "disturbance_name": str(
+                disturbance_name or existing.get("disturbance_name", "")
+            ),
             "disturbance_stage": disturbance_stage,
             "disturbance_amplitude": disturbance_amplitude,
-            "temperature_c": temperature_c,
+            "temperature_c": (
+                temperature_c
+                if temperature_c is not None
+                else existing.get("temperature_c")
+            ),
             "leading_signal_available": bool(leading_signal_available),
             "signal_lead_time_ms": max(0.0, float(signal_lead_time_ms)),
             "leading_signal_name": str(leading_signal_name or ""),
@@ -283,6 +338,37 @@ class OrchestratorService:
                 time.monotonic() if leading_signal_available else 0.0
             ),
         }
+        with self._lock:
+            self._disturbance_context = context
+
+    def promote_disturbance_candidate_model(self) -> dict[str, Any]:
+        """Explicitly promote a shadow-validated model while control is quiescent."""
+        with self._lock:
+            state = self._state
+        allowed = {
+            SystemState.CONFIGURED,
+            SystemState.VIDEO_READY,
+            SystemState.INITIALIZED,
+            SystemState.PAUSED,
+            SystemState.STOPPED,
+        }
+        if state not in allowed:
+            raise RuntimeError(
+                "candidate model promotion requires configured, initialized, paused, or stopped state"
+            )
+        result = self.disturbance_service.promote_candidate_model()
+        self._log(
+            f"[DISTURBANCE][PROMOTION][OPERATOR] version={result['model_version']} "
+            f"state={state.value}"
+        )
+        return result
+
+    def discard_disturbance_candidate_model(self) -> None:
+        self.disturbance_service.discard_candidate_model()
+
+    def close_background_services(self) -> None:
+        """Flush persistent queues and stop bounded background workers."""
+        self.disturbance_service.close()
 
     def _is_realtime_mode(self) -> bool:
         if self._cfg is None:
@@ -313,6 +399,938 @@ class OrchestratorService:
         if error:
             self._log(f"[ORCH][ERROR] {error}")
 
+    def _get_drift_supervisor(self) -> DriftSupervisor:
+        supervisor = getattr(self, "_drift_supervisor", None)
+        if supervisor is None:
+            supervisor = DriftSupervisor()
+            self._drift_supervisor = supervisor
+        return supervisor
+
+    def _apply_plant_calibration(
+        self,
+        record: PlantCalibrationRecord | None,
+    ) -> None:
+        defaults = self._pid_calibration_defaults
+        if record is not None:
+            if record.q1_min < float(defaults["q1_min"]) or record.q1_max > float(defaults["q1_max"]):
+                raise ValueError("plant calibration Q1 bounds exceed controller safety limits")
+            if record.q2_min < float(defaults["q2_min"]) or record.q2_max > float(defaults["q2_max"]):
+                raise ValueError("plant calibration Q2 bounds exceed controller safety limits")
+            if record.total_flow_max > float(defaults["total_flow_max"]):
+                raise ValueError("plant calibration total-flow limit exceeds controller safety limit")
+            if record.min_q1_q2_gap < float(defaults["min_q1_q2_gap"]):
+                raise ValueError("plant calibration phase gap is weaker than controller safety limit")
+
+        for name, value in defaults.items():
+            setattr(self.pid_config, name, copy.deepcopy(value))
+        # An ad-hoc constructor flag is not sufficient authority for real
+        # feedforward. Every configure call must present the versioned record.
+        self.pid_config.feedforward_calibrated = False
+        if record is not None:
+            self.pid_config.feedforward_gain = float(record.feedforward_gain)
+            self.pid_config.feedforward_calibrated = True
+            self.pid_config.q1_control_sign = float(record.q1_control_sign)
+            self.pid_config.q2_control_sign = float(record.q2_control_sign)
+            self.pid_config.q1_output_gain = float(record.q1_output_gain)
+            self.pid_config.q2_output_gain = float(record.q2_output_gain)
+            self.pid_config.q1_min = float(record.q1_min)
+            self.pid_config.q1_max = float(record.q1_max)
+            self.pid_config.q2_min = float(record.q2_min)
+            self.pid_config.q2_max = float(record.q2_max)
+            self.pid_config.total_flow_max = float(record.total_flow_max)
+            self.pid_config.min_q1_q2_gap = float(record.min_q1_q2_gap)
+        pump_runtime = getattr(self.pump_service, "runtime_config", None)
+        if pump_runtime is not None and hasattr(pump_runtime, "min_q1_q2_gap"):
+            pump_runtime.min_q1_q2_gap = float(self.pid_config.min_q1_q2_gap)
+        self._pid_controller.reset()
+
+    def _update_plant_calibration_experiment(self, **values: Any) -> None:
+        with self._lock:
+            current = dict(self._plant_calibration_experiment)
+            current.update(values)
+            self._plant_calibration_experiment = current
+
+    def _require_calibration_lifecycle(
+        self,
+        generation: int,
+        token: RunToken,
+    ) -> None:
+        with self._lock:
+            valid = (
+                generation == self._lifecycle_generation
+                and self._state == SystemState.CALIBRATING
+                and not self._stop_event.is_set()
+                and not self._pause_event.is_set()
+            )
+        if not valid or not self._safety.permits(token):
+            raise RuntimeError("plant calibration was cancelled by a lifecycle transition")
+
+    @staticmethod
+    def _plant_calibration_observations(
+        rec: RecognitionSnapshot,
+    ) -> tuple[PlantCalibrationObservation, ...]:
+        crossed = {
+            int(track_id): float(value)
+            for track_id, value in dict(getattr(rec, "crossed_track_diameters", {}) or {}).items()
+            if math.isfinite(float(value)) and float(value) > 0.0
+        }
+        capture_times = {
+            int(track_id): float(value)
+            for track_id, value in dict(getattr(rec,"crossed_track_capture_monotonic",{}) or {}).items()
+        }
+        frame_ids = {
+            int(track_id): int(value)
+            for track_id, value in dict(getattr(rec,"crossed_track_frame_ids",{}) or {}).items()
+        }
+        current_frame_id = int(getattr(rec, "frame_id", 0) or 0)
+        if current_frame_id <= 0 or not crossed:
+            return ()
+        observed = time.monotonic()
+        fallback_capture = float(getattr(rec, "capture_monotonic", 0.0) or observed)
+        period_id = int(getattr(rec, "control_period_id", 0) or 0)
+        return tuple(
+            PlantCalibrationObservation(
+                frame_id=int(frame_ids.get(track_id,current_frame_id)),
+                capture_monotonic=float(capture_times.get(track_id,fallback_capture)),
+                observed_monotonic=observed,
+                diameter_um=diameter,
+                droplet_count=1,
+                droplet_id=track_id,
+                control_period_id=period_id,
+                pixel_to_micron=float(getattr(rec, "pixel_to_micron", 0.0) or 0.0),
+                scale_source=str(getattr(rec, "scale_source", "unknown") or "unknown"),
+            )
+            for track_id, diameter in sorted(crossed.items())
+        )
+
+    @staticmethod
+    def _calibration_median_drift_um(
+        observations: list[PlantCalibrationObservation] | tuple[PlantCalibrationObservation, ...],
+    ) -> float | None:
+        if len(observations) < 3:
+            return None
+        edge_count = max(1, min(len(observations) // 2, max(2, len(observations) // 3)))
+        early = median(item.diameter_um for item in observations[:edge_count])
+        late = median(item.diameter_um for item in observations[-edge_count:])
+        return abs(float(late) - float(early))
+
+    @staticmethod
+    def _calibration_effective_stability_tolerance_um(
+        observations: list[PlantCalibrationObservation] | tuple[PlantCalibrationObservation, ...],
+        configured_tolerance_um: float,
+        pixel_to_micron: float = 0.0,
+    ) -> float:
+        values = [float(item.diameter_um) for item in observations]
+        noise_sigma_um = 0.0
+        if len(values) >= 3:
+            differences = [current - previous for previous,current in zip(values,values[1:])]
+            difference_center = float(median(differences))
+            difference_mad = float(median(abs(value-difference_center) for value in differences))
+            # First differences contain sqrt(2) times the independent sample
+            # noise while largely removing slow drift.
+            noise_sigma_um = 1.4826 * difference_mad / math.sqrt(2.0)
+        return max(
+            float(configured_tolerance_um),
+            2.0 * max(0.0,float(pixel_to_micron)),
+            2.0 * noise_sigma_um,
+        )
+
+    @staticmethod
+    def _calibration_response_threshold_um(
+        observations: list[PlantCalibrationObservation] | tuple[PlantCalibrationObservation, ...],
+        minimum_response_um: float,
+        pixel_to_micron: float,
+    ) -> float:
+        baseline_diameter = float(median(item.diameter_um for item in observations))
+        deviations = [abs(item.diameter_um - baseline_diameter) for item in observations]
+        robust_noise_threshold = (
+            3.0 * 1.4826 * float(median(deviations)) if deviations else 0.0
+        )
+        return max(
+            float(minimum_response_um),
+            2.0 * max(0.0, float(pixel_to_micron)),
+            robust_noise_threshold,
+        )
+
+    @staticmethod
+    def _calibration_droplet_window_is_stable(
+        observations: list[PlantCalibrationObservation],
+        tolerance_um: float,
+        pixel_to_micron: float = 0.0,
+        noise_reference: list[PlantCalibrationObservation] | tuple[PlantCalibrationObservation, ...] | None = None,
+    ) -> bool:
+        """Detect drift using early/late droplet medians, not frame extremes."""
+        drift_um = OrchestratorService._calibration_median_drift_um(observations)
+        if drift_um is None:
+            return False
+        effective_tolerance_um = OrchestratorService._calibration_effective_stability_tolerance_um(
+            noise_reference if noise_reference is not None else observations,
+            tolerance_um,
+            pixel_to_micron,
+        )
+        return float(drift_um) <= float(effective_tolerance_um)
+
+    @staticmethod
+    def _calibration_response_decision(
+        observations: list[PlantCalibrationObservation],
+        *,
+        baseline_diameter_um: float,
+        response_threshold_um: float,
+        stable_sample_count: int,
+        minimum_observation_count: int,
+        stability_tolerance_um: float,
+        pixel_to_micron: float,
+        noise_reference: tuple[PlantCalibrationObservation, ...],
+    ) -> tuple[str | None, list[PlantCalibrationObservation]]:
+        """Classify only a stable tail after the minimum droplet count.
+
+        A stable sub-threshold tail is a real low-response observation.  An
+        unstable tail is not a failure at the minimum count; callers keep
+        collecting and reconsider after every new valid crossing droplet.
+        """
+        if len(observations) < int(minimum_observation_count):
+            return None, []
+        count = int(stable_sample_count)
+        tail = observations[-count:]
+        if len(tail) < count or not OrchestratorService._calibration_droplet_window_is_stable(
+            tail,
+            float(stability_tolerance_um),
+            float(pixel_to_micron),
+            noise_reference=noise_reference,
+        ):
+            return None, []
+        steady_diameter = float(median(item.diameter_um for item in tail))
+        if abs(steady_diameter - float(baseline_diameter_um)) >= float(response_threshold_um):
+            return "detected_stable", tail
+        return "below_detection_threshold", tail
+
+    def _collect_stable_calibration_baseline(
+        self,
+        *,
+        config: PlantCalibrationExperimentConfig,
+        generation: int,
+        token: RunToken,
+        minimum_observation_count: int | None = None,
+    ) -> tuple[PlantCalibrationObservation, ...]:
+        observations: list[PlantCalibrationObservation] = []
+        initial_rec = self._read_recognition()
+        last_frame_id = int(getattr(initial_rec,"frame_id",0) or 0)
+        seen_droplet_ids = set(
+            int(track_id)
+            for track_id in dict(getattr(initial_rec,"crossed_track_diameters",{}) or {})
+        )
+        last_valid_droplet = time.monotonic()
+        required = int(config.baseline_sample_count)
+        minimum_collected = max(required, int(minimum_observation_count or required))
+        collected = 0
+        while True:
+            self._require_calibration_lifecycle(generation, token)
+            self._safety.heartbeat(token, timeout_s=5.0)
+            rec = self._read_recognition()
+            if (
+                str(rec.session_id or "") == token.session_id
+                and int(rec.run_generation or 0) == token.generation
+            ):
+                frame_id = int(getattr(rec, "frame_id", 0) or 0)
+                if frame_id > last_frame_id:
+                    last_frame_id = frame_id
+                    available = self._plant_calibration_observations(rec)
+                    new_droplets = tuple(item for item in available if item.droplet_id not in seen_droplet_ids)
+                    if new_droplets:
+                        seen_droplet_ids.update(item.droplet_id for item in new_droplets)
+                        last_valid_droplet = time.monotonic()
+                        collected += len(new_droplets)
+                        observations.extend(new_droplets)
+                        observations = observations[-required:]
+                        diameters = [item.diameter_um for item in observations]
+                        pixel_to_micron = float(
+                            getattr(rec,"pixel_to_micron",0.0)
+                            or getattr(self._cfg,"pixel_to_micron",0.0)
+                            or 0.0
+                        )
+                        drift = self._calibration_median_drift_um(observations)
+                        effective_tolerance = self._calibration_effective_stability_tolerance_um(
+                            observations,
+                            float(config.stability_tolerance_um),
+                            pixel_to_micron,
+                        )
+                        self._update_plant_calibration_experiment(
+                            sample_mode="valid_droplet_count",
+                            baseline_valid_droplets=collected,
+                            baseline_required_droplets=minimum_collected,
+                            baseline_recent_range_um=(max(diameters)-min(diameters) if diameters else None),
+                            baseline_median_drift_um=drift,
+                            baseline_effective_tolerance_um=effective_tolerance,
+                        )
+                        if collected >= minimum_collected and self._calibration_droplet_window_is_stable(
+                            observations,
+                            float(config.stability_tolerance_um),
+                            pixel_to_micron,
+                        ):
+                            return tuple(observations)
+            if time.monotonic() - last_valid_droplet >= float(config.vision_liveness_timeout_s):
+                raise RuntimeError(
+                    f"连续 {float(config.vision_liveness_timeout_s):g} 秒没有新的有效过线液滴；"
+                    "已安全终止标定，请检查成滴、计数线和视觉识别"
+                )
+            if self._stop_event.wait(float(config.sample_poll_interval_s)):
+                break
+        raise RuntimeError("泵动力学标定已由停止请求中止")
+
+    def _restore_plant_calibration_baseline(
+        self,
+        *,
+        baseline_q1: float,
+        baseline_q2: float,
+        generation: int,
+        token: RunToken,
+        next_trial_id: str,
+    ) -> tuple[float, float]:
+        self._update_plant_calibration_experiment(
+            phase=f"{next_trial_id}: returning to the common baseline",
+            current_trial=next_trial_id,
+            reason=(
+                f"restoring Q1={float(baseline_q1):.3f}, "
+                f"Q2={float(baseline_q2):.3f} uL/min before the trial"
+            ),
+        )
+        actual_q1, actual_q2, _command_started, _readback_completed = (
+            self._apply_calibration_flow(
+                float(baseline_q1),
+                float(baseline_q2),
+                generation,
+                token,
+            )
+        )
+        self._log(
+            "[PLANT_CAL][BASELINE_RESET] "
+            f"next_trial={next_trial_id} q1={actual_q1:.6f} q2={actual_q2:.6f}"
+        )
+        return float(actual_q1), float(actual_q2)
+
+    def _apply_calibration_flow(
+        self,
+        q1: float,
+        q2: float,
+        generation: int,
+        token: RunToken,
+    ) -> tuple[float, float, float, float]:
+        self._require_calibration_lifecycle(generation, token)
+        result = self._update_flow_with_lifecycle_guard(float(q1), float(q2), generation)
+        if result is None:
+            raise RuntimeError("plant calibration flow update was cancelled")
+        if not result.ok:
+            raise RuntimeError(
+                f"plant calibration flow update failed: {result.reason or result.rollback_error or 'unknown error'}"
+            )
+        q1_actual = self._flow_from_channel_params(result.verified_q1) or float(q1)
+        q2_actual = self._flow_from_channel_params(result.verified_q2) or float(q2)
+        ok1, reason1 = self._flow_matches("Q1", q1, q1_actual)
+        ok2, reason2 = self._flow_matches("Q2", q2, q2_actual)
+        if not (ok1 and ok2):
+            raise RuntimeError(f"plant calibration readback mismatch: {reason1 or reason2}")
+        with self._lock:
+            self._pump_state.q1 = float(q1)
+            self._pump_state.q2 = float(q2)
+            self._pump_state.q1_actual = float(q1_actual)
+            self._pump_state.q2_actual = float(q2_actual)
+            self._pump_state.last_update_ok = True
+            self._pump_state.last_update_reason = "plant calibration flow update succeeded"
+            self._pump_state.last_error = ""
+            self._refresh_pump_channels(communication_ok=True, error="")
+        return (
+            float(q1_actual),
+            float(q2_actual),
+            float(getattr(result, "command_started_monotonic", 0.0) or time.monotonic()),
+            float(getattr(result, "readback_completed_monotonic", 0.0) or time.monotonic()),
+        )
+
+    def _run_plant_calibration_trial(
+        self,
+        *,
+        config: PlantCalibrationExperimentConfig,
+        generation: int,
+        token: RunToken,
+        trial_id: str,
+        channel: str,
+        direction: int,
+        baseline_q1: float,
+        baseline_q2: float,
+        commanded_q1: float,
+        commanded_q2: float,
+        actuator_step: float | None = None,
+    ) -> PlantCalibrationMeasurement:
+        self._update_plant_calibration_experiment(
+            phase=f"{trial_id}：等待成滴及基线稳定",
+            sample_mode="valid_droplet_count",
+            baseline_valid_droplets=0,
+            baseline_required_droplets=max(
+                int(config.baseline_sample_count),
+                int(config.response_observation_limit),
+            ),
+            baseline_median_drift_um=None,
+            baseline_effective_tolerance_um=None,
+            response_valid_droplets=0,
+            response_required_droplets=int(config.stable_sample_count),
+            response_observation_limit=int(config.response_observation_limit),
+            response_detected=False,
+            response_classification="waiting",
+            response_median_drift_um=None,
+            response_effective_tolerance_um=None,
+        )
+        baseline = self._collect_stable_calibration_baseline(
+            config=config,
+            generation=generation,
+            token=token,
+            minimum_observation_count=int(config.response_observation_limit),
+        )
+        baseline_diameter = float(median(item.diameter_um for item in baseline))
+        live_scales = [
+            float(item.pixel_to_micron)
+            for item in baseline
+            if math.isfinite(float(item.pixel_to_micron)) and float(item.pixel_to_micron) > 0.0
+        ]
+        pixel_to_micron = (
+            float(median(live_scales))
+            if live_scales
+            else float(getattr(self._cfg, "pixel_to_micron", 0.0) or 0.0)
+        )
+        effective_stability_tolerance = self._calibration_effective_stability_tolerance_um(
+            baseline,
+            float(config.stability_tolerance_um),
+            pixel_to_micron,
+        )
+        response_threshold = self._calibration_response_threshold_um(
+            baseline,
+            float(config.minimum_response_um),
+            pixel_to_micron,
+        )
+        self._update_plant_calibration_experiment(
+            response_pixel_to_micron=pixel_to_micron,
+            response_scale_source=str(baseline[-1].scale_source or "unknown"),
+            response_detection_threshold_um=response_threshold,
+        )
+
+        samples: list[PlantCalibrationObservation] = []
+        samples_lock = threading.Lock()
+        collector_stop = threading.Event()
+
+        def collect_frames() -> None:
+            initial_rec = self._read_recognition()
+            last_frame_id = int(getattr(initial_rec,"frame_id",0) or 0)
+            seen_droplet_ids = set(
+                int(track_id)
+                for track_id in dict(getattr(initial_rec,"crossed_track_diameters",{}) or {})
+            )
+            while not collector_stop.is_set():
+                try:
+                    rec = self._read_recognition()
+                    if (
+                        str(rec.session_id or "") == token.session_id
+                        and int(rec.run_generation or 0) == token.generation
+                    ):
+                        frame_id = int(getattr(rec,"frame_id",0) or 0)
+                        if frame_id > last_frame_id:
+                            last_frame_id = frame_id
+                            available = self._plant_calibration_observations(rec)
+                            observations = tuple(item for item in available if item.droplet_id not in seen_droplet_ids)
+                            seen_droplet_ids.update(item.droplet_id for item in observations)
+                            with samples_lock:
+                                samples.extend(observations)
+                except Exception as exc:
+                    self._log(f"[PLANT_CAL][VISION][WARN] {exc}")
+                collector_stop.wait(float(config.sample_poll_interval_s))
+
+        collector = threading.Thread(
+            target=collect_frames,
+            name=f"plant-calibration-vision-{trial_id}",
+            daemon=True,
+        )
+        collector.start()
+        update_completed = False
+        try:
+            self._update_plant_calibration_experiment(
+                phase=f"{trial_id}：执行阶跃并等待有效液滴响应",
+            )
+            actual_q1, actual_q2, command_started, readback_completed = (
+                self._apply_calibration_flow(
+                    commanded_q1,
+                    commanded_q2,
+                    generation,
+                    token,
+                )
+            )
+            update_completed = True
+            onset: PlantCalibrationObservation | None = None
+            stable_tail: list[PlantCalibrationObservation] = []
+            response_classification = "detected_stable"
+            while True:
+                self._require_calibration_lifecycle(generation, token)
+                self._safety.heartbeat(token, timeout_s=5.0)
+                with samples_lock:
+                    post_command = [
+                        item for item in samples if item.capture_monotonic >= command_started
+                    ]
+                self._update_plant_calibration_experiment(
+                    response_valid_droplets=len(post_command),
+                    response_required_droplets=int(config.stable_sample_count),
+                    response_detected=onset is not None,
+                    response_effective_tolerance_um=effective_stability_tolerance,
+                )
+                if onset is None and len(post_command) >= 2:
+                    for previous, current in zip(post_command, post_command[1:]):
+                        first = previous.diameter_um - baseline_diameter
+                        second = current.diameter_um - baseline_diameter
+                        if (
+                            abs(first) >= response_threshold
+                            and abs(second) >= response_threshold
+                            and first * second > 0.0
+                        ):
+                            onset = previous
+                            break
+                recent_tail = post_command[-int(config.stable_sample_count):]
+                response_drift = self._calibration_median_drift_um(recent_tail)
+                decision, decision_tail = self._calibration_response_decision(
+                    post_command,
+                    baseline_diameter_um=baseline_diameter,
+                    response_threshold_um=response_threshold,
+                    stable_sample_count=int(config.stable_sample_count),
+                    minimum_observation_count=int(config.response_observation_limit),
+                    stability_tolerance_um=float(config.stability_tolerance_um),
+                    pixel_to_micron=pixel_to_micron,
+                    noise_reference=baseline,
+                )
+                self._update_plant_calibration_experiment(
+                    response_median_drift_um=response_drift,
+                    response_effective_tolerance_um=effective_stability_tolerance,
+                )
+                if decision == "detected_stable" and onset is not None:
+                    stable_tail = decision_tail
+                    response_classification = decision
+                    break
+                if decision == "below_detection_threshold":
+                    stable_tail = decision_tail
+                    response_classification = decision
+                    self._update_plant_calibration_experiment(
+                        phase=f"{trial_id}: stable low response recorded; continuing",
+                        response_detected=False,
+                        response_classification=response_classification,
+                        reason=(
+                            f"stable response remained below {response_threshold:.3f} um after "
+                            f"{len(post_command)} valid droplets; retained as a valid low-response observation"
+                        ),
+                    )
+                    break
+                last_valid_droplet = (
+                    float(post_command[-1].observed_monotonic)
+                    if post_command else float(command_started)
+                )
+                if time.monotonic() - last_valid_droplet >= float(config.vision_liveness_timeout_s):
+                    raise RuntimeError(
+                        f"{trial_id} 连续 {float(config.vision_liveness_timeout_s):g} 秒"
+                        "没有新的有效过线液滴；已安全终止标定"
+                    )
+                if self._stop_event.wait(float(config.sample_poll_interval_s)):
+                    break
+            if not stable_tail:
+                raise RuntimeError(f"{trial_id} diameter response did not become stable")
+            stable_diameter = float(median(item.diameter_um for item in stable_tail))
+            stable_time = float(stable_tail[-1].capture_monotonic)
+            with samples_lock:
+                response_observations = tuple(
+                    item
+                    for item in samples
+                    if command_started <= item.capture_monotonic <= stable_time
+                )
+            response_started = onset or response_observations[0]
+            delay_ms = max(0.001,(float(response_started.capture_monotonic)-float(command_started))*1000.0)
+            return PlantCalibrationMeasurement(
+                trial_id=trial_id,
+                channel=channel,
+                direction=int(direction),
+                baseline_q1=float(baseline_q1),
+                baseline_q2=float(baseline_q2),
+                commanded_q1=float(commanded_q1),
+                commanded_q2=float(commanded_q2),
+                actual_q1=float(actual_q1),
+                actual_q2=float(actual_q2),
+                actuator_step=None if actuator_step is None else float(actuator_step),
+                command_started_monotonic=float(command_started),
+                readback_completed_monotonic=float(readback_completed),
+                response_started_monotonic=float(response_started.capture_monotonic),
+                response_stable_monotonic=stable_time,
+                baseline_diameter_um=baseline_diameter,
+                steady_diameter_um=stable_diameter,
+                diameter_change_um=stable_diameter - baseline_diameter,
+                response_delay_ms=delay_ms,
+                baseline_observations=baseline,
+                response_observations=response_observations,
+                response_detected=response_classification == "detected_stable",
+                response_classification=response_classification,
+            )
+        finally:
+            collector_stop.set()
+            collector.join(timeout=1.0)
+            if update_completed:
+                try:
+                    self._require_calibration_lifecycle(generation, token)
+                    self._apply_calibration_flow(
+                        baseline_q1,
+                        baseline_q2,
+                        generation,
+                        token,
+                    )
+                except Exception as exc:
+                    self._log(f"[PLANT_CAL][RESTORE][FAIL] trial={trial_id} error={exc}")
+                    raise
+
+    def _validate_plant_calibration_target(self, q1: float, q2: float) -> None:
+        self._require_valid_phase_flows(q1, q2)
+        if float(q1) + float(q2) > float(self.pid_config.total_flow_max):
+            raise ValueError(
+                f"calibration target exceeds total flow limit: {q1 + q2:.6f} > "
+                f"{self.pid_config.total_flow_max:.6f} uL/min"
+            )
+
+    def _plant_calibration_baseline_with_step_margin(
+        self,
+        config: PlantCalibrationExperimentConfig,
+        q1: float,
+        q2: float,
+    ) -> tuple[float, float]:
+        q1_low = float(self.pid_config.q1_min) + float(config.q1_step)
+        q1_high = float(self.pid_config.q1_max) - float(config.q1_step)
+        q2_low = float(self.pid_config.q2_min) + float(config.q2_step)
+        q2_high = float(self.pid_config.q2_max) - float(config.q2_step)
+        if q1_low > q1_high or q2_low > q2_high:
+            raise ValueError("calibration step is too large for the configured Q1/Q2 range")
+
+        baseline_q1 = min(max(float(q1), q1_low), q1_high)
+        baseline_q2 = min(max(float(q2), q2_low), q2_high)
+        # Validate all four corners because the combined-step direction is not
+        # known until the individual channel sensitivities have been measured.
+        for q1_direction in (-1, 1):
+            for q2_direction in (-1, 1):
+                self._validate_plant_calibration_target(
+                    baseline_q1 + q1_direction * float(config.q1_step),
+                    baseline_q2 + q2_direction * float(config.q2_step),
+                )
+        return baseline_q1, baseline_q2
+
+    def run_plant_calibration_experiment(
+        self,
+        config: PlantCalibrationExperimentConfig,
+    ) -> PlantCalibrationExperimentResult:
+        """Run bounded pump steps under exclusive authority and return an unsaved result."""
+        if not isinstance(config, PlantCalibrationExperimentConfig):
+            config = PlantCalibrationExperimentConfig(**dict(config))
+        with self._lock:
+            if self._cfg is None:
+                raise RuntimeError("system config is missing, call configure() first")
+            if not self._is_realtime_mode():
+                raise RuntimeError("pump-chip calibration requires realtime vision and pump control")
+            if self._state != SystemState.INITIALIZED:
+                raise RuntimeError(
+                    f"plant calibration requires INITIALIZED state, current state is {self._state.value}"
+                )
+            if self._loop_thread and self._loop_thread.is_alive():
+                raise RuntimeError("control loop must be stopped before plant calibration")
+            if self._start_in_progress or self._plant_calibration_in_progress:
+                raise RuntimeError("another pump-control start is already in progress")
+
+        preflight = self.run_preflight_check()
+        if not preflight["ok"]:
+            raise RuntimeError(
+                "plant calibration preflight failed: " + "; ".join(preflight["issues"])
+            )
+
+        with self._lock:
+            if self._state != SystemState.INITIALIZED:
+                raise RuntimeError("plant calibration start was superseded")
+            self._plant_calibration_in_progress = True
+            self._start_in_progress = True
+            self._lifecycle_generation += 1
+            generation = self._lifecycle_generation
+            self._stop_event.clear()
+            self._pause_event.clear()
+            self._state = SystemState.CALIBRATING
+            self._message = "pump-chip calibration is starting"
+
+        total_trials = int(config.repetitions) * 6
+        self._plant_calibration_experiment = {
+            "status": "running",
+            "phase": "starting",
+            "reason": "",
+            "completed_trials": 0,
+            "total_trials": total_trials,
+            "measurement_count": 0,
+        }
+        token: RunToken | None = None
+        adapter_started = False
+        pump_start_attempted = False
+        stopped = False
+        result: PlantCalibrationExperimentResult | None = None
+        failure: Exception | None = None
+        started_at = datetime.now(timezone.utc).isoformat()
+        measurements: list[PlantCalibrationMeasurement] = []
+        try:
+            token = self._safety.begin_session()
+            self._run_token = token
+            set_context = getattr(self.vision_adapter, "set_run_context", None)
+            if callable(set_context):
+                set_context(token.session_id, token.generation)
+            self.vision_adapter.start()
+            adapter_started = True
+            pump_start_attempted = True
+            start_result = self.pump_service.start_infusion_and_verify([1, 2])
+            if not start_result.ok:
+                raise RuntimeError(
+                    f"plant calibration pump start failed: {start_result.reason or start_result.error}"
+                )
+            self._pump_state.running = True
+            self._refresh_pump_channels(communication_ok=True, error="")
+            if not self._sync_pump_flow_readback("plant calibration start"):
+                raise RuntimeError(
+                    self._pump_state.last_error or "plant calibration flow readback failed"
+                )
+            heartbeat_timeout = self._control_heartbeat_timeout_s(
+                float(config.sample_poll_interval_s),
+                pump_transaction=True,
+            )
+            self._safety.arm(token, heartbeat_timeout_s=heartbeat_timeout)
+            current_q1 = float(self._pump_state.q1_actual or self._pump_state.q1)
+            current_q2 = float(self._pump_state.q2_actual or self._pump_state.q2)
+            baseline_q1, baseline_q2 = self._plant_calibration_baseline_with_step_margin(
+                config,
+                current_q1,
+                current_q2,
+            )
+            if abs(baseline_q1 - current_q1) > 1e-9 or abs(baseline_q2 - current_q2) > 1e-9:
+                self._update_plant_calibration_experiment(
+                    phase="moving to an interior calibration baseline",
+                    reason=(
+                        f"current flow is on a step boundary; calibration baseline adjusted to "
+                        f"Q1={baseline_q1:.3f}, Q2={baseline_q2:.3f} uL/min"
+                    ),
+                )
+                baseline_q1, baseline_q2, _command_started, _readback_completed = (
+                    self._apply_calibration_flow(
+                        baseline_q1,
+                        baseline_q2,
+                        generation,
+                        token,
+                    )
+                )
+            single_targets = (
+                ("q1", 1, baseline_q1 + config.q1_step, baseline_q2),
+                ("q1", -1, baseline_q1 - config.q1_step, baseline_q2),
+                ("q2", 1, baseline_q1, baseline_q2 + config.q2_step),
+                ("q2", -1, baseline_q1, baseline_q2 - config.q2_step),
+            )
+            for _channel, _direction, q1, q2 in single_targets:
+                self._validate_plant_calibration_target(q1, q2)
+
+            completed = 0
+            for repeat in range(int(config.repetitions)):
+                directions = (1, -1) if repeat % 2 == 0 else (-1, 1)
+                for channel in ("q1", "q2"):
+                    for direction in directions:
+                        q1 = baseline_q1 + (direction * config.q1_step if channel == "q1" else 0.0)
+                        q2 = baseline_q2 + (direction * config.q2_step if channel == "q2" else 0.0)
+                        trial_id = f"{channel}-r{repeat + 1}-{'plus' if direction > 0 else 'minus'}"
+                        self._update_plant_calibration_experiment(
+                            phase=f"measuring {trial_id}",
+                            current_trial=trial_id,
+                        )
+                        self._restore_plant_calibration_baseline(
+                            baseline_q1=baseline_q1,
+                            baseline_q2=baseline_q2,
+                            generation=generation,
+                            token=token,
+                            next_trial_id=trial_id,
+                        )
+                        measurement = self._run_plant_calibration_trial(
+                            config=config,
+                            generation=generation,
+                            token=token,
+                            trial_id=trial_id,
+                            channel=channel,
+                            direction=direction,
+                            baseline_q1=baseline_q1,
+                            baseline_q2=baseline_q2,
+                            commanded_q1=q1,
+                            commanded_q2=q2,
+                        )
+                        measurements.append(measurement)
+                        self._log(
+                            "[PLANT_CAL][MEASUREMENT] "
+                            f"trial={measurement.trial_id} channel={measurement.channel} "
+                            f"direction={measurement.direction:+d} "
+                            f"baseline={measurement.baseline_diameter_um:.6f}um "
+                            f"steady={measurement.steady_diameter_um:.6f}um "
+                            f"delta={measurement.diameter_change_um:+.6f}um "
+                            f"detected={measurement.response_detected} "
+                            f"classification={measurement.response_classification}"
+                        )
+                        completed += 1
+                        self._update_plant_calibration_experiment(
+                            completed_trials=completed,
+                            measurement_count=len(measurements),
+                        )
+
+            q1_sensitivity, q2_sensitivity = identify_channel_sensitivities(measurements)
+            q1_sign = 1.0 if q1_sensitivity > 0.0 else -1.0 if q1_sensitivity < 0.0 else 0.0
+            q2_sign = 1.0 if q2_sensitivity > 0.0 else -1.0 if q2_sensitivity < 0.0 else 0.0
+            base_step = min(float(config.q1_step), float(config.q2_step))
+            for direction in (-1, 1):
+                self._validate_plant_calibration_target(
+                    baseline_q1 + direction * q1_sign * float(config.q1_step),
+                    baseline_q2 + direction * q2_sign * float(config.q2_step),
+                )
+
+            for repeat in range(int(config.repetitions)):
+                directions = (1, -1) if repeat % 2 == 0 else (-1, 1)
+                for direction in directions:
+                    q1 = baseline_q1 + direction * q1_sign * float(config.q1_step)
+                    q2 = baseline_q2 + direction * q2_sign * float(config.q2_step)
+                    trial_id = f"combined-r{repeat + 1}-{'plus' if direction > 0 else 'minus'}"
+                    self._update_plant_calibration_experiment(
+                        phase=f"measuring {trial_id}",
+                        current_trial=trial_id,
+                    )
+                    self._restore_plant_calibration_baseline(
+                        baseline_q1=baseline_q1,
+                        baseline_q2=baseline_q2,
+                        generation=generation,
+                        token=token,
+                        next_trial_id=trial_id,
+                    )
+                    measurement = self._run_plant_calibration_trial(
+                        config=config,
+                        generation=generation,
+                        token=token,
+                        trial_id=trial_id,
+                        channel="combined",
+                        direction=direction,
+                        baseline_q1=baseline_q1,
+                        baseline_q2=baseline_q2,
+                        commanded_q1=q1,
+                        commanded_q2=q2,
+                        actuator_step=direction * base_step,
+                    )
+                    measurements.append(measurement)
+                    self._log(
+                        "[PLANT_CAL][MEASUREMENT] "
+                        f"trial={measurement.trial_id} channel={measurement.channel} "
+                        f"direction={measurement.direction:+d} "
+                        f"baseline={measurement.baseline_diameter_um:.6f}um "
+                        f"steady={measurement.steady_diameter_um:.6f}um "
+                        f"delta={measurement.diameter_change_um:+.6f}um "
+                        f"detected={measurement.response_detected} "
+                        f"classification={measurement.response_classification}"
+                    )
+                    completed += 1
+                    self._update_plant_calibration_experiment(
+                        completed_trials=completed,
+                        measurement_count=len(measurements),
+                    )
+
+            result = build_plant_calibration_result(
+                config=config,
+                measurements=measurements,
+                session_id=token.session_id,
+                started_at=started_at,
+                q1_min=float(self.pid_config.q1_min),
+                q1_max=float(self.pid_config.q1_max),
+                q2_min=float(self.pid_config.q2_min),
+                q2_max=float(self.pid_config.q2_max),
+                total_flow_max=float(self.pid_config.total_flow_max),
+                min_q1_q2_gap=float(self.pid_config.min_q1_q2_gap),
+            )
+        except Exception as exc:
+            failure = exc
+        finally:
+            with self._lock:
+                lifecycle_current = (
+                    generation == self._lifecycle_generation
+                    and self._state == SystemState.CALIBRATING
+                )
+            if lifecycle_current:
+                self._run_token = None
+                self._stop_event.set()
+                self._safety.request_stop("plant calibration finished")
+                stopped = self._safety_stop_pump() if pump_start_attempted else True
+                if stopped:
+                    self._safety.confirm_stopped()
+                if adapter_started:
+                    try:
+                        self.vision_adapter.stop()
+                    except Exception as exc:
+                        stopped = False
+                        if failure is None:
+                            failure = RuntimeError(f"plant calibration vision stop failed: {exc}")
+                self._pump_state.running = False if stopped else self._pump_state.running
+                self._refresh_pump_channels(
+                    communication_ok=stopped,
+                    error="" if stopped else "plant calibration stop could not be verified",
+                )
+                if not stopped and failure is None:
+                    failure = RuntimeError("plant calibration pump stop could not be verified")
+                if failure is None and result is not None:
+                    self._update_plant_calibration_experiment(
+                        status="completed",
+                        phase="completed; awaiting save",
+                        reason="",
+                        record=result.record.to_dict(),
+                    )
+                    self._set_state(
+                        SystemState.STOPPED,
+                        message="pump-chip calibration completed; pump stop verified",
+                    )
+                else:
+                    reason = str(failure or "plant calibration did not produce a result")
+                    self._update_plant_calibration_experiment(
+                        status="failed",
+                        phase="failed",
+                        reason=reason,
+                    )
+                    self._set_state(SystemState.ERROR, error=reason)
+            elif failure is not None:
+                self._update_plant_calibration_experiment(
+                    status="cancelled",
+                    phase="cancelled by pause or stop",
+                    reason=str(failure),
+                )
+            with self._lock:
+                self._plant_calibration_in_progress = False
+                self._start_in_progress = False
+
+        if failure is not None:
+            raise failure
+        if result is None:
+            raise RuntimeError("plant calibration was cancelled before completion")
+        return result
+
+    def save_plant_calibration_experiment(
+        self,
+        result: PlantCalibrationExperimentResult,
+        calibration_path: str,
+    ) -> dict[str, Any]:
+        if not isinstance(result, PlantCalibrationExperimentResult):
+            raise TypeError("plant calibration result object is invalid")
+        saved = save_plant_calibration_result(result, calibration_path)
+        self._log(
+            f"[PLANT_CAL][SAVED] record={saved['path']} "
+            f"measurements={saved['measurements_path']}"
+        )
+        self._update_plant_calibration_experiment(
+            status="saved",
+            phase="saved",
+            saved_path=saved["path"],
+            measurements_path=saved["measurements_path"],
+        )
+        return saved
+
     def configure(self, system_config: SystemConfig) -> None:
         with self._lock:
             state = self._state
@@ -324,7 +1342,11 @@ class OrchestratorService:
             SystemState.ERROR,
         }:
             raise RuntimeError(f"state does not allow configuration: {state.value}")
-        self._require_valid_phase_flows(system_config.initial_q1, system_config.initial_q2)
+        plant_calibration = (
+            PlantCalibrationRecord.from_mapping(dict(system_config.plant_calibration))
+            if system_config.plant_calibration
+            else None
+        )
         interval = int(system_config.control_interval_ms)
         if not self.runtime.min_control_interval_ms <= interval <= self.runtime.max_control_interval_ms:
             raise ValueError(
@@ -343,6 +1365,9 @@ class OrchestratorService:
         if not getattr(system_config, "pump_parity", ""):
             system_config.pump_parity = "N"
 
+        self._apply_plant_calibration(plant_calibration)
+        self._require_valid_phase_flows(system_config.initial_q1, system_config.initial_q2)
+
         with self._lock:
             self._cfg = system_config
             self._target_revision += 1
@@ -350,9 +1375,25 @@ class OrchestratorService:
             self._optimization_candidate = None
             self._optimization_candidate_applied_monotonic = 0.0
             self._optimization_candidate_period_id = 0
+            self._optimization_window_observations = []
+            self._optimization_review_required = False
             self._stabilizing_until_monotonic = 0.0
-            self._pump_state.pump_response_delay_ms = None
-            self._pump_state.pump_response_measurement_status = "unmeasured"
+            self._get_drift_supervisor().reset()
+            self._plant_calibration = plant_calibration
+            self._pump_state.pump_response_delay_ms = (
+                None
+                if plant_calibration is None
+                else plant_calibration.conservative_response_delay_ms
+            )
+            self._pump_state.pump_response_measurement_status = (
+                "unmeasured; feedforward disabled"
+                if plant_calibration is None
+                else (
+                    f"{plant_calibration.measurement_source}; calibration="
+                    f"{plant_calibration.calibration_id}; uncertainty +"
+                    f"{plant_calibration.response_delay_uncertainty_ms:.0f} ms"
+                )
+            )
             self._error = ""
             self._message = "configured"
         self._set_state(SystemState.CONFIGURED, message="configured")
@@ -437,6 +1478,17 @@ class OrchestratorService:
                 pixel_to_micron=cfg.pixel_to_micron,
             )
         self._set_state(SystemState.VIDEO_READY, message="video ready")
+
+    def apply_vision_tuning(
+        self,
+        detector_config: Any,
+        channel_region_config: Any,
+    ) -> dict[str, Any]:
+        """Publish saved vision tuning to the live sampling pipeline."""
+        apply_tuning = getattr(self.vision_service, "apply_tuning_config", None)
+        if not callable(apply_tuning):
+            raise RuntimeError("当前视觉服务不支持运行时应用液滴识别调参参数")
+        return dict(apply_tuning(detector_config, channel_region_config) or {})
 
     def discover_cameras(self) -> dict[str, Any]:
         self._log("[CAMERA][CALLCHAIN] frontend -> orchestrator -> vision_service -> CameraManager")
@@ -793,7 +1845,12 @@ class OrchestratorService:
         with self._lock:
             if (
                 generation != self._lifecycle_generation
-                or self._state not in {SystemState.OPTIMIZING, SystemState.STABILIZING, SystemState.RUNNING}
+                or self._state not in {
+                    SystemState.CALIBRATING,
+                    SystemState.OPTIMIZING,
+                    SystemState.STABILIZING,
+                    SystemState.RUNNING,
+                }
                 or self._stop_event.is_set()
                 or self._pause_event.is_set()
             ):
@@ -820,7 +1877,12 @@ class OrchestratorService:
         with self._lock:
             current = (
                 generation == self._lifecycle_generation
-                and self._state in {SystemState.OPTIMIZING, SystemState.STABILIZING, SystemState.RUNNING}
+                and self._state in {
+                    SystemState.CALIBRATING,
+                    SystemState.OPTIMIZING,
+                    SystemState.STABILIZING,
+                    SystemState.RUNNING,
+                }
                 and not self._stop_event.is_set()
                 and not self._pause_event.is_set()
             )
@@ -1023,6 +2085,18 @@ class OrchestratorService:
                 raise ValueError("optimizer phase gap is weaker than controller safety limit")
             if float(config.total_flow_max) > float(self.pid_config.total_flow_max):
                 raise ValueError("optimizer total-flow limit exceeds controller safety limit")
+            calibration = getattr(self, "_plant_calibration", None)
+            if calibration is not None:
+                if abs(
+                    float(config.measured_response_delay_ms)
+                    - float(calibration.response_delay_median_ms)
+                ) > 1e-9 or abs(
+                    float(config.response_delay_uncertainty_ms)
+                    - float(calibration.response_delay_uncertainty_ms)
+                ) > 1e-9:
+                    raise ValueError(
+                        "optimizer response delay must match the active plant calibration"
+                    )
             current_q1 = float(getattr(self._pump_state, "q1", None) or self._cfg.initial_q1)
             current_q2 = float(getattr(self._pump_state, "q2", None) or self._cfg.initial_q2)
             self._optimizer = SafeBayesianOptimizer(
@@ -1032,7 +2106,10 @@ class OrchestratorService:
             self._optimization_candidate = None
             self._optimization_candidate_applied_monotonic = 0.0
             self._optimization_candidate_period_id = 0
+            self._optimization_window_observations = []
+            self._optimization_review_required = False
             self._stabilizing_until_monotonic = 0.0
+            self._get_drift_supervisor().reset()
             previous_delay = self._pump_state.pump_response_delay_ms
             previous_delay_status = self._pump_state.pump_response_measurement_status
             self._pump_state.pump_response_delay_ms = float(
@@ -1047,6 +2124,7 @@ class OrchestratorService:
             with self._lock:
                 self._optimizer = None
                 self._optimization_candidate = None
+                self._optimization_window_observations = []
                 self._pump_state.pump_response_delay_ms = previous_delay
                 self._pump_state.pump_response_measurement_status = previous_delay_status
             raise
@@ -1090,7 +2168,8 @@ class OrchestratorService:
                 self._auto_disturbance_experiment_id = token.session_id
             if not str(context.get("chip_id", "")).strip():
                 context["chip_id"] = str(
-                    dict(getattr(self._cfg, "calibration", {}) or {}).get("calibration_id")
+                    dict(getattr(self._cfg, "plant_calibration", {}) or {}).get("chip_id")
+                    or dict(getattr(self._cfg, "calibration", {}) or {}).get("calibration_id")
                     or getattr(self._cfg, "video_source", "")
                     or getattr(self._cfg, "camera_backend", "")
                     or "realtime-camera"
@@ -1098,7 +2177,7 @@ class OrchestratorService:
             if not str(context.get("disturbance_name", "")).strip():
                 context["disturbance_name"] = "closed_loop_dynamics"
             if not str(context.get("disturbance_stage", "")).strip():
-                context["disturbance_stage"] = "disturbed"
+                context["disturbance_stage"] = "baseline"
             self._disturbance_context = context
         set_context = getattr(adapter, "set_run_context", None)
         if callable(set_context):
@@ -1262,7 +2341,12 @@ class OrchestratorService:
 
     def pause(self) -> None:
         with self._lock:
-            if self._state not in {SystemState.OPTIMIZING, SystemState.STABILIZING, SystemState.RUNNING}:
+            if self._state not in {
+                SystemState.CALIBRATING,
+                SystemState.OPTIMIZING,
+                SystemState.STABILIZING,
+                SystemState.RUNNING,
+            }:
                 return
             # Invalidate both guards before any pump I/O so an in-flight
             # control step cannot publish another command after pause.
@@ -1414,6 +2498,16 @@ class OrchestratorService:
                         if self._optimizer is not None
                         else None
                     ),
+                    disturbance_context=dict(self._disturbance_context),
+                    plant_calibration=(
+                        None
+                        if getattr(self, "_plant_calibration", None) is None
+                        else self._plant_calibration.to_dict()
+                    ),
+                    plant_calibration_experiment=dict(
+                        getattr(self, "_plant_calibration_experiment", {}) or {}
+                    ),
+                    drift_supervisor=self._get_drift_supervisor().status().to_dict(),
                 )
             )
 
@@ -1469,6 +2563,18 @@ class OrchestratorService:
             single_rate = None if single_rate_raw is None else float(single_rate_raw)
             reason = str(raw.get("reason", raw.get("control_reason", "")) or "")
             frame_diameters = [float(v) for v in raw.get("frame_diameters", []) or []]
+            crossed_track_diameters = {
+                int(track_id): float(value)
+                for track_id, value in dict(raw.get("crossed_track_diameters", {}) or {}).items()
+            }
+            crossed_track_capture_monotonic = {
+                int(track_id): float(value)
+                for track_id, value in dict(raw.get("crossed_track_capture_monotonic", {}) or {}).items()
+            }
+            crossed_track_frame_ids = {
+                int(track_id): int(value)
+                for track_id, value in dict(raw.get("crossed_track_frame_ids", {}) or {}).items()
+            }
             diameter_sum_raw = raw.get("frame_diameter_sum", None)
             diameter_sum = (
                 float(diameter_sum_raw)
@@ -1498,6 +2604,9 @@ class OrchestratorService:
                 preview_timestamp=float(raw.get("preview_timestamp", raw.get("timestamp", 0.0)) or 0.0),
                 frame_single_cell_count=int(raw.get("frame_single_cell_count", 0) or 0),
                 frame_diameters=frame_diameters,
+                crossed_track_diameters=crossed_track_diameters,
+                crossed_track_capture_monotonic=crossed_track_capture_monotonic,
+                crossed_track_frame_ids=crossed_track_frame_ids,
                 frame_diameter_sum=diameter_sum,
                 frame_avg_diameter=avg_diameter,
                 frame_single_cell_rate=single_rate,
@@ -2037,6 +3146,21 @@ class OrchestratorService:
             pump_response_delay_ms=float(getattr(disturbance_sample, "pump_response_delay_ms", 0.0) or 0.0),
         )
         cmd = self._pid_controller.update_input(pid_input)
+        drift_supervisor = self._get_drift_supervisor()
+        previous_drift_recommendation = drift_supervisor.status().reoptimization_recommended
+        if not cmd.freeze_feedback and not cmd.suggested_stop:
+            drift_status = drift_supervisor.observe(
+                target_diameter_um=target_diameter_um,
+                diameter_error_um=float(cmd.diameter_error),
+                integral_state=float(self._pid_controller.integral),
+                integral_limit=float(self.pid_config.integral_limit),
+                actuator_saturated=bool(cmd.actuator_saturated),
+            )
+            if drift_status.reoptimization_recommended and not previous_drift_recommendation:
+                self._log(
+                    "[CONTROL][DRIFT] local PID authority is persistently exhausted; "
+                    "operator BO re-optimization recommended"
+                )
         operating_point = self._pid_controller.operating_point
         if int(rec.frame_id) > 0:
             self._last_control_frame_id = int(rec.frame_id)
@@ -2225,6 +3349,7 @@ class OrchestratorService:
         if int(control_period_id or 0) <= int(self._optimization_candidate_period_id or 0):
             return
         self._optimization_candidate_period_id = int(control_period_id)
+        self._optimization_window_observations = []
         optimizer.reject_current(reason)
         status = optimizer.status()
         self._log(f"[BO][QUALITY][REJECT] candidate={candidate.candidate_id} reason={reason}")
@@ -2269,6 +3394,25 @@ class OrchestratorService:
 
         raw_count = len(list(rec.raw_frame_diameters or []))
         accepted_count = len(list(rec.frame_diameters or []))
+        if accepted_count < int(optimizer.config.minimum_valid_droplets):
+            self._optimization_candidate_period_id = int(rec.control_period_id or 0)
+            self._optimization_window_observations = []
+            optimizer.reject_current(
+                "valid droplet count below per-period BO quality threshold "
+                f"({accepted_count} < {optimizer.config.minimum_valid_droplets})"
+            )
+            status = optimizer.status()
+            if status.failed:
+                raise RuntimeError(f"BO measurement-quality failure: {status.reason}")
+            self._update_control_snapshot(
+                self._optimization_snapshot(
+                    now,
+                    candidate.q1,
+                    candidate.q2,
+                    "BO evaluation window reset after insufficient droplets",
+                )
+            )
+            return
         invalid_fraction = (
             max(0.0, min(1.0, float(raw_count - accepted_count) / float(raw_count)))
             if raw_count > 0
@@ -2286,22 +3430,63 @@ class OrchestratorService:
             measurement_valid=bool(rec.valid_for_control),
             invalid_reason=str(rec.reason or rec.control_reason or ""),
         )
-        optimizer.tell(observation)
+        self._optimization_candidate_period_id = int(rec.control_period_id or 0)
+        self._optimization_window_observations.append(observation)
+        required_periods = int(optimizer.config.evaluation_window_periods)
+        if len(self._optimization_window_observations) < required_periods:
+            self._update_control_snapshot(
+                self._optimization_snapshot(
+                    now,
+                    candidate.q1,
+                    candidate.q2,
+                    "BO stable evaluation window "
+                    f"({len(self._optimization_window_observations)}/{required_periods} periods)",
+                )
+            )
+            return
+
+        aggregated = self._aggregate_optimization_window(
+            candidate.candidate_id,
+            self._optimization_window_observations,
+        )
+        optimizer.tell(aggregated)
         status = optimizer.status()
         self._log(
             f"[BO][OBSERVE] candidate={candidate.candidate_id} q1={candidate.q1:.6f} q2={candidate.q2:.6f} "
-            f"diameter={current_diameter_um:.6f} objective={status.objective_history[-1] if status.objective_history else float('nan'):.6f} "
+            f"diameter={float(aggregated.diameter_um):.6f} periods={aggregated.period_count} "
+            f"objective={status.objective_history[-1] if status.objective_history else float('nan'):.6f} "
             f"phase={status.phase}"
         )
         if status.failed:
+            if status.best_operating_point is not None and status.failure_kind == "target_not_found":
+                best = status.best_operating_point
+                if abs(float(best.q1) - float(candidate.q1)) > 1e-9 or abs(float(best.q2) - float(candidate.q2)) > 1e-9:
+                    self._apply_optimizer_flow(best.q1, best.q2, generation, token)
+                self._optimization_candidate = None
+                self._optimization_window_observations = []
+                self._optimization_review_required = True
+                self._set_state(
+                    SystemState.STABILIZING,
+                    message="BO ended without confirmed target; holding best safe point for review",
+                )
+                self._update_control_snapshot(
+                    self._optimization_snapshot(
+                        now,
+                        best.q1,
+                        best.q2,
+                        f"BO review required ({status.failure_kind}): {status.reason}",
+                    )
+                )
+                return
             raise RuntimeError(f"BO failed: {status.reason}")
         if status.completed:
-            best = status.best_operating_point
+            best = status.confirmed_operating_point
             if best is None:
                 raise RuntimeError("BO completed without an operating point")
             if abs(float(best.q1) - float(candidate.q1)) > 1e-9 or abs(float(best.q2) - float(candidate.q2)) > 1e-9:
                 self._apply_optimizer_flow(best.q1, best.q2, generation, token)
             self._optimization_candidate = None
+            self._optimization_window_observations = []
             self._stabilizing_until_monotonic = monotonic_now + float(optimizer.config.settling_time_ms) / 1000.0
             self._set_state(SystemState.STABILIZING, message="BO completed; holding optimum before PID")
             self._update_control_snapshot(
@@ -2309,7 +3494,38 @@ class OrchestratorService:
             )
             return
         self._optimization_candidate = None
+        self._optimization_window_observations = []
         self._apply_next_optimization_candidate(optimizer, generation, token, now, monotonic_now, rec)
+
+    @staticmethod
+    def _aggregate_optimization_window(
+        candidate_id: int,
+        observations: list[OptimizationObservation],
+    ) -> OptimizationObservation:
+        if not observations:
+            raise ValueError("cannot aggregate an empty BO evaluation window")
+
+        def _median_optional(values: list[float | None]) -> float | None:
+            finite = [float(value) for value in values if value is not None and math.isfinite(float(value))]
+            return None if not finite else float(median(finite))
+
+        return OptimizationObservation(
+            candidate_id=int(candidate_id),
+            q1=float(median(float(item.q1) for item in observations)),
+            q2=float(median(float(item.q2) for item in observations)),
+            diameter_um=_median_optional([item.diameter_um for item in observations]),
+            frequency_hz=_median_optional([item.frequency_hz for item in observations]),
+            diameter_cv_percent=_median_optional(
+                [item.diameter_cv_percent for item in observations]
+            ),
+            valid_droplets=sum(max(0, int(item.valid_droplets)) for item in observations),
+            invalid_fraction=sum(float(item.invalid_fraction) for item in observations) / len(observations),
+            measurement_valid=all(bool(item.measurement_valid) for item in observations),
+            invalid_reason="; ".join(
+                dict.fromkeys(item.invalid_reason for item in observations if item.invalid_reason)
+            ),
+            period_count=len(observations),
+        )
 
     def _apply_next_optimization_candidate(
         self,
@@ -2326,6 +3542,7 @@ class OrchestratorService:
         self._optimization_candidate = candidate
         self._optimization_candidate_applied_monotonic = monotonic_now
         self._optimization_candidate_period_id = int(rec.control_period_id or 0)
+        self._optimization_window_observations = []
         self._log(
             f"[BO][APPLY] candidate={candidate.candidate_id} q1={candidate.q1:.6f} "
             f"q2={candidate.q2:.6f} reason={candidate.reason}"
@@ -2374,9 +3591,19 @@ class OrchestratorService:
         if optimizer is None:
             raise RuntimeError("STABILIZING state has no optimizer")
         status = optimizer.status()
-        best = status.best_operating_point
+        best = status.confirmed_operating_point or status.best_operating_point
         if best is None:
             raise RuntimeError("STABILIZING state has no BO operating point")
+        if bool(getattr(self, "_optimization_review_required", False)):
+            self._update_control_snapshot(
+                self._optimization_snapshot(
+                    now,
+                    best.q1,
+                    best.q2,
+                    "holding best safe BO point; operator review required before PID handoff",
+                )
+            )
+            return
         if monotonic_now < self._stabilizing_until_monotonic:
             remaining_ms = (self._stabilizing_until_monotonic - monotonic_now) * 1000.0
             self._update_control_snapshot(
@@ -2391,6 +3618,7 @@ class OrchestratorService:
         q1_actual = float(self._pump_state.q1_actual if self._pump_state.q1_actual is not None else best.q1)
         q2_actual = float(self._pump_state.q2_actual if self._pump_state.q2_actual is not None else best.q2)
         self._pid_controller.set_operating_point(q1_actual, q2_actual)
+        self._get_drift_supervisor().reset()
         self._last_control_frame_id = int(rec.frame_id or 0)
         self._last_control_period_id = int(rec.control_period_id or 0)
         self._last_control_ts = monotonic_now
@@ -2402,6 +3630,20 @@ class OrchestratorService:
             f"[BO][TRANSFER] q1_bias={q1_actual:.6f} q2_bias={q2_actual:.6f}; "
             "PID reset and feedforward remains subject to deployment gates"
         )
+
+    def accept_unconfirmed_optimization_best(self) -> None:
+        """Explicitly authorize PID handoff from a safe but unconfirmed BO point."""
+        with self._lock:
+            if self._state != SystemState.STABILIZING or not self._optimization_review_required:
+                raise RuntimeError("no unconfirmed BO operating point is awaiting review")
+            optimizer = self._optimizer
+            if optimizer is None or optimizer.status().best_operating_point is None:
+                raise RuntimeError("BO review has no safe operating point")
+            self._optimization_review_required = False
+            self._stabilizing_until_monotonic = (
+                time.monotonic() + float(optimizer.config.settling_time_ms) / 1000.0
+            )
+            self._message = "operator accepted unconfirmed BO point; stabilizing before PID"
 
     def _optimization_snapshot(self, now: float, q1: float, q2: float, reason: str) -> ControlSnapshot:
         return ControlSnapshot(

@@ -37,6 +37,7 @@ class OptimizationObservation:
     invalid_fraction: float = 0.0
     measurement_valid: bool = True
     invalid_reason: str = ""
+    period_count: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,9 +62,11 @@ class OptimizationStatus:
     confirmation_count: int = 0
     current_candidate: OptimizationCandidate | None = None
     best_operating_point: OperatingPoint | None = None
+    confirmed_operating_point: OperatingPoint | None = None
     completed: bool = False
     failed: bool = False
     reason: str = ""
+    failure_kind: str = ""
     objective_history: list[float] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -73,5 +76,10 @@ class OptimizationStatus:
         )
         data["best_operating_point"] = (
             None if self.best_operating_point is None else self.best_operating_point.to_dict()
+        )
+        data["confirmed_operating_point"] = (
+            None
+            if self.confirmed_operating_point is None
+            else self.confirmed_operating_point.to_dict()
         )
         return data

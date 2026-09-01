@@ -10,7 +10,7 @@ import numpy as np
 try:
     from .bead_counter import BeadCounter, BeadResult
     from .channel_region import ChannelRegionDetector, ChannelRegionResult
-    from .config import PipelineConfig
+    from .config import ChannelRegionConfig, DetectorConfig, PipelineConfig
     from .detector import DetectionResult, DropletDetector
     from .kalman_tracker import KalmanTracker
     from .metrics import MetricsCalculator, MetricsResult
@@ -19,7 +19,7 @@ try:
 except ImportError:
     from bead_counter import BeadCounter, BeadResult
     from channel_region import ChannelRegionDetector, ChannelRegionResult
-    from config import PipelineConfig
+    from config import ChannelRegionConfig, DetectorConfig, PipelineConfig
     from detector import DetectionResult, DropletDetector
     from kalman_tracker import KalmanTracker
     from metrics import MetricsCalculator, MetricsResult
@@ -53,6 +53,28 @@ class VisionPipeline:
 
     def configure_expected_diameter(self, diameter_um: float, pixel_to_micron: float) -> None:
         self.detector.configure_expected_diameter(diameter_um, pixel_to_micron)
+
+    def apply_tuning_config(
+        self,
+        detector_config: DetectorConfig,
+        channel_region_config: ChannelRegionConfig,
+    ) -> None:
+        """Apply saved tuning to subsequent frames without resetting run metrics."""
+        detector = DetectorConfig(**vars(detector_config))
+        channel_region = ChannelRegionConfig(**vars(channel_region_config))
+        # Build the detector before publishing it so invalid input cannot leave
+        # the live pipeline half-updated.
+        replacement_detector = DropletDetector(detector, self.config.debug)
+        self.config.detector = detector
+        self.config.channel_region = channel_region
+        self.detector = replacement_detector
+        # A resolved channel region defines the track coordinate system. Keep
+        # that result for the current run and use the new calibration settings
+        # at the next reset; restarting it mid-period could clear tracking and
+        # cumulative metrics. During startup collection it is safe to restart.
+        self.channel_region_detector.config = channel_region
+        if self._frame_index == 0 or self.channel_region_detector.result.status == "collecting":
+            self.channel_region_detector.reset()
 
     def _build_tracker(self, config: PipelineConfig) -> BaseTracker:
         if config.tracker.tracker_type == "kalman":

@@ -95,12 +95,13 @@ class DisturbancePrediction:
     confidence: float = 0.0
     predicted_diameter_um: float | None = None
     predicted_diameter_change_um: float = 0.0
+    predicted_nominal_change_um: float = 0.0
+    predicted_disturbance_residual_um: float | None = None
     predicted_response_delay_ms: float = 0.0
     predicted_cv: float | None = None
     disturbance_effect: str = "unknown"
-    # None means that the predictive model has not supplied a physically
-    # calibrated inverse-model command. PID may derive one only when an
-    # explicit plant calibration is configured.
+    # Retained for artifact/API compatibility. It is never accepted as
+    # actuator authority; the PID layer uses only the versioned plant record.
     recommended_feedforward: float | None = None
     feedforward_weight: float = 0.0
     control_stage: str = DisturbanceControlStage.COLLECT_ONLY.value
@@ -144,6 +145,17 @@ class ModelStatus:
     shadow_mae_um: float = 0.0
     shadow_change_mae_um: float = 0.0
     shadow_direction_accuracy: float = 0.0
+    candidate_model_version: str = ""
+    candidate_ready: bool = False
+    candidate_comparisons: int = 0
+    candidate_shadow_mae_um: float = 0.0
+    candidate_shadow_change_mae_um: float = 0.0
+    candidate_shadow_direction_accuracy: float = 0.0
+    candidate_active_change_mae_um: float | None = None
+    candidate_relative_improvement: float | None = None
+    candidate_promotion_ready: bool = False
+    candidate_promotion_reason: str = "no candidate model"
+    candidate_metrics: ModelMetrics = field(default_factory=ModelMetrics)
     safety_fallback: bool = False
     last_error: str = ""
     metrics: ModelMetrics = field(default_factory=ModelMetrics)
@@ -151,4 +163,5 @@ class ModelStatus:
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["metrics"] = self.metrics.to_dict()
+        data["candidate_metrics"] = self.candidate_metrics.to_dict()
         return data

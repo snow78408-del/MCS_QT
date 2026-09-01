@@ -28,7 +28,8 @@ class MetricsTrackWindowTests(unittest.TestCase):
         metrics.update(tracking, _beads([7]), 100, 200, timestamp=1.0)
         track.radius = 26
         track.position = np.array([140, 50])
-        metrics.update(tracking, _beads([7]), 100, 200, timestamp=1.1)
+        crossing = metrics.update(tracking, _beads([7]), 100, 200, timestamp=1.1)
+        self.assertEqual(crossing.control.crossed_track_diameters,{7:51.0})
         empty = TrackingResult([], [], [], [7], 1)
         completed = metrics.update(empty, _beads([]), 100, 200, timestamp=1.51)
 

@@ -98,6 +98,36 @@ class DisturbanceStorage:
                 ),
             )
 
+    def mark_model_promoted(self, version: str) -> None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM model_versions WHERE version=?",
+                (str(version),),
+            ).fetchone()
+            payload: dict[str, object] = {}
+            if row and row[0]:
+                try:
+                    loaded = json.loads(str(row[0]))
+                    if isinstance(loaded, dict):
+                        payload.update(loaded)
+                except (TypeError, ValueError):
+                    pass
+            payload.update({"role": "active", "promoted_at": time.time()})
+            if row:
+                conn.execute(
+                    "UPDATE model_versions SET payload_json=? WHERE version=?",
+                    (json.dumps(payload, ensure_ascii=False), str(version)),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO model_versions(version, created_at, payload_json) VALUES(?,?,?)",
+                    (
+                        str(version),
+                        time.time(),
+                        json.dumps(payload, ensure_ascii=False),
+                    ),
+                )
+
     def _writer_loop(self) -> None:
         batch: list[DisturbanceSample] = []
         last_flush = time.monotonic()

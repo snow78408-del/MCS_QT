@@ -49,40 +49,43 @@ class FeedforwardCompensator:
             self._last_u_ff = 0.0
             return FeedforwardResult(0.0, False, "prediction stale", confidence)
 
-        recommended = getattr(prediction, "recommended_feedforward", None)
-        model_inverse_available = recommended is not None and is_finite(recommended)
+        if not self.config.feedforward_calibrated:
+            self._last_u_ff = 0.0
+            return FeedforwardResult(0.0, False, "feedforward plant gain not calibrated", confidence)
 
-        if self.config.feedforward_require_leading_signal and not model_inverse_available:
-            leading_available = bool(getattr(prediction, "leading_signal_available", False))
-            lead_ms = max(0.0, float(getattr(prediction, "signal_lead_time_ms", 0.0) or 0.0))
-            measured_delay_ms = max(0.0, float(pid_input.pump_response_delay_ms or 0.0))
-            required_lead_ms = measured_delay_ms + max(0.0, float(self.config.feedforward_min_lead_margin_ms))
-            if measured_delay_ms <= 0.0:
-                self._last_u_ff = 0.0
-                return FeedforwardResult(0.0, False, "physical pump response delay is unmeasured", confidence)
-            prediction_horizon_ms = max(
+        # Predictive compensation is only feedforward when an exogenous event
+        # is observed before its diameter effect. This gate is intentionally
+        # unconditional; a model forecast alone cannot manufacture causality.
+        leading_available = bool(getattr(prediction, "leading_signal_available", False))
+        lead_ms = max(0.0, float(getattr(prediction, "signal_lead_time_ms", 0.0) or 0.0))
+        measured_delay_ms = max(0.0, float(pid_input.pump_response_delay_ms or 0.0))
+        required_lead_ms = measured_delay_ms + max(0.0, float(self.config.feedforward_min_lead_margin_ms))
+        if measured_delay_ms <= 0.0:
+            self._last_u_ff = 0.0
+            return FeedforwardResult(0.0, False, "physical pump response delay is unmeasured", confidence)
+        prediction_horizon_ms = max(
+            0.0,
+            float(getattr(prediction, "prediction_horizon_ms", 0.0) or 0.0),
+        )
+        if prediction_horizon_ms < measured_delay_ms:
+            self._last_u_ff = 0.0
+            return FeedforwardResult(
                 0.0,
-                float(getattr(prediction, "prediction_horizon_ms", 0.0) or 0.0),
+                False,
+                f"prediction horizon is shorter than pump delay ({prediction_horizon_ms:.0f} < {measured_delay_ms:.0f} ms)",
+                confidence,
             )
-            if prediction_horizon_ms < measured_delay_ms:
-                self._last_u_ff = 0.0
-                return FeedforwardResult(
-                    0.0,
-                    False,
-                    f"prediction horizon is shorter than pump delay ({prediction_horizon_ms:.0f} < {measured_delay_ms:.0f} ms)",
-                    confidence,
-                )
-            if not leading_available:
-                self._last_u_ff = 0.0
-                return FeedforwardResult(0.0, False, "no causal leading disturbance signal", confidence)
-            if lead_ms < required_lead_ms:
-                self._last_u_ff = 0.0
-                return FeedforwardResult(
-                    0.0,
-                    False,
-                    f"leading signal is too late ({lead_ms:.0f} < {required_lead_ms:.0f} ms)",
-                    confidence,
-                )
+        if not leading_available:
+            self._last_u_ff = 0.0
+            return FeedforwardResult(0.0, False, "no causal leading disturbance signal", confidence)
+        if lead_ms < required_lead_ms:
+            self._last_u_ff = 0.0
+            return FeedforwardResult(
+                0.0,
+                False,
+                f"leading signal is too late ({lead_ms:.0f} < {required_lead_ms:.0f} ms)",
+                confidence,
+            )
 
         weight = float(getattr(prediction, "feedforward_weight", 1.0) or 0.0)
         if weight <= 0.0:
@@ -90,12 +93,17 @@ class FeedforwardCompensator:
             stage = str(getattr(prediction, "control_stage", "") or "")
             return FeedforwardResult(0.0, False, f"feedforward gated by stage {stage}".strip(), confidence)
 
-        if recommended is None:
-            if not self.config.feedforward_calibrated:
-                self._last_u_ff = 0.0
-                return FeedforwardResult(0.0, False, "feedforward plant gain not calibrated", confidence)
-            change = float(getattr(prediction, "predicted_diameter_change_um", 0.0) or 0.0)
-            recommended = -float(self.config.feedforward_gain) * change * weight
+        residual_value = getattr(prediction, "predicted_disturbance_residual_um", None)
+        if residual_value is None:
+            self._last_u_ff = 0.0
+            return FeedforwardResult(
+                0.0,
+                False,
+                "prediction does not provide a disturbance residual",
+                confidence,
+            )
+        residual = float(residual_value or 0.0)
+        recommended = -float(self.config.feedforward_gain) * residual * weight
         if not is_finite(recommended):
             self._last_u_ff = 0.0
             return FeedforwardResult(0.0, False, "invalid feedforward value", confidence)

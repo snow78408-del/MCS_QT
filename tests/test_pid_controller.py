@@ -25,9 +25,9 @@ class DiameterPidTests(unittest.TestCase):
     def test_default_flow_limits_match_commissioning_envelope(self) -> None:
         config = PIDConfig()
 
-        self.assertEqual((config.q1_min, config.q1_max), (15.0, 100.0))
+        self.assertEqual((config.q1_min, config.q1_max), (20.0, 200.0))
         self.assertEqual((config.q2_min, config.q2_max), (5.0, 25.0))
-        self.assertEqual(config.total_flow_max, 125.0)
+        self.assertEqual(config.total_flow_max, 225.0)
 
     def test_invalid_current_flow_requests_stop_without_control_output(self) -> None:
         controller = DiameterPIDController(PIDConfig())
@@ -97,11 +97,11 @@ class DiameterPidTests(unittest.TestCase):
         )
         controller = DiameterPIDController(config)
 
-        first = controller.update_input(_input(frame_id=1, q1=50.0, q2=20.0))
+        first = controller.update_input(_input(frame_id=1, q1=100.0, q2=10.0))
         second = controller.update_input(_input(frame_id=2, q1=first.q1, q2=first.q2))
 
-        self.assertAlmostEqual(first.q1, 48.0)
-        self.assertAlmostEqual(first.q2, 21.0)
+        self.assertAlmostEqual(first.q1, 98.0)
+        self.assertAlmostEqual(first.q2, 11.0)
         self.assertAlmostEqual(second.q1, first.q1)
         self.assertAlmostEqual(second.q2, first.q2)
 
@@ -112,9 +112,9 @@ class DiameterPidTests(unittest.TestCase):
             base_ki=0.0,
             base_kd=0.0,
         ))
-        command = controller.update_input(_input(frame_id=1, q1=50.0, q2=20.0, current=60.0))
-        self.assertGreater(command.q1, 50.0)
-        self.assertLess(command.q2, 20.0)
+        command = controller.update_input(_input(frame_id=1, q1=100.0, q2=10.0, current=60.0))
+        self.assertGreater(command.q1, 100.0)
+        self.assertLess(command.q2, 10.0)
 
     def test_small_droplet_decreases_q1_and_increases_q2(self) -> None:
         controller = DiameterPIDController(PIDConfig(
@@ -123,9 +123,9 @@ class DiameterPidTests(unittest.TestCase):
             base_ki=0.0,
             base_kd=0.0,
         ))
-        command = controller.update_input(_input(frame_id=1, q1=50.0, q2=20.0, current=40.0))
-        self.assertLess(command.q1, 50.0)
-        self.assertGreater(command.q2, 20.0)
+        command = controller.update_input(_input(frame_id=1, q1=100.0, q2=10.0, current=40.0))
+        self.assertLess(command.q1, 100.0)
+        self.assertGreater(command.q2, 10.0)
 
     def test_q1_uses_larger_adjustment_gain_than_q2(self) -> None:
         controller = DiameterPIDController(PIDConfig(
@@ -137,11 +137,11 @@ class DiameterPidTests(unittest.TestCase):
             q2_output_gain=1.0,
         ))
         command = controller.update_input(
-            _input(frame_id=1, q1=50.0, q2=20.0, current=40.0)
+            _input(frame_id=1, q1=100.0, q2=10.0, current=40.0)
         )
 
-        self.assertAlmostEqual(50.0 - command.q1, 2.0)
-        self.assertAlmostEqual(command.q2 - 20.0, 1.0)
+        self.assertAlmostEqual(100.0 - command.q1, 2.0)
+        self.assertAlmostEqual(command.q2 - 10.0, 1.0)
         self.assertAlmostEqual(command.q1_output_gain, 2.0)
         self.assertAlmostEqual(command.q2_output_gain, 1.0)
 
@@ -155,14 +155,32 @@ class DiameterPidTests(unittest.TestCase):
             q2_control_sign=-1.0,
         ))
         command = controller.update_input(
-            _input(frame_id=1, q1=50.0, q2=20.0, current=40.0)
+            _input(frame_id=1, q1=100.0, q2=10.0, current=40.0)
         )
-        self.assertGreater(command.q1, 50.0)
-        self.assertLess(command.q2, 20.0)
+        self.assertGreater(command.q1, 100.0)
+        self.assertLess(command.q2, 10.0)
 
     def test_zero_control_sign_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
             PIDConfig(q1_control_sign=0.0)
+
+    def test_sub_resolution_channel_can_be_inactive_without_division_by_zero(self) -> None:
+        controller = DiameterPIDController(PIDConfig(
+            control_mode=PIDControlMode.CLASSIC_PID.value,
+            base_kp=0.1,
+            base_ki=0.0,
+            base_kd=0.0,
+            q2_control_sign=0.0,
+            q2_output_gain=0.0,
+        ))
+
+        command = controller.update_input(
+            _input(frame_id=1, q1=100.0, q2=10.0, current=40.0)
+        )
+
+        self.assertLess(command.q1,100.0)
+        self.assertEqual(command.q2,10.0)
+        self.assertEqual(command.q2_output_gain,0.0)
 
     def test_nonpositive_phase_gap_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
@@ -184,7 +202,7 @@ class DiameterPidTests(unittest.TestCase):
             output_rate_limit=10.0,
         )
         controller = DiameterPIDController(config)
-        controller.update_input(_input(frame_id=1, q1=50.0, q2=20.0, current=1.0))
+        controller.update_input(_input(frame_id=1, q1=100.0, q2=10.0, current=1.0))
         self.assertEqual(controller.integral, 0.0)
 
     def test_per_cycle_flow_change_is_limited(self) -> None:
@@ -195,9 +213,9 @@ class DiameterPidTests(unittest.TestCase):
             output_rate_limit=10000.0,
             max_flow_change_per_cycle=5.0,
         ))
-        command = controller.update_input(_input(frame_id=1, q1=60.0, q2=40.0, current=40.0))
-        self.assertGreaterEqual(command.q1, 55.0)
-        self.assertLessEqual(command.q2, 45.0)
+        command = controller.update_input(_input(frame_id=1, q1=100.0, q2=10.0, current=40.0))
+        self.assertGreaterEqual(command.q1, 95.0)
+        self.assertLessEqual(command.q2, 15.0)
 
     def test_total_flow_is_limited(self) -> None:
         controller = DiameterPIDController(PIDConfig(
@@ -206,7 +224,7 @@ class DiameterPidTests(unittest.TestCase):
             base_ki=0.0,
             total_flow_max=60.0,
         ))
-        command = controller.update_input(_input(frame_id=1, q1=50.0, q2=40.0, current=40.0))
+        command = controller.update_input(_input(frame_id=1, q1=70.0, q2=10.0, current=40.0))
         self.assertLessEqual(command.q1 + command.q2, 60.0 + 1e-9)
 
     def test_small_droplet_saturates_before_q1_reaches_q2(self) -> None:

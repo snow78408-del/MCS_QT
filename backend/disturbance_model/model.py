@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import math
 import time
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from .feature_builder import FEATURE_NAMES, NONLINEAR_FEATURE_NAMES, TARGET_NAMES, build_features, build_nonlinear_features
@@ -19,37 +19,47 @@ class LinearDisturbanceModel:
     intercepts: list[float]
     confidence: float
     model_type: str = "quadratic_ridge"
-    schema_version: int = 2
+    schema_version: int = 3
     feature_means: list[float] | None = None
     feature_scales: list[float] | None = None
     training_data_hash: str = ""
-    feature_version: str = "disturbance-static-v2"
+    feature_version: str = "causal-residual-v3"
+    nominal_change_coefficients: list[float] | None = None
+    nominal_change_intercept: float = 0.0
 
-    def predict_values(self, features: list[float]) -> list[float]:
+    def _model_features(self, features: list[float]) -> list[float]:
         model_features = build_nonlinear_features(features) if self.model_type == "quadratic_ridge" else features
         if self.feature_means is not None and self.feature_scales is not None:
             model_features = [
                 (float(value) - float(mean)) / float(scale)
                 for value, mean, scale in zip(model_features, self.feature_means, self.feature_scales)
             ]
+        return model_features
+
+    def predict_values(self, features: list[float]) -> list[float]:
+        model_features = self._model_features(features)
         values: list[float] = []
         for coeffs, intercept in zip(self.coefficients, self.intercepts):
             values.append(float(intercept) + sum(float(a) * float(b) for a, b in zip(coeffs, model_features)))
         return values
 
+    def predict_nominal_change(self, features: list[float]) -> float:
+        if self.nominal_change_coefficients is None:
+            return 0.0
+        model_features = self._model_features(features)
+        return float(self.nominal_change_intercept) + sum(
+            float(a) * float(b)
+            for a, b in zip(self.nominal_change_coefficients, model_features)
+        )
+
     def predict(self, sample: DisturbanceSample, previous_diameter: float | None = None) -> DisturbancePrediction:
-        values = self.predict_values(build_features(sample))
+        features = build_features(sample)
+        values = self.predict_values(features)
         mapping = dict(zip(self.target_names, values))
         predicted_diameter = mapping.get("future_droplet_mean_diameter_um", mapping.get("droplet_mean_diameter_um"))
-        predicted_change = mapping.get("future_diameter_change_um")
-        if predicted_change is not None:
-            change = float(predicted_change)
-        elif predicted_diameter is not None and previous_diameter is not None:
-            change = float(predicted_diameter) - float(previous_diameter)
-        elif predicted_diameter is not None and sample.droplet_mean_diameter_um is not None:
-            change = float(predicted_diameter) - float(sample.droplet_mean_diameter_um)
-        else:
-            change = 0.0
+        nominal_change = self.predict_nominal_change(features)
+        residual_change = float(mapping.get("future_disturbance_residual_um", 0.0) or 0.0)
+        change = nominal_change + residual_change
         return DisturbancePrediction(
             timestamp=time.time(),
             model_ready=True,
@@ -57,6 +67,8 @@ class LinearDisturbanceModel:
             confidence=float(self.confidence),
             predicted_diameter_um=predicted_diameter,
             predicted_diameter_change_um=change,
+            predicted_nominal_change_um=nominal_change,
+            predicted_disturbance_residual_um=residual_change,
             predicted_response_delay_ms=float(
                 mapping.get("response_delay_ms", mapping.get("pump_response_delay_ms", sample.pump_response_delay_ms or 0.0))
             ),
@@ -66,42 +78,6 @@ class LinearDisturbanceModel:
             model_version=self.version,
             reason="model prediction",
         )
-
-    def recommend_feedforward(
-        self,
-        sample: DisturbanceSample,
-        *,
-        predicted_change_um: float,
-        probe_output: float,
-        min_sensitivity: float,
-        max_output: float,
-        q1_control_sign: float,
-        q2_control_sign: float,
-        q1_output_gain: float,
-        q2_output_gain: float,
-    ) -> float | None:
-        """Invert the learned local response along the PID actuator direction."""
-        probe = max(1e-6, abs(float(probe_output)))
-        q1_delta = float(q1_control_sign) * float(q1_output_gain) * probe
-        q2_delta = float(q2_control_sign) * float(q2_output_gain) * probe
-        probed = replace(
-            sample,
-            q1_set=float(sample.q1_set) + q1_delta,
-            q2_set=float(sample.q2_set) + q2_delta,
-            q1_feedback=float(sample.q1_feedback) + q1_delta,
-            q2_feedback=float(sample.q2_feedback) + q2_delta,
-        )
-        values = self.predict_values(build_features(probed))
-        mapping = dict(zip(self.target_names, values))
-        probed_change = float(mapping.get("future_diameter_change_um", predicted_change_um))
-        sensitivity = (probed_change - float(predicted_change_um)) / probe
-        if not math.isfinite(sensitivity) or abs(sensitivity) < max(1e-9, float(min_sensitivity)):
-            return None
-        command = -float(predicted_change_um) / sensitivity
-        if not math.isfinite(command):
-            return None
-        limit = max(0.0, float(max_output))
-        return max(-limit, min(limit, command))
 
     def save(self, path: str) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -121,7 +97,7 @@ class LinearDisturbanceModel:
     @classmethod
     def from_dict(cls, data: dict) -> "LinearDisturbanceModel | None":
         try:
-            if int(data.get("schema_version", 0)) != 2:
+            if int(data.get("schema_version", 0)) != 3:
                 return None
             training_data_hash = str(data.get("training_data_hash", ""))
             if len(training_data_hash) != 64:
@@ -136,12 +112,23 @@ class LinearDisturbanceModel:
             intercepts = list(map(float, data["intercepts"]))
             means = list(map(float, data.get("feature_means") or []))
             scales = list(map(float, data.get("feature_scales") or []))
-            numeric_values = [*intercepts, *means, *scales, *(value for row in coefficients for value in row)]
+            nominal_coefficients = list(map(float, data.get("nominal_change_coefficients") or []))
+            nominal_intercept = float(data.get("nominal_change_intercept", 0.0))
+            numeric_values = [
+                *intercepts,
+                *means,
+                *scales,
+                *nominal_coefficients,
+                nominal_intercept,
+                *(value for row in coefficients for value in row),
+            ]
             if len(coefficients) != len(TARGET_NAMES) or len(intercepts) != len(TARGET_NAMES):
                 return None
             if any(len(row) != expected_coeff_len for row in coefficients):
                 return None
             if len(means) != expected_coeff_len or len(scales) != expected_coeff_len:
+                return None
+            if len(nominal_coefficients) != expected_coeff_len:
                 return None
             if any(scale <= 0.0 for scale in scales) or not all(math.isfinite(value) for value in numeric_values):
                 return None
@@ -156,11 +143,13 @@ class LinearDisturbanceModel:
                 intercepts=intercepts,
                 confidence=confidence,
                 model_type=model_type,
-                schema_version=2,
+                schema_version=3,
                 feature_means=means,
                 feature_scales=scales,
                 training_data_hash=training_data_hash,
-                feature_version=str(data.get("feature_version", "disturbance-static-v2")),
+                feature_version=str(data.get("feature_version", "causal-residual-v3")),
+                nominal_change_coefficients=nominal_coefficients,
+                nominal_change_intercept=nominal_intercept,
             )
         except (KeyError, TypeError, ValueError):
             return None

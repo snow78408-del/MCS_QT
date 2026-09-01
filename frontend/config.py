@@ -12,9 +12,9 @@ DEFAULT_CONTROL_INTERVAL_MS = 7500
 MIN_CONTROL_INTERVAL_MS = 7500
 MAX_CONTROL_INTERVAL_MS = 30000
 
-# Fixed commissioning envelope for the current microfluidic setup.  These are
-# dialog defaults only; backend safety limits and Q1/Q2 feasibility checks still
-# apply before a Bayesian-optimization run can start.
-DEFAULT_BO_Q1_RANGE = (15.0, 100.0)
+# Fixed commissioning envelope for the current microfluidic setup. The pump
+# input page and BO dialog share these values; backend safety checks enforce the
+# same envelope before any command can reach the pumps.
+DEFAULT_BO_Q1_RANGE = (20.0, 200.0)
 DEFAULT_BO_Q2_RANGE = (5.0, 25.0)
 

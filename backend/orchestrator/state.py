@@ -9,6 +9,7 @@ class SystemState(str, Enum):
     VIDEO_READY = "VIDEO_READY"
     INITIALIZING = "INITIALIZING"
     INITIALIZED = "INITIALIZED"
+    CALIBRATING = "CALIBRATING"
     OPTIMIZING = "OPTIMIZING"
     STABILIZING = "STABILIZING"
     RUNNING = "RUNNING"
@@ -23,7 +24,8 @@ ALLOWED_TRANSITIONS: dict[SystemState, frozenset[SystemState]] = {
     SystemState.CONFIGURED: frozenset({SystemState.VIDEO_READY, SystemState.INITIALIZING, SystemState.ERROR}),
     SystemState.VIDEO_READY: frozenset({SystemState.INITIALIZING, SystemState.CONFIGURED, SystemState.ERROR}),
     SystemState.INITIALIZING: frozenset({SystemState.INITIALIZED, SystemState.ERROR, SystemState.STOPPING}),
-    SystemState.INITIALIZED: frozenset({SystemState.OPTIMIZING, SystemState.RUNNING, SystemState.CONFIGURED, SystemState.STOPPING, SystemState.ERROR}),
+    SystemState.INITIALIZED: frozenset({SystemState.CALIBRATING, SystemState.OPTIMIZING, SystemState.RUNNING, SystemState.CONFIGURED, SystemState.STOPPING, SystemState.ERROR}),
+    SystemState.CALIBRATING: frozenset({SystemState.INITIALIZED, SystemState.PAUSED, SystemState.STOPPING, SystemState.STOPPED, SystemState.ERROR}),
     SystemState.OPTIMIZING: frozenset({SystemState.STABILIZING, SystemState.PAUSED, SystemState.STOPPING, SystemState.ERROR}),
     SystemState.STABILIZING: frozenset({SystemState.RUNNING, SystemState.PAUSED, SystemState.STOPPING, SystemState.ERROR}),
     SystemState.RUNNING: frozenset({SystemState.PAUSED, SystemState.STOPPING, SystemState.ERROR}),

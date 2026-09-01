@@ -26,6 +26,7 @@ class SystemConfig:
     camera_parameters: dict[str, float | int | str] = field(default_factory=dict)
     recognition_roi: dict[str, Any] = field(default_factory=dict)
     calibration: dict[str, Any] = field(default_factory=dict)
+    plant_calibration: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         finite_positive = {
@@ -58,6 +59,10 @@ class SystemConfig:
                 raise ValueError(
                     "pixel_to_micron disagrees with the versioned calibration record"
                 )
+        if self.plant_calibration:
+            from ..pid_control.calibration import PlantCalibrationRecord
+
+            PlantCalibrationRecord.from_mapping(dict(self.plant_calibration))
 
 
 @dataclass(slots=True)
@@ -127,6 +132,9 @@ class RecognitionSnapshot:
     hardware_frame_id: int = 0
     hardware_timestamp: float = 0.0
     raw_frame_diameters: list[float] = field(default_factory=list)
+    crossed_track_diameters: dict[int, float] = field(default_factory=dict)
+    crossed_track_capture_monotonic: dict[int, float] = field(default_factory=dict)
+    crossed_track_frame_ids: dict[int, int] = field(default_factory=dict)
     raw_frame_diameter_cv: float | None = None
     filtering_rule: str = "none"
     calibration_id: str = ""
@@ -228,5 +236,9 @@ class SystemSnapshot:
     timestamp: float = 0.0
     disturbance_model: Optional[dict[str, Any]] = None
     disturbance_prediction: Optional[dict[str, Any]] = None
+    disturbance_context: Optional[dict[str, Any]] = None
     safety: Optional[dict[str, Any]] = None
     optimization: Optional[dict[str, Any]] = None
+    plant_calibration: Optional[dict[str, Any]] = None
+    plant_calibration_experiment: Optional[dict[str, Any]] = None
+    drift_supervisor: Optional[dict[str, Any]] = None

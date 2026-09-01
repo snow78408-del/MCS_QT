@@ -60,6 +60,15 @@ def test_gallery_publishes_crossing_evidence_when_period_completes():
     assert frame["crossed_droplet_count"] == 1
     assert frame["valid_track_ids"] == [7]
     assert frame["average_diameter_um"] == 48.0
+    assert frame["valid_droplets"] == [
+        {
+            "track_id": 7,
+            "center_x_px": 80.0,
+            "center_y_px": 60.0,
+            "radius_px": 12.0,
+            "diameter_um": 48.0,
+        }
+    ]
     decoded = cv2.imdecode(
         np.frombuffer(base64.b64decode(frame["image_jpeg_base64"]), dtype=np.uint8),
         cv2.IMREAD_COLOR,

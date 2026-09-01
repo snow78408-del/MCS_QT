@@ -159,6 +159,55 @@ def test_save_button_overwrites_user_algorithm_parameters(tmp_path) -> None:
     window.close()
 
 
+def test_save_button_applies_parameters_to_live_sampling_callback(tmp_path) -> None:
+    _application()
+    store = VisionTuningSettingsStore(tmp_path / "vision_tuning_parameters.json")
+    applied: list[tuple[DetectorConfig, ChannelRegionConfig]] = []
+    window = TuningWindow(
+        settings_store=store,
+        on_parameters_saved=lambda detector, channel: applied.append((detector, channel)),
+    )
+    window.current_config.min_radius = 24.0
+    window.current_config.max_radius = 48.0
+    window.current_channel_config.canny_low = 28
+
+    window._save()
+
+    assert len(applied) == 1
+    assert applied[0][0].min_radius == 24.0
+    assert applied[0][0].max_radius == 48.0
+    assert applied[0][1].canny_low == 28
+    assert "应用到采样识别" in window.status.text()
+    window.close()
+
+
+def test_frontend_startup_applies_saved_tuning_parameters(tmp_path) -> None:
+    from frontend.qt_app import FrontendApp
+
+    store = VisionTuningSettingsStore(tmp_path / "vision_tuning_parameters.json")
+    store.save(
+        DetectorConfig(min_radius=26.0, max_radius=52.0),
+        ChannelRegionConfig(canny_low=29),
+    )
+    applied = []
+    messages = []
+    holder = SimpleNamespace(
+        vision_tuning_settings_store=store,
+        orchestrator=SimpleNamespace(
+            apply_vision_tuning=lambda detector, channel: applied.append((detector, channel))
+        ),
+        runtime_logger=messages.append,
+    )
+
+    FrontendApp._apply_stored_vision_tuning(holder)
+
+    assert len(applied) == 1
+    assert applied[0][0].min_radius == 26.0
+    assert applied[0][0].max_radius == 52.0
+    assert applied[0][1].canny_low == 29
+    assert any("[VISION][TUNING][LOADED]" in message for message in messages)
+
+
 def test_expanding_stage_does_not_stretch_neighbour_card() -> None:
     app = _application()
     container = QWidget()

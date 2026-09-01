@@ -30,11 +30,12 @@ class BayesianOptimizationConfig:
     initial_sample_count: int = 8
     maximum_observations: int = 24
     confirmation_count: int = 2
+    evaluation_window_periods: int = 3
     minimum_valid_droplets: int = 5
     candidate_timeout_ms: float = 120_000.0
     invalid_retry_limit: int = 3
     min_q1_q2_gap: float = STRICT_Q1_Q2_GAP_UL_MIN
-    total_flow_max: float = 125.0
+    total_flow_max: float = 225.0
     cv_weight: float = 0.02
     invalid_fraction_weight: float = 1.0
     movement_weight: float = 0.01
@@ -92,6 +93,8 @@ class BayesianOptimizationConfig:
             raise ValueError("maximum_observations must cover the initial samples")
         if self.confirmation_count < 1 or self.minimum_valid_droplets < 1:
             raise ValueError("confirmation_count and minimum_valid_droplets must be positive")
+        if self.evaluation_window_periods < 2:
+            raise ValueError("evaluation_window_periods must be at least 2")
         if self.invalid_retry_limit < 0 or self.acquisition_candidates < 32:
             raise ValueError("invalid retry/acquisition settings are not usable")
         if self.min_q1_q2_gap < STRICT_Q1_Q2_GAP_UL_MIN:

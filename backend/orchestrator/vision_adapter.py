@@ -187,6 +187,7 @@ class PipelineVisionService:
         self._channel_calibration_attempts = 0
         self._channel_width_samples: deque[tuple[float, float]] = deque(maxlen=5)
         self._lock = threading.RLock()
+        self._pipeline_lock = threading.RLock()
         self._recognition_condition = threading.Condition(self._lock)
         self._cap = None
         self._worker: threading.Thread | None = None
@@ -228,6 +229,7 @@ class PipelineVisionService:
             maxlen=MOTION_WINDOW_FRAMES
         )
         self._crossing_times: deque[float] = deque(maxlen=1000)
+        self._calibration_crossing_events: dict[int, tuple[float, float, int, int]] = {}
         self._average_droplet_speed_um_s: float | None = None
         self._speed_sample_count = 0
         self._droplet_generation_rate_hz = 0.0
@@ -366,6 +368,7 @@ class PipelineVisionService:
             self._last_motion_frame_id = 0
             self._motion_observations.clear()
             self._crossing_times.clear()
+            self._calibration_crossing_events.clear()
             for work_queue in (self._preview_queue, self._sampling_queue, self._frame_queue):
                 while True:
                     try:
@@ -396,6 +399,33 @@ class PipelineVisionService:
             f"broad_target_size_guard=False "
             f"radius_px={min_r:.2f}/{preferred_r:.2f}/{max_r:.2f}"
         )
+
+    def apply_tuning_config(self, detector_config: Any, channel_region_config: Any) -> dict[str, Any]:
+        """Apply user tuning atomically to all subsequently sampled frames."""
+        from ..vision.config import ChannelRegionConfig, DetectorConfig
+
+        detector = DetectorConfig(**vars(detector_config))
+        channel_region = ChannelRegionConfig(**vars(channel_region_config))
+        with self._pipeline_lock:
+            pipeline = self._ensure_pipeline()
+            pipeline.apply_tuning_config(detector, channel_region)
+            min_r, preferred_r, max_r = pipeline.detector.runtime_radius_range()
+        self._log(
+            "[VISION][TUNING][APPLIED] "
+            f"radius_px={min_r:.2f}/{preferred_r:.2f}/{max_r:.2f} "
+            f"sensitivity={detector.sensitivity:.3f} "
+            f"radius_adjustment_percent={detector.radius_adjustment_percent:+.3f} "
+            f"channel_region_enabled={channel_region.enabled}"
+        )
+        return {
+            "applied": True,
+            "min_radius": min_r,
+            "preferred_radius": preferred_r,
+            "max_radius": max_r,
+            "sensitivity": float(detector.sensitivity),
+            "radius_adjustment_percent": float(detector.radius_adjustment_percent),
+            "channel_region_enabled": bool(channel_region.enabled),
+        }
 
     def configure_control_interval(self, control_interval_ms: int) -> None:
         """Use the user-selected control period as the recognition window."""
@@ -444,9 +474,9 @@ class PipelineVisionService:
         self._channel_calibration_enabled = bool(values.get("channel_calibration_enabled", False))
         self._channel_width_um = float(values.get("channel_width_um", 430.0))
         if self._channel_width_um <= 0.0:
-            raise ValueError("管道内宽必须大于 0 μm")
+            raise ValueError("框选区域实际高度必须大于 0 μm")
         if self._channel_calibration_enabled and not config.enabled:
-            raise ValueError("启用 430 μm 管道标定前必须先启用并框选 ROI")
+            raise ValueError("启用已知高度标定前必须先启用并框选 ROI")
         pipeline.channel_region_detector.reset()
         self._log(
             f"[VISION][ROI] enabled={config.enabled} "
@@ -464,7 +494,7 @@ class PipelineVisionService:
         self._pixel_to_micron = self._configured_pixel_to_micron
         if self._channel_calibration_enabled:
             self._channel_calibration_status = "collecting"
-            self._channel_calibration_reason = f"正在从 ROI 中拟合 {self._channel_width_um:.1f} μm 管道内壁"
+            self._channel_calibration_reason = f"正在用用户输入的 {self._channel_width_um:.1f} μm 框选高度计算比例"
         else:
             self._channel_calibration_status = "disabled"
             self._channel_calibration_reason = "未启用管道标定"
@@ -489,7 +519,7 @@ class PipelineVisionService:
                 self._channel_calibration_confidence = 1.0
                 self._channel_calibration_status = "calibrated"
                 self._channel_calibration_reason = (
-                    f"采用用户选择的两条管壁：{self._channel_width_um:.1f} μm / "
+                    f"采用用户输入的框选高度与两条内壁：{self._channel_width_um:.1f} μm / "
                     f"{selected_width:.2f} px = {scale:.6f} μm/px"
                 )
                 self._log(
@@ -935,6 +965,7 @@ class PipelineVisionService:
             self._next_analysis_batch_time = 0.0
             self._motion_observations.clear()
             self._crossing_times.clear()
+            self._calibration_crossing_events.clear()
             self._average_droplet_speed_um_s = None
             self._speed_sample_count = 0
             self._droplet_generation_rate_hz = 0.0
@@ -1082,9 +1113,10 @@ class PipelineVisionService:
         timestamp: float | None = None,
         encode_frame: bool = False,
     ) -> RecognitionSnapshot:
-        with self._lock:
-            self._try_channel_calibration(frame)
-        result = self._ensure_pipeline().process_frame(frame, timestamp=timestamp)
+        with self._pipeline_lock:
+            with self._lock:
+                self._try_channel_calibration(frame)
+            result = self._ensure_pipeline().process_frame(frame, timestamp=timestamp)
         observed_ids = {int(track_id) for track_id, _ in result.tracking.matched_pairs}
         observed_ids.update(int(track_id) for track_id in result.tracking.new_track_ids)
         with self._lock:
@@ -1146,6 +1178,10 @@ class PipelineVisionService:
             frame_b64, width, height = self._encode_png_base64(frame)
         scale = float(self._pixel_to_micron)
         frame_diameters = [float(value) * scale for value in control.frame_diameters]
+        current_crossed_track_diameters = {
+            int(track_id): float(value) * scale
+            for track_id, value in dict(control.crossed_track_diameters).items()
+        }
         raw_frame_diameters = [
             float(value) * scale for value in control.raw_frame_diameters
         ]
@@ -1159,6 +1195,21 @@ class PipelineVisionService:
         diagnostics = self._diagnostics()
         resolved_frame_id = int(frame_id if frame_id is not None else result.frame_index)
         frame_meta = self._frame_metadata.get(resolved_frame_id, {})
+        capture_monotonic = float(frame_meta.get("capture_monotonic", 0.0) or time.monotonic())
+        with self._lock:
+            for track_id, diameter_um in current_crossed_track_diameters.items():
+                self._calibration_crossing_events[int(track_id)] = (
+                    float(diameter_um),
+                    capture_monotonic,
+                    resolved_frame_id,
+                    int(control.period_id),
+                )
+            while len(self._calibration_crossing_events) > 4000:
+                self._calibration_crossing_events.pop(next(iter(self._calibration_crossing_events)))
+            calibration_events = dict(self._calibration_crossing_events)
+        crossed_track_diameters = {track_id:item[0] for track_id,item in calibration_events.items()}
+        crossed_track_capture_monotonic = {track_id:item[1] for track_id,item in calibration_events.items()}
+        crossed_track_frame_ids = {track_id:item[2] for track_id,item in calibration_events.items()}
         return RecognitionSnapshot(
             frame_droplet_count=active_count,
             total_droplet_count=total_count,
@@ -1182,6 +1233,9 @@ class PipelineVisionService:
             preview_timestamp=float(timestamp or result.timestamp),
             frame_single_cell_count=int(control.frame_single_cell_count),
             frame_diameters=frame_diameters,
+            crossed_track_diameters=crossed_track_diameters,
+            crossed_track_capture_monotonic=crossed_track_capture_monotonic,
+            crossed_track_frame_ids=crossed_track_frame_ids,
             frame_diameter_sum=frame_diameter_sum,
             frame_avg_diameter=frame_avg_diameter,
             frame_single_cell_rate=control.frame_single_cell_rate,
@@ -1192,7 +1246,7 @@ class PipelineVisionService:
             filtering_rule=control.filtering_rule,
             session_id=str(frame_meta.get("session_id", "") or ""),
             run_generation=int(frame_meta.get("run_generation", 0) or 0),
-            capture_monotonic=float(frame_meta.get("capture_monotonic", 0.0) or 0.0),
+            capture_monotonic=capture_monotonic,
             hardware_frame_id=int(frame_meta.get("hardware_frame_id", 0) or 0),
             hardware_timestamp=float(frame_meta.get("hardware_timestamp", 0.0) or 0.0),
             uniformity_valid=bool(control.uniformity_valid),
@@ -1293,6 +1347,7 @@ class PipelineVisionService:
             }
             crossed_ids.intersection_update(valid_ids)
             valid_diameters_um: list[float] = []
+            valid_droplets: list[dict[str, float | int]] = []
             for track_id in sorted(valid_ids):
                 track = tracks.get(track_id)
                 if track is None:
@@ -1303,6 +1358,15 @@ class PipelineVisionService:
                 cx, cy = float(track.position[0]), float(track.position[1])
                 diameter_um = radius * 2.0 * float(self._pixel_to_micron)
                 valid_diameters_um.append(diameter_um)
+                valid_droplets.append(
+                    {
+                        "track_id": int(track_id),
+                        "center_x_px": cx,
+                        "center_y_px": cy,
+                        "radius_px": radius,
+                        "diameter_um": diameter_um,
+                    }
+                )
                 color = (0, 165, 255) if track_id in crossed_ids else (40, 220, 70)
                 thickness = 3 if track_id in crossed_ids else 2
                 cv2.circle(
@@ -1315,7 +1379,7 @@ class PipelineVisionService:
                 )
                 cv2.putText(
                     annotated,
-                    f"ID {track_id}  {diameter_um:.1f}um",
+                    f"ID {track_id}",
                     (
                         max(2, int(round(cx - radius))),
                         max(16, int(round(cy - radius - 5))),
@@ -1323,6 +1387,36 @@ class PipelineVisionService:
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.42,
                     color,
+                    1,
+                    cv2.LINE_AA,
+                )
+                diameter_label = f"{diameter_um:.1f}"
+                font_scale = 0.38
+                (text_width, text_height), baseline = cv2.getTextSize(
+                    diameter_label,
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    font_scale,
+                    1,
+                )
+                text_x = max(1, min(frame_w - text_width - 1, int(round(cx - text_width / 2))))
+                text_y = max(
+                    text_height + 1,
+                    min(frame_h - baseline - 1, int(round(cy + text_height / 2))),
+                )
+                cv2.rectangle(
+                    annotated,
+                    (text_x - 1, text_y - text_height - 1),
+                    (text_x + text_width + 1, text_y + baseline + 1),
+                    (0, 0, 0),
+                    -1,
+                )
+                cv2.putText(
+                    annotated,
+                    diameter_label,
+                    (text_x, text_y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    font_scale,
+                    (255, 255, 255),
                     1,
                     cv2.LINE_AA,
                 )
@@ -1364,6 +1458,7 @@ class PipelineVisionService:
                     "valid_droplet_count": len(valid_ids),
                     "crossed_droplet_count": len(crossed_ids),
                     "valid_track_ids": sorted(valid_ids),
+                    "valid_droplets": valid_droplets,
                     "average_diameter_um": (
                         float(np.mean(valid_diameters_um)) if valid_diameters_um else None
                     ),
@@ -1717,6 +1812,9 @@ class PipelineVisionService:
             return replace(
                 self._latest,
                 frame_diameters=list(self._latest.frame_diameters),
+                crossed_track_diameters=dict(self._latest.crossed_track_diameters),
+                crossed_track_capture_monotonic=dict(self._latest.crossed_track_capture_monotonic),
+                crossed_track_frame_ids=dict(self._latest.crossed_track_frame_ids),
                 **self._diagnostics(),
             )
 

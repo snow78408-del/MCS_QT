@@ -54,6 +54,33 @@ def test_optimizer_requires_independently_measured_response_delay() -> None:
         _config(measured_response_delay_ms=4000.0, settling_time_ms=3000.0)
 
 
+def test_confirmation_repeats_target_feasible_point_not_objective_best() -> None:
+    optimizer = SafeBayesianOptimizer(
+        _config(
+            initial_sample_count=2,
+            maximum_observations=5,
+            confirmation_count=2,
+            cv_weight=0.02,
+        ),
+        initial_point=(50.0, 20.0),
+    )
+    first = optimizer.ask()
+    optimizer.tell(_observation(first, diameter=60.0, diameter_cv_percent=0.0))
+    feasible = optimizer.ask()
+    optimizer.tell(_observation(feasible, diameter=50.0, diameter_cv_percent=1000.0))
+
+    confirmation = optimizer.ask()
+
+    assert (confirmation.q1, confirmation.q2) == pytest.approx((feasible.q1, feasible.q2))
+    optimizer.tell(_observation(confirmation, diameter=50.0, diameter_cv_percent=1000.0))
+    status = optimizer.status()
+    assert status.completed
+    assert status.confirmed_operating_point is not None
+    assert status.best_operating_point is not None
+    assert status.confirmed_operating_point.q1 == pytest.approx(feasible.q1)
+    assert status.best_operating_point.q1 == pytest.approx(first.q1)
+
+
 def test_every_candidate_obeys_joint_pump_constraints() -> None:
     optimizer = SafeBayesianOptimizer(_config())
     for index in range(6):
@@ -73,7 +100,7 @@ def test_optimizer_starts_from_current_verified_operating_point() -> None:
 
 
 def test_default_total_flow_limit_matches_pid_envelope() -> None:
-    assert _config().total_flow_max == 125.0
+    assert _config().total_flow_max == 225.0
 
 
 def test_q1_above_q2_invariant_survives_runtime_config_mutation() -> None:

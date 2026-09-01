@@ -15,7 +15,7 @@ from backend.pid_control import DiameterPIDController, PIDConfig, PIDInput
 def _bo_config(**overrides) -> BayesianOptimizationConfig:
     values = {
         "target_diameter_um": 60.0,
-        "q1_min": 40.0,
+        "q1_min": 20.0,
         "q1_max": 60.0,
         "q2_min": 10.0,
         "q2_max": 25.0,

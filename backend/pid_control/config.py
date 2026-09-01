@@ -50,7 +50,6 @@ class PIDConfig:
     feedforward_confidence_threshold: float = 0.65
     feedforward_timeout_ms: int = 2000
     feedforward_gain: float = 0.5
-    feedforward_require_leading_signal: bool = True
     feedforward_min_lead_margin_ms: float = 100.0
     feedforward_max_output_fraction: float = 0.30
     # Must only be enabled after feedforward_gain has been identified in
@@ -69,15 +68,15 @@ class PIDConfig:
     # Keep controller authority inside the experimentally approved BO envelope.
     # Lower Q2 values are numerically encodable but are rejected by the current
     # pump firmware during WSP readback.
-    q1_min: float = 15.0
-    q1_max: float = 100.0
+    q1_min: float = 20.0
+    q1_max: float = 200.0
     q2_min: float = 5.0
     q2_max: float = 25.0
     # Oil phase Q1 must remain strictly faster than aqueous phase Q2. A
     # positive gap makes the strict inequality robust to pump quantization.
     min_q1_q2_gap: float = STRICT_Q1_Q2_GAP_UL_MIN
     max_flow_change_per_cycle: float = 200.0
-    total_flow_max: float = 125.0
+    total_flow_max: float = 225.0
     use_initial_flow_as_output_bias: bool = True
     # Identified plant direction: flow_delta = sign * PID output. Defaults
     # preserve the current Q1/Q2 differential-control convention.
@@ -87,6 +86,9 @@ class PIDConfig:
     # change of Q2 (water) for the same PID output.
     q1_output_gain: float = 2.0
     q2_output_gain: float = 1.0
+    # After BO handoff, PID is a local trim controller around the confirmed
+    # operating point rather than a second global operating-point search.
+    operating_point_local_span_fraction: float = 0.20
 
     # Backward-compatible aliases used by older call sites.
     kp: float | None = None
@@ -115,10 +117,20 @@ class PIDConfig:
         self.kd = self.base_kd
         self.adjustment_min = self.output_min
         self.adjustment_max = self.output_max
-        if self.q1_control_sign == 0.0 or self.q2_control_sign == 0.0:
-            raise ValueError("pump control signs must be non-zero")
-        if self.q1_output_gain <= 0.0 or self.q2_output_gain <= 0.0:
-            raise ValueError("pump output gains must be greater than zero")
+        for channel, sign, gain in (
+            ("Q1", self.q1_control_sign, self.q1_output_gain),
+            ("Q2", self.q2_control_sign, self.q2_output_gain),
+        ):
+            if float(gain) < 0.0:
+                raise ValueError(f"{channel} output gain must be non-negative")
+            if (float(sign) == 0.0) != (float(gain) == 0.0):
+                raise ValueError(
+                    f"{channel} sign and gain must both be zero when the channel is inactive"
+                )
+        if self.q1_output_gain == 0.0 and self.q2_output_gain == 0.0:
+            raise ValueError("at least one pump control channel must remain active")
+        if not 0.0 < self.operating_point_local_span_fraction <= 1.0:
+            raise ValueError("operating_point_local_span_fraction must be in (0, 1]")
         if self.min_q1_q2_gap < STRICT_Q1_Q2_GAP_UL_MIN:
             raise ValueError(
                 f"min_q1_q2_gap cannot be below fixed hardware invariant "
@@ -132,5 +144,9 @@ class PIDConfig:
             raise ValueError("feedforward_min_lead_margin_ms must be non-negative")
         if self.anti_windup_back_calculation_gain < 0.0:
             raise ValueError("anti_windup_back_calculation_gain must be non-negative")
-        self.q1_control_sign = 1.0 if self.q1_control_sign > 0.0 else -1.0
-        self.q2_control_sign = 1.0 if self.q2_control_sign > 0.0 else -1.0
+        self.q1_control_sign = (
+            1.0 if self.q1_control_sign > 0.0 else -1.0 if self.q1_control_sign < 0.0 else 0.0
+        )
+        self.q2_control_sign = (
+            1.0 if self.q2_control_sign > 0.0 else -1.0 if self.q2_control_sign < 0.0 else 0.0
+        )

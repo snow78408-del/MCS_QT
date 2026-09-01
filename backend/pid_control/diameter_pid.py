@@ -27,6 +27,7 @@ class DiameterPIDController(BaseDiameterController):
         self._last_pid_output = 0.0
         self._q1_bias: float | None = None
         self._q2_bias: float | None = None
+        self._local_authority_enabled = False
 
     def reset(self) -> None:
         self.integral = 0.0
@@ -37,6 +38,7 @@ class DiameterPIDController(BaseDiameterController):
         self._last_pid_output = 0.0
         self._q1_bias = None
         self._q2_bias = None
+        self._local_authority_enabled = False
         self.adaptive.reset()
         self.feedforward.reset()
         self.kp = float(self.config.base_kp)
@@ -56,6 +58,7 @@ class DiameterPIDController(BaseDiameterController):
         self.reset()
         self._q1_bias = q1_value
         self._q2_bias = q2_value
+        self._local_authority_enabled = True
 
     @property
     def operating_point(self) -> tuple[float, float] | None:
@@ -164,6 +167,18 @@ class DiameterPIDController(BaseDiameterController):
         q2_base = float(self._q2_bias) if self.config.use_initial_flow_as_output_bias else q2_current
         q1_coefficient = float(self.config.q1_control_sign) * float(self.config.q1_output_gain)
         q2_coefficient = float(self.config.q2_control_sign) * float(self.config.q2_output_gain)
+        q1_flow_min = float(self.config.q1_min)
+        q1_flow_max = float(self.config.q1_max)
+        q2_flow_min = float(self.config.q2_min)
+        q2_flow_max = float(self.config.q2_max)
+        if self._local_authority_enabled:
+            fraction = float(self.config.operating_point_local_span_fraction)
+            q1_radius = (float(self.config.q1_max) - float(self.config.q1_min)) * fraction
+            q2_radius = (float(self.config.q2_max) - float(self.config.q2_min)) * fraction
+            q1_flow_min = max(q1_flow_min, q1_base - q1_radius)
+            q1_flow_max = min(q1_flow_max, q1_base + q1_radius)
+            q2_flow_min = max(q2_flow_min, q2_base - q2_radius)
+            q2_flow_max = min(q2_flow_max, q2_base + q2_radius)
         # Convert actuator limits into the feasible PID-output interval. This
         # preserves differential control (and its nominal total flow) when one
         # pump reaches a boundary, instead of calculating a negative flow and
@@ -171,9 +186,17 @@ class DiameterPIDController(BaseDiameterController):
         actuator_low = float(self.config.output_min)
         actuator_high = float(self.config.output_max)
         for base, coefficient, flow_min, flow_max in (
-            (q1_base, q1_coefficient, float(self.config.q1_min), float(self.config.q1_max)),
-            (q2_base, q2_coefficient, float(self.config.q2_min), float(self.config.q2_max)),
+            (q1_base, q1_coefficient, q1_flow_min, q1_flow_max),
+            (q2_base, q2_coefficient, q2_flow_min, q2_flow_max),
         ):
+            if abs(coefficient) <= 1e-12:
+                if not flow_min <= base <= flow_max:
+                    return self._frozen(
+                        pid_input,
+                        "inactive pump channel is outside its calibrated flow limits",
+                        mode,
+                    )
+                continue
             flow_bounds = (
                 (flow_min - base) / coefficient,
                 (flow_max - base) / coefficient,
@@ -240,22 +263,32 @@ class DiameterPIDController(BaseDiameterController):
             scale = total_max / (q1_raw + q2_raw)
             q1_raw *= scale
             q2_raw *= scale
-        q1_final = clamp(q1_raw, self.config.q1_min, self.config.q1_max)
-        q2_final = clamp(q2_raw, self.config.q2_min, self.config.q2_max)
+        q1_final = clamp(q1_raw, q1_flow_min, q1_flow_max)
+        q2_final = clamp(q2_raw, q2_flow_min, q2_flow_max)
         if q1_final < q2_final + min_phase_gap:
             # A total-flow scale or floating point rounding may shrink the
             # gap after the feasible-output calculation.
-            q2_final = max(float(self.config.q2_min), q1_final - min_phase_gap)
+            q2_final = max(q2_flow_min, q1_final - min_phase_gap)
         if q1_final < q2_final + min_phase_gap - 1e-9:
             return self._frozen(
                 pid_input,
                 "final pump command cannot maintain Q1 strictly above Q2",
                 mode,
             )
+        if total_max > 0.0 and q1_final + q2_final > total_max + 1e-9:
+            return self._frozen(
+                pid_input,
+                "local PID authority cannot satisfy the total-flow limit",
+                mode,
+            )
 
         realized_candidates = [
-            (q1_final - q1_base) / q1_coefficient,
-            (q2_final - q2_base) / q2_coefficient,
+            (final - base) / coefficient
+            for final, base, coefficient in (
+                (q1_final, q1_base, q1_coefficient),
+                (q2_final, q2_base, q2_coefficient),
+            )
+            if abs(coefficient) > 1e-12
         ]
         realized_output = float(sum(realized_candidates) / len(realized_candidates))
         allocation_saturated = bool(

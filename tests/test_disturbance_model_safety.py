@@ -18,6 +18,7 @@ from backend.disturbance_model.models import (
     DisturbanceControlStage,
     DisturbancePrediction,
     DisturbanceSample,
+    ModelMetrics,
     ModelStatus,
 )
 from backend.disturbance_model.service import DisturbanceModelService
@@ -54,6 +55,7 @@ def _prediction(**overrides) -> DisturbancePrediction:
         "confidence": 0.99,
         "predicted_diameter_um": 105.0,
         "predicted_diameter_change_um": 5.0,
+        "predicted_disturbance_residual_um": 5.0,
         "feedforward_weight": 0.2,
         "control_stage": "LOW_WEIGHT_FEEDFORWARD",
         "leading_signal_available": True,
@@ -193,9 +195,9 @@ def test_model_does_not_invent_an_uncalibrated_feedforward_command() -> None:
     assert prediction.recommended_feedforward is None
 
 
-def test_model_inverse_uses_learned_local_actuator_sensitivity() -> None:
+def test_model_predicts_disturbance_residual_without_actuator_command() -> None:
     coefficients = [[0.0] * len(FEATURE_NAMES) for _ in TARGET_NAMES]
-    change_index = TARGET_NAMES.index("future_diameter_change_um")
+    change_index = TARGET_NAMES.index("future_disturbance_residual_um")
     coefficients[change_index][FEATURE_NAMES.index("q2_feedback")] = 2.0
     intercepts = [0.0] * len(TARGET_NAMES)
     intercepts[change_index] = -36.0
@@ -213,19 +215,10 @@ def test_model_inverse_uses_learned_local_actuator_sensitivity() -> None:
     )
     sample = _sample(1.0, 100.0, q1_set=50.0, q2_set=20.0, q1_feedback=50.0, q2_feedback=20.0)
 
-    recommendation = model.recommend_feedforward(
-        sample,
-        predicted_change_um=4.0,
-        probe_output=1.0,
-        min_sensitivity=0.02,
-        max_output=50.0,
-        q1_control_sign=-1.0,
-        q2_control_sign=1.0,
-        q1_output_gain=2.0,
-        q2_output_gain=1.0,
-    )
+    prediction = model.predict(sample)
 
-    assert recommendation == pytest.approx(-2.0)
+    assert prediction.predicted_disturbance_residual_um == pytest.approx(4.0)
+    assert prediction.recommended_feedforward is None
 
 
 def test_feedforward_is_fail_closed_until_plant_gain_is_calibrated() -> None:
@@ -244,7 +237,7 @@ def test_feedforward_is_fail_closed_until_plant_gain_is_calibrated() -> None:
     assert active.u_ff == -2.0  # -gain * delta-D * stage weight
 
 
-def test_validated_model_inverse_can_assist_without_static_gain_or_leading_signal() -> None:
+def test_model_recommendation_field_cannot_bypass_calibration_or_leading_signal() -> None:
     prediction = _prediction(
         recommended_feedforward=-1.5,
         leading_signal_available=False,
@@ -255,8 +248,8 @@ def test_validated_model_inverse_can_assist_without_static_gain_or_leading_signa
 
     result = compensator.compute(_pid_input(prediction))
 
-    assert result.active
-    assert result.u_ff == pytest.approx(-1.5)
+    assert not result.active
+    assert "not calibrated" in result.reason
 
 
 def test_feedforward_requires_a_signal_that_leads_the_measured_pump_delay() -> None:
@@ -321,3 +314,127 @@ def test_feedforward_stage_requires_shadow_window_and_explicit_authorization() -
     config.allow_low_weight_feedforward = True
     assert service._feedforward_weight_for_stage(DisturbanceControlStage.LOW_WEIGHT_FEEDFORWARD) == pytest.approx(0.2)
     assert service._feedforward_weight_for_stage(DisturbanceControlStage.FULL_FEEDFORWARD) == 0.0
+
+
+def test_candidate_model_requires_paired_shadow_validation_and_explicit_promotion(tmp_path) -> None:
+    def constant_model(version: str, diameter: float, residual: float) -> LinearDisturbanceModel:
+        return LinearDisturbanceModel(
+            version=version,
+            feature_names=list(FEATURE_NAMES),
+            target_names=list(TARGET_NAMES),
+            coefficients=[[0.0] * len(FEATURE_NAMES) for _ in TARGET_NAMES],
+            intercepts=[diameter, residual, 0.0, 0.0, 0.0, 500.0],
+            confidence=0.9,
+            model_type="linear",
+            feature_means=[0.0] * len(FEATURE_NAMES),
+            feature_scales=[1.0] * len(FEATURE_NAMES),
+            nominal_change_coefficients=[0.0] * len(FEATURE_NAMES),
+            nominal_change_intercept=0.0,
+            training_data_hash=(version[0] * 64),
+        )
+
+    config = DisturbanceModelConfig(
+        database_path=str(tmp_path / "samples.sqlite3"),
+        model_path=str(tmp_path / "active-model.json"),
+        online_update_enabled=False,
+        prediction_horizon_ms=1000,
+        prediction_horizon_tolerance_ms=10,
+        align_horizon_to_control_cycle=False,
+        shadow_min_comparisons=2,
+        shadow_max_mae_um=2.0,
+        shadow_max_change_mae_um=2.0,
+        shadow_min_direction_accuracy=0.5,
+        candidate_min_relative_improvement=0.05,
+    )
+    service = DisturbanceModelService(config)
+    active = constant_model("active", 110.0, 10.0)
+    candidate = constant_model("candidate", 101.0, 1.0)
+    service.predictor._model = active
+    service.predictor.set_candidate_model(candidate)
+    service._candidate_metrics = ModelMetrics(r2=0.8, rmse=1.0, direction_accuracy=1.0)
+    with service._lock:
+        service._refresh_candidate_status_locked()
+
+    try:
+        for base_time in (0.0, 10.0):
+            origin = _sample(base_time, 100.0, disturbance_stage="baseline", disturbance_amplitude=0.0)
+            future = _sample(base_time + 1.0, 101.0, disturbance_stage="disturbed")
+            service.submit_sample(origin)
+            displayed = service.predict(origin)
+            assert displayed.model_version == "active"
+            service.submit_sample(future)
+
+        status = service.get_status()
+        assert service.predictor.model_version == "active"
+        assert status.candidate_model_version == "candidate"
+        assert status.candidate_comparisons == 2
+        assert status.candidate_promotion_ready
+        assert status.candidate_relative_improvement is not None
+        assert status.candidate_relative_improvement > 0.05
+
+        result = service.promote_candidate_model()
+
+        assert result["model_version"] == "candidate"
+        assert service.predictor.model_version == "candidate"
+        assert not service.get_status().candidate_ready
+        assert not result["feedforward_authorized"]
+    finally:
+        service.close()
+
+
+def test_background_training_creates_candidate_without_replacing_active_model(tmp_path) -> None:
+    config = DisturbanceModelConfig(
+        database_path=str(tmp_path / "training.sqlite3"),
+        model_path=str(tmp_path / "active.json"),
+        online_update_enabled=True,
+    )
+    service = DisturbanceModelService(config)
+    active = LinearDisturbanceModel(
+        version="active",
+        feature_names=list(FEATURE_NAMES),
+        target_names=list(TARGET_NAMES),
+        coefficients=[[0.0] * len(FEATURE_NAMES) for _ in TARGET_NAMES],
+        intercepts=[100.0, 0.0, 0.0, 0.0, 0.0, 500.0],
+        confidence=0.8,
+        model_type="linear",
+        feature_means=[0.0] * len(FEATURE_NAMES),
+        feature_scales=[1.0] * len(FEATURE_NAMES),
+        nominal_change_coefficients=[0.0] * len(FEATURE_NAMES),
+        training_data_hash="a" * 64,
+    )
+    candidate = LinearDisturbanceModel(
+        version="candidate",
+        feature_names=list(FEATURE_NAMES),
+        target_names=list(TARGET_NAMES),
+        coefficients=[[0.0] * len(FEATURE_NAMES) for _ in TARGET_NAMES],
+        intercepts=[101.0, 1.0, 0.0, 0.0, 0.0, 500.0],
+        confidence=0.9,
+        model_type="linear",
+        feature_means=[0.0] * len(FEATURE_NAMES),
+        feature_scales=[1.0] * len(FEATURE_NAMES),
+        nominal_change_coefficients=[0.0] * len(FEATURE_NAMES),
+        training_data_hash="b" * 64,
+    )
+    metrics = ModelMetrics(
+        rmse=1.0,
+        r2=0.8,
+        direction_accuracy=0.9,
+        persistence_improvement=0.2,
+    )
+    service.predictor._model = active
+    service.storage.load_recent_samples = lambda _limit: []
+    service.storage.record_model_version = lambda _version, _payload: None
+    service.storage.record_metrics = lambda _version, _metrics: None
+    service.trainer.train = lambda _samples: (candidate, metrics, "validated")
+
+    try:
+        service._train_background()
+
+        assert service.predictor.model_version == "active"
+        assert service.predictor.candidate_model_version == "candidate"
+        status = service.get_status()
+        assert status.candidate_ready
+        assert not status.candidate_promotion_ready
+        assert "shadow validation incomplete" in status.candidate_promotion_reason
+    finally:
+        service.close()

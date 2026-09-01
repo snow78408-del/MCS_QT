@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from PySide6.QtCharts import QChart, QChartView, QLineSeries, QValueAxis
+from PySide6.QtCharts import QChart, QChartView, QLineSeries, QScatterSeries, QValueAxis
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
@@ -13,6 +13,8 @@ from backend.orchestrator.pid_database import PIDReplayData, PIDReplaySample
 _SERIES_COLORS = {
     "q1": QColor("#ef4444"),
     "q2": QColor("#2563eb"),
+    "q1_change": QColor("#991b1b"),
+    "q2_change": QColor("#1e3a8a"),
     "target": QColor("#f59e0b"),
     "diameter": QColor("#16a34a"),
     "speed": QColor("#9333ea"),
@@ -26,7 +28,7 @@ class PIDReplayDialog(QDialog):
         super().__init__(parent)
         self.replay = replay
         self.setWindowTitle("PID 实验数据复现")
-        self.resize(1180, 820)
+        self.resize(1320, 900)
 
         layout = QVBoxLayout(self)
         layout.addWidget(
@@ -45,9 +47,13 @@ class PIDReplayDialog(QDialog):
         notice.setStyleSheet("color:#92400e;background:#fffbeb;padding:6px;border-radius:4px")
         layout.addWidget(notice)
 
-        self.flow_chart = _build_flow_chart(replay)
+        self.q1_flow_chart = _build_channel_flow_chart(replay, "q1")
+        self.q2_flow_chart = _build_channel_flow_chart(replay, "q2")
         self.response_chart = _build_response_chart(replay)
-        layout.addWidget(_chart_view(self.flow_chart), 1)
+        flow_charts = QHBoxLayout()
+        flow_charts.addWidget(_chart_view(self.q1_flow_chart), 1)
+        flow_charts.addWidget(_chart_view(self.q2_flow_chart), 1)
+        layout.addLayout(flow_charts, 1)
         layout.addWidget(_chart_view(self.response_chart), 1)
 
         buttons = QHBoxLayout()
@@ -58,24 +64,49 @@ class PIDReplayDialog(QDialog):
         layout.addLayout(buttons)
 
 
-def _build_flow_chart(replay: PIDReplayData) -> QChart:
+def _build_channel_flow_chart(replay: PIDReplayData, channel: str) -> QChart:
+    if channel not in {"q1", "q2"}:
+        raise ValueError("channel must be q1 or q2")
+    channel_name = channel.upper()
+    pump_name = "泵1" if channel == "q1" else "泵2"
+    value_field = f"{channel}_flow_ul_min"
+    source = replay.q1_flow_source if channel == "q1" else replay.q2_flow_source
+    values = [getattr(sample, value_field) for sample in replay.samples]
+    changes = _flow_change_points(replay.samples, value_field)
+    finite_values = [float(value) for value in values if value is not None]
+    value_summary = "无有效流速数据"
+    if finite_values:
+        value_summary = (
+            f"范围 {min(finite_values):.2f}–{max(finite_values):.2f} μL/min · "
+            f"变化 {len(changes)} 次"
+        )
+
     chart = QChart()
-    chart.setTitle("泵流量随时间变化")
+    chart.setTitle(f"{pump_name}（{channel_name}）流速变化｜{value_summary}")
     axis_x = _time_axis(replay.duration_s)
     axis_y = QValueAxis()
     axis_y.setTitleText("流量（μL/min）")
     axis_y.setLabelFormat("%.2f")
 
-    q1_label = _flow_label("Q1", replay.q1_flow_source)
-    q2_label = _flow_label("Q2", replay.q2_flow_source)
-    q1 = _line_series(q1_label, _SERIES_COLORS["q1"], replay.samples, "q1_flow_ul_min")
-    q2 = _line_series(q2_label, _SERIES_COLORS["q2"], replay.samples, "q2_flow_ul_min")
+    flow = _line_series(
+        _flow_label(channel_name, source),
+        _SERIES_COLORS[channel],
+        replay.samples,
+        value_field,
+        width=3.0,
+    )
+    change_markers = QScatterSeries()
+    change_markers.setName(f"{channel_name} 变化点")
+    change_markers.setMarkerSize(12.0)
+    change_markers.setColor(_SERIES_COLORS[f"{channel}_change"])
+    change_markers.setBorderColor(QColor("#ffffff"))
+    for elapsed_s, value in changes:
+        change_markers.append(elapsed_s, value)
+
     _add_axes(chart, axis_x, axis_y)
-    _attach_series(chart, q1, axis_x, axis_y)
-    _attach_series(chart, q2, axis_x, axis_y)
-    flow_values = [sample.q1_flow_ul_min for sample in replay.samples]
-    flow_values.extend(sample.q2_flow_ul_min for sample in replay.samples)
-    axis_y.setRange(*_value_range(flow_values))
+    _attach_series(chart, flow, axis_x, axis_y)
+    _attach_series(chart, change_markers, axis_x, axis_y)
+    axis_y.setRange(*_value_range(values))
     chart.legend().setAlignment(Qt.AlignmentFlag.AlignBottom)
     return chart
 
@@ -139,11 +170,12 @@ def _line_series(
     samples: Iterable[PIDReplaySample],
     value_field: str,
     line_style: Qt.PenStyle = Qt.PenStyle.SolidLine,
+    width: float = 2.2,
 ) -> QLineSeries:
     series = QLineSeries()
     series.setName(name)
     pen = QPen(color)
-    pen.setWidthF(2.2)
+    pen.setWidthF(float(width))
     pen.setStyle(line_style)
     series.setPen(pen)
     for sample in samples:
@@ -153,12 +185,29 @@ def _line_series(
     return series
 
 
+def _flow_change_points(
+    samples: Iterable[PIDReplaySample],
+    value_field: str,
+) -> list[tuple[float, float]]:
+    changes: list[tuple[float, float]] = []
+    previous: float | None = None
+    for sample in samples:
+        raw_value = getattr(sample, value_field)
+        if raw_value is None:
+            continue
+        value = float(raw_value)
+        if previous is not None and abs(value - previous) > 1e-9:
+            changes.append((float(sample.elapsed_s), value))
+        previous = value
+    return changes
+
+
 def _add_axes(chart: QChart, axis_x: QValueAxis, axis_y: QValueAxis) -> None:
     chart.addAxis(axis_x, Qt.AlignmentFlag.AlignBottom)
     chart.addAxis(axis_y, Qt.AlignmentFlag.AlignLeft)
 
 
-def _attach_series(chart: QChart, series: QLineSeries, axis_x: QValueAxis, axis_y: QValueAxis) -> None:
+def _attach_series(chart: QChart, series, axis_x: QValueAxis, axis_y: QValueAxis) -> None:
     chart.addSeries(series)
     series.attachAxis(axis_x)
     series.attachAxis(axis_y)

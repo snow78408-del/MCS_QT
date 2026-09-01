@@ -18,8 +18,9 @@ FEATURE_NAMES = [
     "droplet_count_frame",
     "valid_sample_count",
     "measurement_noise_est",
-    "diameter_error_um",
-    "pid_output",
+    "current_diameter_um",
+    "droplet_frequency_hz",
+    "temperature_c",
     "feedback_frozen",
     "control_cycle_ms",
     "control_jitter_ms",
@@ -27,12 +28,12 @@ FEATURE_NAMES = [
 
 _FEATURE_INDEX = {name: index for index, name in enumerate(FEATURE_NAMES)}
 _NONLINEAR_INTERACTION_PAIRS = [
-    ("disturbance_amplitude", "pid_output"),
-    ("disturbance_amplitude", "diameter_error_um"),
+    ("disturbance_amplitude", "current_diameter_um"),
+    ("disturbance_amplitude", "temperature_c"),
     ("q1_set", "q2_set"),
     ("q1_feedback", "q2_feedback"),
     ("q1_error", "q2_error"),
-    ("diameter_error_um", "pid_output"),
+    ("current_diameter_um", "droplet_frequency_hz"),
     ("measurement_noise_est", "droplet_count_frame"),
     ("control_cycle_ms", "control_jitter_ms"),
 ]
@@ -46,7 +47,7 @@ NONLINEAR_FEATURE_NAMES = (
 
 TARGET_NAMES = [
     "future_droplet_mean_diameter_um",
-    "future_diameter_change_um",
+    "future_disturbance_residual_um",
     "future_droplet_std_um",
     "future_droplet_cv",
     "future_single_cell_rate",
@@ -71,8 +72,9 @@ def build_features(sample: DisturbanceSample) -> list[float]:
         float(sample.droplet_count_frame or 0),
         float(sample.valid_sample_count or 0),
         float(sample.measurement_noise_est or 0.0),
-        float(sample.diameter_error_um or 0.0),
-        float(sample.pid_output or 0.0),
+        float(sample.droplet_mean_diameter_um or 0.0),
+        float(sample.droplet_frequency_hz or 0.0),
+        float(sample.temperature_c or 0.0),
         1.0 if sample.feedback_frozen else 0.0,
         float(sample.control_cycle_ms or 0.0),
         float(sample.control_jitter_ms or 0.0),

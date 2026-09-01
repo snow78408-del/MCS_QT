@@ -44,6 +44,10 @@ class ControlMetrics:
     # IDs that crossed in the current processed frame. These are used only to
     # capture evidence thumbnails; control aggregation remains period-based.
     crossed_track_ids: list[int] = field(default_factory=list)
+    # One locked diameter per newly crossed track in this exact frame. Plant
+    # calibration consumes these event samples so its progress is driven by
+    # actual droplets rather than repeated frame or period averages.
+    crossed_track_diameters: dict[int, float] = field(default_factory=dict)
     # Tracks observed and accepted in this exact sampled frame. The monitor
     # uses these IDs to annotate full-frame recognition evidence.
     valid_track_ids: list[int] = field(default_factory=list)
@@ -76,6 +80,7 @@ class AnalysisMetrics:
     raw_frame_diameter_cv: float | None
     filtering_rule: str
     crossed_track_ids: list[int] = field(default_factory=list)
+    crossed_track_diameters: dict[int, float] = field(default_factory=dict)
     valid_track_ids: list[int] = field(default_factory=list)
 
 
@@ -380,6 +385,7 @@ class MetricsCalculator:
             raw_frame_diameter_cv=raw_frame_diameter_cv,
             filtering_rule=filtering_rule,
             crossed_track_ids=list(crossed_track_ids),
+            crossed_track_diameters=dict(crossed_track_diameters),
             valid_track_ids=sorted(valid_track_ids),
         )
 
@@ -407,6 +413,7 @@ class MetricsCalculator:
             raw_frame_diameter_cv=raw_frame_diameter_cv,
             filtering_rule=filtering_rule,
             crossed_track_ids=list(crossed_track_ids),
+            crossed_track_diameters=dict(crossed_track_diameters),
             valid_track_ids=sorted(valid_track_ids),
         )
 
