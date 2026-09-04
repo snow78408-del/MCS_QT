@@ -50,6 +50,14 @@ SEARCHABLE_FIELDS = (
     "max_radius",
     "min_center_distance",
     "sensitivity",
+    "generation_center_band_ratio",
+    "generation_edge_mad_multiplier",
+    "generation_min_length_ratio",
+    "generation_max_length_ratio",
+    "generation_min_edge_separation_ratio",
+    "generation_min_profile_contrast_sigma",
+    "generation_min_meniscus_support_ratio",
+    "generation_min_capsule_outline_ratio",
 )
 
 
@@ -83,14 +91,196 @@ def _candidate_overlay(frame: np.ndarray, centers: list[np.ndarray], radii: list
     return output
 
 
+def _as_bgr(image: np.ndarray) -> np.ndarray:
+    if image.ndim == 2:
+        return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    return image.copy()
+
+
+def _generation_band_overlay(
+    frame: np.ndarray,
+    *,
+    flow_axis: str,
+    band_start: int,
+    band_size: int,
+) -> np.ndarray:
+    output = _as_bgr(frame)
+    height, width = output.shape[:2]
+    if flow_axis == "x":
+        cv2.rectangle(
+            output,
+            (0, max(0, band_start)),
+            (width - 1, min(height - 1, band_start + band_size - 1)),
+            (0, 210, 255),
+            2,
+        )
+    else:
+        cv2.rectangle(
+            output,
+            (max(0, band_start), 0),
+            (min(width - 1, band_start + band_size - 1), height - 1),
+            (0, 210, 255),
+            2,
+        )
+    return output
+
+
+def _generation_profile_plot(
+    profile: np.ndarray,
+    gradient: np.ndarray,
+    threshold: float,
+    peak_indices: list[int],
+) -> np.ndarray:
+    width = max(360, int(profile.size))
+    height = 260
+    margin = 24
+    output = np.full((height, width, 3), 248, dtype=np.uint8)
+
+    def points(values: np.ndarray, top: int, bottom: int) -> np.ndarray:
+        values = np.asarray(values, dtype=np.float32)
+        low = float(np.min(values)) if values.size else 0.0
+        high = float(np.max(values)) if values.size else 1.0
+        span = max(1e-6, high - low)
+        xs = np.linspace(0, width - 1, max(1, values.size))
+        ys = bottom - (values - low) * float(bottom - top) / span
+        return np.column_stack((xs, ys)).astype(np.int32).reshape((-1, 1, 2))
+
+    split = height // 2
+    cv2.polylines(output, [points(profile, margin, split - 12)], False, (42, 92, 180), 2)
+    cv2.polylines(output, [points(gradient, split + 12, height - margin)], False, (35, 150, 75), 2)
+    gradient_max = max(1e-6, float(np.max(gradient)))
+    threshold_y = int(round((height - margin) - min(1.0, threshold / gradient_max) * (height - margin - split - 12)))
+    cv2.line(output, (0, threshold_y), (width - 1, threshold_y), (40, 40, 220), 1)
+    axial_denominator = max(1, int(profile.size) - 1)
+    for index in peak_indices:
+        x = int(round(float(index) * float(width - 1) / axial_denominator))
+        cv2.line(output, (x, split), (x, height - 1), (0, 140, 255), 1)
+    cv2.putText(output, "median intensity", (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (42, 92, 180), 1, cv2.LINE_AA)
+    cv2.putText(output, "gradient / threshold / peaks", (8, split + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (35, 120, 65), 1, cv2.LINE_AA)
+    return output
+
+
+def _generation_pair_overlay(
+    frame: np.ndarray,
+    *,
+    flow_axis: str,
+    intervals: list[tuple[int, int, float]],
+) -> np.ndarray:
+    output = _as_bgr(frame)
+    height, width = output.shape[:2]
+    for left, right, _length in intervals:
+        if flow_axis == "x":
+            first = (max(0, left), 2)
+            second = (min(width - 1, right), height - 3)
+        else:
+            first = (2, max(0, left))
+            second = (width - 3, min(height - 1, right))
+        cv2.rectangle(output, first, second, (0, 190, 255), 2)
+    return output
+
+
+def _inspect_generation_frame(
+    detection_frame: np.ndarray,
+    detector: DropletDetector,
+    config: DetectorConfig,
+    pixel_to_micron: float,
+) -> tuple[DetectionResult, list[PipelineStage]]:
+    gray = detector._ensure_gray(detection_frame)
+    trace: dict[str, object] = {}
+    result = detector._detect_generation_plugs(gray, trace)
+    flow_axis = str(trace["flow_axis"])
+    band_start = int(trace["band_start"])
+    band_size = int(trace["band_size"])
+    profile = np.asarray(trace["profile"])
+    gradient = np.asarray(trace["gradient"])
+    threshold = float(trace["gradient_threshold"])
+    peak_indices = [int(value) for value in trace["peak_indices"]]
+    intervals = [tuple(value) for value in trace["selected_intervals"]]
+    stages = [
+        PipelineStage(
+            "1. 生成区原始图像",
+            "输入应只覆盖生成区直通道；先用相机页 ROI 框定管壁，避免交汇口和外部结构进入检测。",
+            detection_frame.copy(),
+            statistics=f"尺寸 {detection_frame.shape[1]}×{detection_frame.shape[0]}；流向轴 {flow_axis.upper()}",
+        ),
+        PipelineStage(
+            "2. 灰度与光照校正",
+            "去除缓慢变化的背景并增强局部对比度，后续只依据生成区弯月面边缘配对。",
+            np.asarray(trace["corrected"]),
+            parameters="背景校正 + CLAHE + Gaussian 7×7",
+            statistics=f"灰度范围 {int(gray.min())}–{int(gray.max())}",
+        ),
+        PipelineStage(
+            "3. 管道中心采样带",
+            "在管道横向中心带取中位数，抑制上下管壁、灰尘和孤立反光对轴向信号的影响。",
+            _generation_band_overlay(
+                detection_frame,
+                flow_axis=flow_axis,
+                band_start=band_start,
+                band_size=band_size,
+            ),
+            parameters=f"中心带宽 = 管宽 × {config.generation_center_band_ratio:g}",
+            statistics=f"采样带 {band_size}px",
+        ),
+        PipelineStage(
+            "4. 轴向强度与边缘峰",
+            "对中心带生成一维中位强度曲线；其梯度超过中位数加 MAD 阈值的位置作为候选弯月面。",
+            _generation_profile_plot(profile, gradient, threshold, peak_indices),
+            parameters=(
+                f"边缘阈值 = median + {config.generation_edge_mad_multiplier:g}×1.4826×MAD；"
+                f"最小峰距 {config.generation_min_edge_separation_ratio:g}×管宽"
+            ),
+            statistics=f"候选弯月面 {len(peak_indices)} 个；阈值 {threshold:.2f}",
+        ),
+        PipelineStage(
+            "5. 弯月面配对与塞状液滴筛选",
+            "相邻弯月面只有同时满足长度、相内外对比和二维横向支撑，才登记为独立液滴；方向不一致或共享边缘不会放行。",
+            _generation_pair_overlay(
+                detection_frame,
+                flow_axis=flow_axis,
+                intervals=intervals,
+            ),
+            parameters=(
+                f"长度 {config.generation_min_length_ratio:g}–{config.generation_max_length_ratio:g}×管宽；"
+                f"对比 ≥ {config.generation_min_profile_contrast_sigma:g}σ；"
+                f"弯月面支撑 ≥ {config.generation_min_meniscus_support_ratio:g}；"
+                f"上下胶囊边缘覆盖 ≥ {config.generation_min_capsule_outline_ratio:g}；"
+                f"极性 {config.generation_polarity}"
+            ),
+            statistics=f"有效配对 {len(result.centers)} 个",
+        ),
+        PipelineStage(
+            "6. 等效直径结果",
+            "按用户填写的生成通道 H×W 和 κV，将轴向长度换算为体积，再换算为等体积球直径供 PID 使用。",
+            annotate_frame(detection_frame, result, generation=True),
+            parameters=(
+                f"H={config.generation_channel_height_um:g} μm；"
+                f"W={config.generation_channel_width_um:g} μm；"
+                f"κV={config.generation_volume_correction:g}；"
+                f"比例={pixel_to_micron:g} μm/px"
+            ),
+            statistics=(
+                "未识别到完整液滴"
+                if not result.equivalent_diameters_px
+                else (
+                    f"等效直径中位数 "
+                    f"{float(np.median(result.equivalent_diameters_px)) * pixel_to_micron:.2f} μm"
+                )
+            ),
+        ),
+    ]
+    return result, stages
+
+
 def inspect_frame(
     frame: np.ndarray,
     config: DetectorConfig,
     *,
     channel_config: ChannelRegionConfig | None = None,
     channel_frames: Iterable[np.ndarray] | None = None,
+    pixel_to_micron: float = 1.0,
 ) -> tuple[DetectionResult, list[PipelineStage]]:
-    """Inspect optional channel calibration followed by Hough droplet detection."""
+    """Inspect channel calibration followed by the selected measurement model."""
     channel_stages: list[PipelineStage] = []
     detection_frame = frame
     if channel_config is not None:
@@ -147,6 +337,27 @@ def inspect_frame(
         ]
 
     detector = DropletDetector(config, DebugConfig(enabled=False))
+    detector.configure_expected_diameter(0.0, pixel_to_micron)
+    if str(config.measurement_mode).strip().lower() == "generation_plug":
+        result, stages = _inspect_generation_frame(
+            detection_frame,
+            detector,
+            config,
+            float(pixel_to_micron),
+        )
+        if channel_stages:
+            stages = channel_stages + [
+                PipelineStage(
+                    f"B{index}. {stage.name.split('. ', 1)[-1]}",
+                    stage.description,
+                    stage.image,
+                    stage.parameters,
+                    stage.statistics,
+                )
+                for index, stage in enumerate(stages, start=1)
+            ]
+        return result, stages
+
     gray = detector._ensure_gray(detection_frame)
     trace: dict[str, object] = {}
     corrected = detector._preprocess(gray, trace)
@@ -246,15 +457,38 @@ def detect_frame(frame: np.ndarray, config: DetectorConfig) -> DetectionResult:
     return inspect_frame(frame, config)[0]
 
 
-def annotate_frame(frame: np.ndarray, result: DetectionResult) -> np.ndarray:
-    output = frame.copy()
-    for center, radius in zip(result.centers, result.radii):
+def annotate_frame(
+    frame: np.ndarray,
+    result: DetectionResult,
+    *,
+    generation: bool = False,
+) -> np.ndarray:
+    output = _as_bgr(frame)
+    is_generation = bool(generation or result.plug_lengths_px)
+    for index, (center, radius) in enumerate(zip(result.centers, result.radii)):
         point = tuple(int(round(float(value))) for value in center)
-        cv2.circle(output, point, max(1, int(round(radius))), (0, 220, 80), 2)
+        if is_generation and index < len(result.plug_lengths_px):
+            length = float(result.plug_lengths_px[index])
+            half = max(1, int(round(length * 0.5)))
+            height, width = output.shape[:2]
+            if width >= height:
+                first = (max(0, point[0] - half), 2)
+                second = (min(width - 1, point[0] + half), height - 3)
+            else:
+                first = (2, max(0, point[1] - half))
+                second = (width - 3, min(height - 1, point[1] + half))
+            cv2.rectangle(output, first, second, (0, 220, 80), 2)
+        else:
+            cv2.circle(output, point, max(1, int(round(radius))), (0, 220, 80), 2)
         cv2.circle(output, point, 2, (0, 80, 255), -1)
+        label = (
+            f"d_eq={2.0 * radius:.1f}px L={result.plug_lengths_px[index]:.1f}px"
+            if is_generation and index < len(result.plug_lengths_px)
+            else f"r={radius:.1f}"
+        )
         cv2.putText(
             output,
-            f"r={radius:.1f}",
+            label,
             (point[0] + 4, point[1] - 4),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.42,
@@ -264,7 +498,7 @@ def annotate_frame(frame: np.ndarray, result: DetectionResult) -> np.ndarray:
         )
     cv2.putText(
         output,
-        f"droplets: {len(result.centers)}",
+        f"{'plugs' if is_generation else 'droplets'}: {len(result.centers)}",
         (12, 28),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.75,

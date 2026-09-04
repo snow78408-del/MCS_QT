@@ -14,6 +14,7 @@ from ..optimization import BayesianOptimizationConfig, OptimizationObservation, 
 from ..pid_control import (
     DiameterPIDController,
     PIDConfig,
+    PIDControlMode,
     PIDInput,
     PlantCalibrationExperimentConfig,
     PlantCalibrationExperimentResult,
@@ -77,11 +78,20 @@ class OrchestratorService:
             name: copy.deepcopy(getattr(self.pid_config, name))
             for name in (
                 "feedforward_gain",
+                "feedforward_enabled",
                 "feedforward_calibrated",
+                "control_mode",
+                "base_kp",
+                "base_ki",
+                "base_kd",
                 "q1_control_sign",
                 "q2_control_sign",
                 "q1_output_gain",
                 "q2_output_gain",
+                "q1_log_diameter_sensitivity",
+                "q2_log_diameter_sensitivity",
+                "sensitivity_allocation_regularization",
+                "log_sensitivity_calibrated",
                 "q1_min",
                 "q1_max",
                 "q2_min",
@@ -426,13 +436,40 @@ class OrchestratorService:
         # An ad-hoc constructor flag is not sufficient authority for real
         # feedforward. Every configure call must present the versioned record.
         self.pid_config.feedforward_calibrated = False
+        self.pid_config.log_sensitivity_calibrated = False
+        self.pid_config.q1_log_diameter_sensitivity = 0.0
+        self.pid_config.q2_log_diameter_sensitivity = 0.0
         if record is not None:
-            self.pid_config.feedforward_gain = float(record.feedforward_gain)
-            self.pid_config.feedforward_calibrated = True
+            if not record.has_generation_control_mapping:
+                raise ValueError(
+                    "旧观察区标定不包含生成区 Q1/Q2 对数灵敏度，不能用于闭环；请重新执行生成区标定"
+                )
+            if not record.authorized_for_pi:
+                raise ValueError(
+                    "该动力学标定未通过独立验证，不能授权实时闭环；请使用新版自动标定重新采集"
+                )
+            # The new controller is an identified generation-zone PI.  The
+            # former prediction feedforward and heuristic adaptive gains use
+            # incompatible units and remain disabled.
+            self.pid_config.control_mode = PIDControlMode.CLASSIC_PID.value
+            self.pid_config.feedforward_enabled = False
             self.pid_config.q1_control_sign = float(record.q1_control_sign)
             self.pid_config.q2_control_sign = float(record.q2_control_sign)
             self.pid_config.q1_output_gain = float(record.q1_output_gain)
             self.pid_config.q2_output_gain = float(record.q2_output_gain)
+            self.pid_config.q1_log_diameter_sensitivity = float(
+                record.q1_log_diameter_sensitivity
+            )
+            self.pid_config.q2_log_diameter_sensitivity = float(
+                record.q2_log_diameter_sensitivity
+            )
+            self.pid_config.sensitivity_allocation_regularization = float(
+                record.sensitivity_allocation_regularization
+            )
+            self.pid_config.log_sensitivity_calibrated = True
+            self.pid_config.base_kp = float(record.controller_kp)
+            self.pid_config.base_ki = float(record.controller_ki)
+            self.pid_config.base_kd = 0.0
             self.pid_config.q1_min = float(record.q1_min)
             self.pid_config.q1_max = float(record.q1_max)
             self.pid_config.q2_min = float(record.q2_min)
@@ -499,6 +536,20 @@ class OrchestratorService:
                 control_period_id=period_id,
                 pixel_to_micron=float(getattr(rec, "pixel_to_micron", 0.0) or 0.0),
                 scale_source=str(getattr(rec, "scale_source", "unknown") or "unknown"),
+                measurement_region=str(
+                    getattr(rec, "measurement_region", "generation") or "generation"
+                ),
+                volume_correction_factor=float(
+                    getattr(rec, "generation_volume_correction", 1.0) or 1.0
+                ),
+                generation_frequency_hz=max(
+                    0.0,
+                    float(getattr(rec, "droplet_generation_rate_hz", 0.0) or 0.0),
+                ),
+                diameter_cv=max(
+                    0.0,
+                    float(getattr(rec, "frame_diameter_cv", 0.0) or 0.0),
+                ),
             )
             for track_id, diameter in sorted(crossed.items())
         )
@@ -785,6 +836,14 @@ class OrchestratorService:
             minimum_observation_count=int(config.response_observation_limit),
         )
         baseline_diameter = float(median(item.diameter_um for item in baseline))
+        if any(item.measurement_region != "generation" for item in baseline):
+            raise RuntimeError("动力学标定必须使用生成区体积换算后的等效直径")
+        observed_volume_factors = [item.volume_correction_factor for item in baseline]
+        live_volume_factor = float(median(observed_volume_factors))
+        if abs(live_volume_factor - float(config.volume_correction_factor)) > 1e-6:
+            raise RuntimeError(
+                "标定配置的体积修正系数与实时生成区识别配置不一致"
+            )
         live_scales = [
             float(item.pixel_to_micron)
             for item in baseline
@@ -1056,7 +1115,10 @@ class OrchestratorService:
             self._state = SystemState.CALIBRATING
             self._message = "pump-chip calibration is starting"
 
-        total_trials = int(config.repetitions) * 6
+        total_trials = (
+            int(config.repetitions) * 6
+            + int(config.validation_repetitions) * 2
+        )
         self._plant_calibration_experiment = {
             "status": "running",
             "phase": "starting",
@@ -1229,6 +1291,55 @@ class OrchestratorService:
                         f"detected={measurement.response_detected} "
                         f"classification={measurement.response_classification}"
                     )
+                    completed += 1
+                    self._update_plant_calibration_experiment(
+                        completed_trials=completed,
+                        measurement_count=len(measurements),
+                    )
+
+            validation_fraction = float(config.validation_step_fraction)
+            validation_base_step = base_step * validation_fraction
+            for repeat in range(int(config.validation_repetitions)):
+                directions = (1, -1) if repeat % 2 == 0 else (-1, 1)
+                for direction in directions:
+                    q1 = (
+                        baseline_q1
+                        + direction * q1_sign * float(config.q1_step) * validation_fraction
+                    )
+                    q2 = (
+                        baseline_q2
+                        + direction * q2_sign * float(config.q2_step) * validation_fraction
+                    )
+                    self._validate_plant_calibration_target(q1, q2)
+                    trial_id = (
+                        f"validation-r{repeat + 1}-"
+                        f"{'plus' if direction > 0 else 'minus'}"
+                    )
+                    self._update_plant_calibration_experiment(
+                        phase=f"validating {trial_id}",
+                        current_trial=trial_id,
+                    )
+                    self._restore_plant_calibration_baseline(
+                        baseline_q1=baseline_q1,
+                        baseline_q2=baseline_q2,
+                        generation=generation,
+                        token=token,
+                        next_trial_id=trial_id,
+                    )
+                    measurement = self._run_plant_calibration_trial(
+                        config=config,
+                        generation=generation,
+                        token=token,
+                        trial_id=trial_id,
+                        channel="validation",
+                        direction=direction,
+                        baseline_q1=baseline_q1,
+                        baseline_q2=baseline_q2,
+                        commanded_q1=q1,
+                        commanded_q2=q2,
+                        actuator_step=direction * validation_base_step,
+                    )
+                    measurements.append(measurement)
                     completed += 1
                     self._update_plant_calibration_experiment(
                         completed_trials=completed,
@@ -1490,6 +1601,45 @@ class OrchestratorService:
             raise RuntimeError("当前视觉服务不支持运行时应用液滴识别调参参数")
         return dict(apply_tuning(detector_config, channel_region_config) or {})
 
+    def configure_generation_measurement(
+        self,
+        *,
+        channel_height_um: float,
+        channel_width_um: float,
+        volume_correction_factor: float,
+    ) -> None:
+        """Apply generation-zone geometry while pumps/control are stopped."""
+        values = (
+            float(channel_height_um),
+            float(channel_width_um),
+            float(volume_correction_factor),
+        )
+        if not all(math.isfinite(value) and value > 0.0 for value in values):
+            raise ValueError("生成区通道尺寸和体积修正系数必须为有限正数")
+        with self._lock:
+            if self._cfg is None:
+                raise RuntimeError("system config is missing, call configure() first")
+            if self._state not in {
+                SystemState.CONFIGURED,
+                SystemState.VIDEO_READY,
+                SystemState.INITIALIZED,
+                SystemState.STOPPED,
+            }:
+                raise RuntimeError("运行或标定过程中不能更改生成区几何参数")
+            roi = dict(self._cfg.recognition_roi or {})
+            roi.update(
+                {
+                    "channel_width_um": values[1],
+                    "generation_channel_height_um": values[0],
+                    "generation_channel_width_um": values[1],
+                    "generation_volume_correction": values[2],
+                }
+            )
+            self._cfg.recognition_roi = roi
+        setter = getattr(self.vision_service, "set_recognition_roi", None)
+        if callable(setter):
+            setter(roi)
+
     def discover_cameras(self) -> dict[str, Any]:
         self._log("[CAMERA][CALLCHAIN] frontend -> orchestrator -> vision_service -> CameraManager")
         discover = getattr(self.vision_service, "discover_cameras_result", None)
@@ -1519,7 +1669,7 @@ class OrchestratorService:
         self,
         preview_png_base64: str,
         roi: dict[str, Any] | None = None,
-        channel_width_um: float = 430.0,
+        channel_width_um: float = 50.0,
         configured_pixel_to_micron: float = 1.0,
         hough_parameters: dict[str, float | int] | None = None,
     ) -> dict[str, Any]:
@@ -2046,7 +2196,7 @@ class OrchestratorService:
         try:
             return (
                 str(value("channel_calibration_status", "")) == "calibrated"
-                and str(value("scale_source", "")) == "channel_430um"
+                and str(value("scale_source", "")) == "generation_channel_width"
                 and float(value("channel_calibration_confidence", 0.0) or 0.0) > 0.0
                 and float(value("pixel_to_micron", 0.0) or 0.0) > 0.0
                 and float(value("channel_width_um", 0.0) or 0.0) > 0.0
@@ -2151,6 +2301,18 @@ class OrchestratorService:
             adapter = self.vision_adapter
             starting_state = self._state
             generation = self._lifecycle_generation
+
+        if (
+            start_state == SystemState.RUNNING
+            and self._is_realtime_mode()
+            and (
+                getattr(self, "_plant_calibration", None) is None
+                or not bool(self.pid_config.log_sensitivity_calibrated)
+            )
+        ):
+            raise RuntimeError(
+                "没有有效的生成区 Q1/Q2 动力学标定，禁止使用默认映射启动 PID 闭环"
+            )
 
         recorder_started = False
         adapter_started = False
@@ -2676,6 +2838,16 @@ class OrchestratorService:
                     None
                     if raw.get("calibration_uncertainty_um_per_px") is None
                     else float(raw.get("calibration_uncertainty_um_per_px"))
+                ),
+                measurement_region=str(raw.get("measurement_region", "generation") or "generation"),
+                generation_channel_height_um=float(
+                    raw.get("generation_channel_height_um", 50.0) or 50.0
+                ),
+                generation_channel_width_um=float(
+                    raw.get("generation_channel_width_um", 50.0) or 50.0
+                ),
+                generation_volume_correction=float(
+                    raw.get("generation_volume_correction", 1.0) or 1.0
                 ),
             )
         raise ValueError(f"unsupported recognition snapshot type: {type(raw).__name__}")

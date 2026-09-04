@@ -86,6 +86,13 @@ class PIDConfig:
     # change of Q2 (water) for the same PID output.
     q1_output_gain: float = 2.0
     q2_output_gain: float = 1.0
+    # Generation-zone calibration identifies dimensionless local gradients
+    # g_j = d(log diameter) / d(log Q_j).  When enabled these replace the
+    # legacy fixed signs and 2:1 actuator split.
+    q1_log_diameter_sensitivity: float = 0.0
+    q2_log_diameter_sensitivity: float = 0.0
+    sensitivity_allocation_regularization: float = 0.01
+    log_sensitivity_calibrated: bool = False
     # After BO handoff, PID is a local trim controller around the confirmed
     # operating point rather than a second global operating-point search.
     operating_point_local_span_fraction: float = 0.20
@@ -129,6 +136,13 @@ class PIDConfig:
                 )
         if self.q1_output_gain == 0.0 and self.q2_output_gain == 0.0:
             raise ValueError("at least one pump control channel must remain active")
+        if self.sensitivity_allocation_regularization <= 0.0:
+            raise ValueError("sensitivity_allocation_regularization must be positive")
+        if self.log_sensitivity_calibrated and (
+            abs(float(self.q1_log_diameter_sensitivity)) <= 1e-12
+            and abs(float(self.q2_log_diameter_sensitivity)) <= 1e-12
+        ):
+            raise ValueError("calibrated log-sensitivity mapping needs at least one active channel")
         if not 0.0 < self.operating_point_local_span_fraction <= 1.0:
             raise ValueError("operating_point_local_span_fraction must be in (0, 1]")
         if self.min_q1_q2_gap < STRICT_Q1_Q2_GAP_UL_MIN:

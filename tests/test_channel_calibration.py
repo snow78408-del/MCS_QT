@@ -45,22 +45,46 @@ class ChannelCalibrationTests(unittest.TestCase):
 
         applied = service.apply_tuning_config(
             DetectorConfig(
-                min_radius=24.0,
-                max_radius=48.0,
-                sensitivity=0.72,
-                radius_adjustment_percent=5.0,
+                measurement_mode="observation_circle",
+                generation_channel_height_um=90.0,
+                generation_channel_width_um=80.0,
+                generation_volume_correction=1.4,
+                generation_center_band_ratio=0.54,
+                generation_edge_mad_multiplier=2.6,
+                generation_min_profile_contrast_sigma=0.48,
             ),
             ChannelRegionConfig(enabled=False, canny_low=28),
         )
 
         self.assertTrue(applied["applied"])
-        self.assertEqual(pipeline.detector.runtime_radius_range(), (24.0, 33.94112549695428, 48.0))
-        self.assertAlmostEqual(pipeline.detector._config.sensitivity, 0.72)
-        self.assertAlmostEqual(pipeline.detector._config.radius_adjustment_percent, 5.0)
+        self.assertEqual(pipeline.detector._config.measurement_mode, "generation_plug")
+        self.assertAlmostEqual(pipeline.detector._config.generation_channel_height_um, 50.0)
+        self.assertAlmostEqual(pipeline.detector._config.generation_channel_width_um, 50.0)
+        self.assertAlmostEqual(pipeline.detector._config.generation_volume_correction, 1.0)
+        self.assertAlmostEqual(pipeline.detector._config.generation_center_band_ratio, 0.54)
+        self.assertAlmostEqual(pipeline.detector._config.generation_edge_mad_multiplier, 2.6)
+        self.assertAlmostEqual(pipeline.detector._config.generation_min_profile_contrast_sigma, 0.48)
+        self.assertEqual(applied["measurement_mode"], "generation_plug")
         self.assertFalse(pipeline.channel_region_detector.config.enabled)
         self.assertEqual(pipeline.channel_region_detector.config.canny_low, 28)
         self.assertIs(pipeline.tracker, tracker)
         self.assertIs(pipeline.metrics, metrics)
+
+    def test_user_square_channel_width_populates_missing_height_and_width(self) -> None:
+        service = PipelineVisionService()
+
+        service.set_recognition_roi(
+            {
+                "enabled": True,
+                "channel_width_um": 70.0,
+                "channel_calibration_enabled": False,
+            }
+        )
+
+        detector = service._ensure_pipeline().config.detector
+        self.assertEqual(service._channel_width_um, 70.0)
+        self.assertEqual(detector.generation_channel_height_um, 70.0)
+        self.assertEqual(detector.generation_channel_width_um, 70.0)
 
     def test_fitted_lower_wall_is_added_to_clickable_candidates(self) -> None:
         measurement = ChannelWidthMeasurement(

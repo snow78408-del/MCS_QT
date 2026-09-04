@@ -53,6 +53,17 @@ _INTEGER_PARAMETERS = {
 # Algorithm-safe slider ranges: (minimum, maximum, step). Text entry remains
 # available for exact values, while sliders cover the useful operating range.
 _PARAMETER_RANGES: dict[str, tuple[float, float, float]] = {
+    "generation_channel_height_um": (0.01, 100000.0, 0.01),
+    "generation_channel_width_um": (0.01, 100000.0, 0.01),
+    "generation_volume_correction": (0.20, 3.0, 0.01),
+    "generation_center_band_ratio": (0.20, 0.90, 0.01),
+    "generation_edge_mad_multiplier": (0.50, 10.0, 0.10),
+    "generation_min_length_ratio": (0.50, 20.0, 0.10),
+    "generation_max_length_ratio": (1.0, 40.0, 0.10),
+    "generation_min_edge_separation_ratio": (0.02, 2.0, 0.01),
+    "generation_min_profile_contrast_sigma": (0.0, 5.0, 0.05),
+    "generation_min_meniscus_support_ratio": (0.01, 1.0, 0.01),
+    "generation_min_capsule_outline_ratio": (0.10, 0.95, 0.01),
     "min_radius": (1.0, 300.0, 1.0),
     "max_radius": (2.0, 300.0, 1.0),
     "min_center_distance": (1.0, 300.0, 1.0),
@@ -111,6 +122,11 @@ def _validate_tuning_configs(
 
     relationships = (
         (detector_config.min_radius, detector_config.max_radius, "最小半径不能大于最大半径"),
+        (
+            detector_config.generation_min_length_ratio,
+            detector_config.generation_max_length_ratio,
+            "生成区最小液滴长度比例不能大于最大长度比例",
+        ),
         (channel_config.min_width_ratio, channel_config.max_width_ratio, "最小管宽比例不能大于最大管宽比例"),
     )
     for lower, upper, message in relationships:
@@ -118,6 +134,8 @@ def _validate_tuning_configs(
             raise ValueError(message)
     if channel_config.canny_low >= channel_config.canny_high:
         raise ValueError("Canny 低阈值必须小于高阈值")
+    if detector_config.generation_polarity not in {"brighter", "darker", "either"}:
+        raise ValueError("生成区液滴极性必须是 brighter、darker 或 either")
 
 
 class _InspectionSignals(QObject):
@@ -442,15 +460,17 @@ class TuningWindow(QWidget):
         on_sample_loaded: Callable[[str], None] | None = None,
         settings_store: VisionTuningSettingsStore | None = None,
         on_parameters_saved: Callable[[DetectorConfig, ChannelRegionConfig], object] | None = None,
+        pixel_to_micron: float = 1.0,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("液滴识别算法调参工作台")
+        self.setWindowTitle("生成区液滴识别算法调参工作台")
         self.resize(1280, 820)
         self.frames: list[TuningFrame] = []
         self.frame_pos = 0
         self._on_sample_loaded = on_sample_loaded
         self._settings_store = settings_store
         self._on_parameters_saved = on_parameters_saved
+        self._pixel_to_micron = max(1e-9, float(pixel_to_micron))
         self._expanded_stages: set[int] = set()
         detector_config, channel_config, self._initial_parameter_status = self._load_initial_parameters()
         self.original_config = DetectorConfig(**vars(detector_config))
@@ -482,12 +502,13 @@ class TuningWindow(QWidget):
             self.status.setText(self._initial_parameter_status)
 
     def _load_initial_parameters(self) -> tuple[DetectorConfig, ChannelRegionConfig, str]:
-        defaults = (DetectorConfig(), ChannelRegionConfig())
+        defaults = (DetectorConfig(measurement_mode="generation_plug"), ChannelRegionConfig())
         if self._settings_store is None:
             return defaults[0], defaults[1], ""
         try:
             result = self._settings_store.load_or_create()
             if result.status is not TuningLoadStatus.INVALID:
+                result.detector.measurement_mode = "generation_plug"
                 _validate_tuning_configs(result.detector, result.channel_region)
                 message = "已创建并加载默认算法参数。" if result.status is TuningLoadStatus.CREATED else "已加载用户算法参数。"
                 return result.detector, result.channel_region, message
@@ -544,9 +565,13 @@ class TuningWindow(QWidget):
         self.reset.setEnabled(False)
         self.reset.clicked.connect(self._reset_parameters)
         toolbar.addWidget(self.reset)
+        self.scale_label = QLabel()
+        self.scale_label.setObjectName("mutedText")
+        self._update_scale_label()
+        toolbar.addWidget(self.scale_label)
         layout.addLayout(toolbar)
 
-        self.status = QLabel("等待加载样本；参数修改或步骤开关变化后，将在 500ms 内自动刷新。")
+        self.status = QLabel("等待加载生成区样本；调节弯月面参数后，将在 500ms 内按实时识别同一路径刷新。")
         self.status.setStyleSheet("color:#475569;padding:2px 4px")
         layout.addWidget(self.status)
 
@@ -565,6 +590,57 @@ class TuningWindow(QWidget):
         layout.addWidget(self.stage_scroll, 1)
         if initial_video:
             QTimer.singleShot(0, self._load)
+
+    def set_pixel_to_micron(self, value: float) -> None:
+        scale = float(value)
+        if not math.isfinite(scale) or scale <= 0.0:
+            raise ValueError("调参预览像素比例必须为正有限值")
+        if math.isclose(scale, self._pixel_to_micron, rel_tol=0.0, abs_tol=1e-12):
+            return
+        self._pixel_to_micron = scale
+        self._update_scale_label()
+        self._config_revision += 1
+        if self.frames:
+            self.status.setText("像素比例已更新，正在按实时比例刷新生成区识别…")
+            self._refresh_timer.start()
+
+    def set_generation_geometry(
+        self,
+        *,
+        channel_height_um: float,
+        channel_width_um: float,
+        volume_correction: float,
+    ) -> None:
+        values = (
+            float(channel_height_um),
+            float(channel_width_um),
+            float(volume_correction),
+        )
+        if not all(math.isfinite(value) and value > 0.0 for value in values):
+            raise ValueError("生成区 H、W 和 κV 必须是正有限值")
+        fields = (
+            "generation_channel_height_um",
+            "generation_channel_width_um",
+            "generation_volume_correction",
+        )
+        changed = any(
+            not math.isclose(float(getattr(self.current_config, field)), value)
+            for field, value in zip(fields, values)
+        )
+        if not changed:
+            return
+        for field, value in zip(fields, values):
+            setattr(self.current_config, field, value)
+            setattr(self.original_config, field, value)
+            setattr(self._last_good_config, field, value)
+        self._config_revision += 1
+        if self.frames:
+            self.status.setText("生成区物理几何已同步，正在刷新等效直径预览…")
+            self._refresh_timer.start()
+
+    def _update_scale_label(self) -> None:
+        self.scale_label.setText(f"预览比例 {self._pixel_to_micron:g} μm/px")
+        self.scale_label.setToolTip("来自基础参数/光学标定；生成区长度门限和等效直径均使用此实时比例")
 
     def _browse(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -682,9 +758,77 @@ class TuningWindow(QWidget):
         else:
             self.status.setText("参数已回退为原设定")
 
-    def _controls_for_stage(self, index: int) -> list[dict[str, Any]]:
+    def _controls_for_stage(
+        self,
+        index: int,
+        stage: PipelineStage | None = None,
+    ) -> list[dict[str, Any]]:
         config = self.current_config
         channel = self.current_channel_config
+        stage_name = stage.name if stage is not None else ""
+        if str(config.measurement_mode).strip().lower() == "generation_plug":
+            if "管道中心采样带" in stage_name or (not stage_name and index == 2):
+                return [
+                    self._number(
+                        "generation_center_band_ratio",
+                        "中心采样带比例",
+                        config.generation_center_band_ratio,
+                    ),
+                ]
+            if "轴向强度与边缘峰" in stage_name or (not stage_name and index == 3):
+                return [
+                    self._number(
+                        "generation_edge_mad_multiplier",
+                        "边缘 MAD 倍数",
+                        config.generation_edge_mad_multiplier,
+                    ),
+                    self._number(
+                        "generation_min_edge_separation_ratio",
+                        "最小弯月面峰距/管宽",
+                        config.generation_min_edge_separation_ratio,
+                    ),
+                ]
+            if "弯月面配对" in stage_name or (not stage_name and index == 4):
+                return [
+                    self._number(
+                        "generation_min_length_ratio",
+                        "最小液滴长度/管宽",
+                        config.generation_min_length_ratio,
+                    ),
+                    self._number(
+                        "generation_max_length_ratio",
+                        "最大液滴长度/管宽",
+                        config.generation_max_length_ratio,
+                    ),
+                    self._number(
+                        "generation_min_profile_contrast_sigma",
+                        "最低相内外对比（σ）",
+                        config.generation_min_profile_contrast_sigma,
+                    ),
+                    self._number(
+                        "generation_min_meniscus_support_ratio",
+                        "最低二维弯月面支撑比例",
+                        config.generation_min_meniscus_support_ratio,
+                    ),
+                    self._number(
+                        "generation_min_capsule_outline_ratio",
+                        "上下胶囊边缘最低覆盖率",
+                        config.generation_min_capsule_outline_ratio,
+                    ),
+                    self._choice(
+                        "generation_polarity",
+                        "液滴相对连续相亮暗",
+                        config.generation_polarity,
+                        [
+                            ("自动兼容亮/暗", "either"),
+                            ("液滴更亮", "brighter"),
+                            ("液滴更暗", "darker"),
+                        ],
+                    ),
+                ]
+            if "管道检定" not in stage_name and stage_name:
+                return []
+
         controls: dict[int, list[dict[str, Any]]] = {
             0: [
                 self._check("channel_region.enabled", "启用管道区域检定", channel.enabled),
@@ -762,6 +906,23 @@ class TuningWindow(QWidget):
             "modified": value != getattr(self._original_parameter_owner(key)[0], self._original_parameter_owner(key)[1]),
         }
 
+    def _choice(
+        self,
+        key: str,
+        label: str,
+        value: str,
+        options: list[tuple[str, str]],
+    ) -> dict[str, Any]:
+        owner, field = self._original_parameter_owner(key)
+        return {
+            "key": key,
+            "label": label,
+            "kind": "choice",
+            "value": value,
+            "options": options,
+            "modified": value != getattr(owner, field),
+        }
+
     def _redraw(self) -> None:
         if not self.frames:
             return
@@ -792,6 +953,7 @@ class TuningWindow(QWidget):
                 detector_config,
                 channel_config=channel_config,
                 channel_frames=channel_frames,
+                pixel_to_micron=self._pixel_to_micron,
             )
 
         worker = _InspectionWorker(request_id, task)
@@ -923,7 +1085,7 @@ class TuningWindow(QWidget):
         for index, stage in enumerate(stages):
             card = StageCard(
                 stage,
-                self._controls_for_stage(index),
+                self._controls_for_stage(index, stage),
                 self.stage_container,
                 expanded=index in self._expanded_stages,
             )
@@ -949,6 +1111,7 @@ class TuningWindow(QWidget):
             QMessageBox.warning(self, "保存失败", "未配置算法参数存储位置。")
             return
         try:
+            self.current_config.measurement_mode = "generation_plug"
             _validate_tuning_configs(self.current_config, self.current_channel_config)
             self._settings_store.save(self.current_config, self.current_channel_config)
         except Exception as exc:

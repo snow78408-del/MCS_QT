@@ -51,6 +51,8 @@ class VisionTuningSettingsStore:
         return TuningLoadResult(TuningLoadStatus.LOADED, detector, channel)
 
     def save(self, detector: DetectorConfig, channel_region: ChannelRegionConfig) -> None:
+        detector = DetectorConfig(**asdict(detector))
+        detector.measurement_mode = "generation_plug"
         # Validate before replacing the last usable file.
         self._validate_section(asdict(detector), DetectorConfig(), "detector")
         self._validate_section(asdict(channel_region), ChannelRegionConfig(), "channel_region")
@@ -81,7 +83,7 @@ class VisionTuningSettingsStore:
 
     @staticmethod
     def _defaults() -> tuple[DetectorConfig, ChannelRegionConfig]:
-        return DetectorConfig(), ChannelRegionConfig()
+        return DetectorConfig(measurement_mode="generation_plug"), ChannelRegionConfig()
 
     def _decode(self, payload: Any) -> tuple[DetectorConfig, ChannelRegionConfig]:
         if not isinstance(payload, dict):
@@ -96,13 +98,22 @@ class VisionTuningSettingsStore:
         channel_values = self._validate_section(
             payload["channel_region"], ChannelRegionConfig(), "channel_region"
         )
-        return DetectorConfig(**detector_values), ChannelRegionConfig(**channel_values)
+        detector = DetectorConfig(**detector_values)
+        detector.measurement_mode = "generation_plug"
+        return detector, ChannelRegionConfig(**channel_values)
 
     @staticmethod
     def _validate_section(values: Any, defaults: object, section: str) -> dict[str, Any]:
         if not isinstance(values, dict):
             raise ValueError(f"{section} 必须是对象")
+        values = dict(values)
         expected = {item.name for item in fields(defaults)}
+        # Older schema-v1 files predate full capsule-outline validation. Keep
+        # the other user-tuned values and fill only this new safety parameter.
+        if section == "detector" and "generation_min_capsule_outline_ratio" not in values:
+            values["generation_min_capsule_outline_ratio"] = float(
+                getattr(defaults, "generation_min_capsule_outline_ratio")
+            )
         if set(values) != expected:
             missing = sorted(expected - set(values))
             extra = sorted(set(values) - expected)

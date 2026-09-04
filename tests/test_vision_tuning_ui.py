@@ -86,13 +86,27 @@ def test_invalid_algorithm_parameters_are_rejected_before_inspection() -> None:
         _validate_tuning_configs(detector, ChannelRegionConfig())
 
 
-def test_final_stage_exposes_global_radius_adjustment() -> None:
+def test_generation_stages_expose_only_live_meniscus_parameters() -> None:
     window = TuningWindow()
 
-    controls = window._controls_for_stage(11)
+    band_controls = window._controls_for_stage(2)
+    edge_controls = window._controls_for_stage(3)
+    pair_controls = window._controls_for_stage(4)
 
-    assert [control["key"] for control in controls] == ["radius_adjustment_percent"]
-    assert controls[0]["label"] == "液滴整体尺寸调节（%）"
+    assert [control["key"] for control in band_controls] == ["generation_center_band_ratio"]
+    assert [control["key"] for control in edge_controls] == [
+        "generation_edge_mad_multiplier",
+        "generation_min_edge_separation_ratio",
+    ]
+    assert [control["key"] for control in pair_controls] == [
+        "generation_min_length_ratio",
+        "generation_max_length_ratio",
+            "generation_min_profile_contrast_sigma",
+            "generation_min_meniscus_support_ratio",
+            "generation_min_capsule_outline_ratio",
+            "generation_polarity",
+    ]
+    assert window.current_config.measurement_mode == "generation_plug"
     window.close()
 
 
@@ -149,11 +163,11 @@ def test_save_button_overwrites_user_algorithm_parameters(tmp_path) -> None:
     _application()
     store = VisionTuningSettingsStore(tmp_path / "vision_tuning_parameters.json")
     window = TuningWindow(settings_store=store)
-    window.current_config.sensitivity = 0.71
+    window.current_config.generation_edge_mad_multiplier = 2.7
 
     window._save()
 
-    assert store.load_or_create().detector.sensitivity == 0.71
+    assert store.load_or_create().detector.generation_edge_mad_multiplier == 2.7
     assert "替代原用户参数" in window.status.text()
     assert not window.reset.isEnabled()
     window.close()
@@ -167,15 +181,16 @@ def test_save_button_applies_parameters_to_live_sampling_callback(tmp_path) -> N
         settings_store=store,
         on_parameters_saved=lambda detector, channel: applied.append((detector, channel)),
     )
-    window.current_config.min_radius = 24.0
-    window.current_config.max_radius = 48.0
+    window.current_config.generation_center_band_ratio = 0.55
+    window.current_config.generation_min_profile_contrast_sigma = 0.5
     window.current_channel_config.canny_low = 28
 
     window._save()
 
     assert len(applied) == 1
-    assert applied[0][0].min_radius == 24.0
-    assert applied[0][0].max_radius == 48.0
+    assert applied[0][0].measurement_mode == "generation_plug"
+    assert applied[0][0].generation_center_band_ratio == 0.55
+    assert applied[0][0].generation_min_profile_contrast_sigma == 0.5
     assert applied[0][1].canny_low == 28
     assert "应用到采样识别" in window.status.text()
     window.close()
@@ -206,6 +221,32 @@ def test_frontend_startup_applies_saved_tuning_parameters(tmp_path) -> None:
     assert applied[0][0].max_radius == 52.0
     assert applied[0][1].canny_low == 29
     assert any("[VISION][TUNING][LOADED]" in message for message in messages)
+
+
+def test_generation_preview_scale_can_be_refreshed_from_live_optical_calibration() -> None:
+    window = TuningWindow(pixel_to_micron=0.69)
+
+    window.set_pixel_to_micron(0.82)
+
+    assert window._pixel_to_micron == 0.82
+    assert "0.82 μm/px" in window.scale_label.text()
+    window.close()
+
+
+def test_generation_preview_geometry_is_synchronized_without_becoming_a_tuning_edit() -> None:
+    window = TuningWindow()
+
+    window.set_generation_geometry(
+        channel_height_um=50.0,
+        channel_width_um=55.0,
+        volume_correction=1.08,
+    )
+
+    assert window.current_config.generation_channel_width_um == 55.0
+    assert window.current_config.generation_volume_correction == 1.08
+    assert window.original_config.generation_channel_width_um == 55.0
+    assert not window._has_modified_parameters()
+    window.close()
 
 
 def test_expanding_stage_does_not_stretch_neighbour_card() -> None:

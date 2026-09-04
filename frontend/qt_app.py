@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 from collections import deque
 import json
+import math
 import multiprocessing as mp
 import shutil
 import sys
@@ -445,8 +446,8 @@ class ParameterPage(Page):
         hint=QLabel("没有标定文件可留空；将使用像元尺寸÷放大倍率，仅允许预览，闭环控制前需补充标定 JSON。"); hint.setWordWrap(True); hint.setObjectName("formHint"); form.addRow("", hint)
         plant_row=QWidget(); plant_layout=QHBoxLayout(plant_row); plant_layout.setContentsMargins(0,0,0,0)
         self.plant_calibration_path=QLineEdit(str(cfg.get("plant_calibration_path",""))); plant_button=QPushButton("选择…"); set_button_role(plant_button,"secondary"); plant_button.clicked.connect(self._browse_plant_calibration)
-        plant_layout.addWidget(self.plant_calibration_path,1); plant_layout.addWidget(plant_button); form.addRow("泵-芯片动力学标定（可选）",plant_row)
-        plant_hint=QLabel("未提供时仍可运行 BO 和 PID，但泵响应延迟视为未标定，扰动前馈保持关闭。"); plant_hint.setWordWrap(True); plant_hint.setObjectName("formHint"); form.addRow("",plant_hint)
+        plant_layout.addWidget(self.plant_calibration_path,1); plant_layout.addWidget(plant_button); form.addRow("生成区 Q1/Q2 动力学标定（闭环必需）",plant_row)
+        plant_hint=QLabel("未提供时可进行预览、泵测试、BO 和生成区标定，但禁止启动 PID 闭环；旧观察区标定也必须重新执行。"); plant_hint.setWordWrap(True); plant_hint.setObjectName("formHint"); form.addRow("",plant_hint)
         button = QPushButton("保存并进入相机配置"); button.clicked.connect(self.submit); form.addRow("", button)
 
         summary, summary_layout = self.summary_box("配置摘要")
@@ -478,7 +479,7 @@ class ParameterPage(Page):
         path=self.calibration_path.text().strip()
         plant_path=self.plant_calibration_path.text().strip()
         optical_text="已选择像素标定" if path else "像素标定缺失"
-        plant_text="已选择动力学标定，可校验前馈" if plant_path else "动力学标定缺失，前馈关闭"
+        plant_text="已选择动力学标定；初始化时校验独立验证授权" if plant_path else "动力学标定缺失，实时闭环禁止"
         self.calibration_summary.setText(f"标定状态\n{optical_text}\n{plant_text}")
         self.calibration_summary.setProperty("status","ok" if path else "warning")
         self.calibration_summary.style().unpolish(self.calibration_summary); self.calibration_summary.style().polish(self.calibration_summary)
@@ -550,8 +551,11 @@ class VideoPage(Page):
 
         calibration_box=QGroupBox("3 · 已知框选高度标定"); calibration_form=QFormLayout(calibration_box); calibration_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         self.channel_cal_on=QCheckBox("使用用户输入的实际高度标定 μm/px"); self.channel_cal_on.setChecked(bool(roi.get("channel_calibration_enabled",True))); calibration_form.addRow("",self.channel_cal_on)
-        self.channel_width=self.number_field(calibration_form,"框选区域实际高度",roi.get("channel_width_um",430.0),0.01,100000,decimals=2,suffix="μm")
-        calibration_hint=QLabel("软件按“当前输入高度 ÷ 两条框选内壁的像素间距”计算 μm/px，并据此换算液滴直径；输入值改变后比例自动更新。"); calibration_hint.setWordWrap(True); calibration_hint.setObjectName("formHint"); calibration_form.addRow("",calibration_hint)
+        saved_channel_width=roi.get("generation_channel_width_um",roi.get("channel_width_um",50.0))
+        saved_channel_height=roi.get("generation_channel_height_um",saved_channel_width)
+        self.channel_width=self.number_field(calibration_form,"生成区可见内宽 W",saved_channel_width,0.01,100000,decimals=2,suffix="μm")
+        self.channel_height=self.number_field(calibration_form,"芯片通道深度 H",saved_channel_height,0.01,100000,decimals=2,suffix="μm")
+        calibration_hint=QLabel("W ÷ 两条框选内壁的像素间距用于计算 μm/px；H 是垂直于图像平面的芯片深度，仅参与液滴体积换算。请按芯片实测或加工参数分别填写，不能默认 H=W。"); calibration_hint.setWordWrap(True); calibration_hint.setObjectName("formHint"); calibration_form.addRow("",calibration_hint)
 
         advanced_grid.addWidget(roi_box,0,0,1,2); advanced_grid.addWidget(region_box,1,0); advanced_grid.addWidget(calibration_box,1,1); advanced_grid.setColumnStretch(0,1); advanced_grid.setColumnStretch(1,1)
         advanced_layout.addLayout(advanced_grid,1)
@@ -576,7 +580,7 @@ class VideoPage(Page):
         work.setStretchFactor(0,1); work.setStretchFactor(1,3); work.setSizes([330,760]); layout.addWidget(work,1)
         self._camera_only_fields=(self.devices,self.backend,self.exposure,self.gain,self.fps,self.frame_width,self.frame_height,self.test_button)
         for control in (self.roi_on,self.channel_region_on,self.channel_cal_on): control.toggled.connect(self._refresh_advanced_summary)
-        for control in (self.channel_region_samples,self.channel_width): control.valueChanged.connect(self._refresh_advanced_summary)
+        for control in (self.channel_region_samples,self.channel_width,self.channel_height): control.valueChanged.connect(self._refresh_advanced_summary)
         self.roi.textChanged.connect(self._refresh_advanced_summary)
         for control in (self.exposure,self.gain,self.fps,self.frame_width,self.frame_height): control.valueChanged.connect(self._invalidate_camera_verification)
         self.backend.currentTextChanged.connect(self._invalidate_camera_verification)
@@ -588,8 +592,8 @@ class VideoPage(Page):
     def _refresh_advanced_summary(self, *_args):
         roi_text=self.roi.text().strip() if self.roi_on.isChecked() else "整帧"
         region="开启" if self.channel_region_on.isChecked() else "关闭"
-        calibration=f"{self.channel_width.value():g} μm" if self.channel_cal_on.isChecked() else "关闭"
-        self.advanced_summary.setText(f"ROI：{roi_text}  ·  自动检定：{region}  ·  宽度标定：{calibration}")
+        calibration=f"W={self.channel_width.value():g}、H={self.channel_height.value():g} μm" if self.channel_cal_on.isChecked() else "关闭"
+        self.advanced_summary.setText(f"ROI：{roi_text}  ·  自动检定：{region}  ·  通道尺寸：{calibration}")
 
     def _invalidate_camera_verification(self, *_args):
         self.app.device_verification["camera"]=False
@@ -712,9 +716,9 @@ class VideoPage(Page):
 
     def roi_drawn(self,x0,y0,x1,y1):
         self._roi_user_modified=True; self._selected_wall_lines=[]; self.preview.set_hough_lines(self.preview._line_candidates,[]); self.roi_on.setChecked(True); values=(x0*100,y0*100,x1*100,y1*100); self.roi.setText(",".join(f"{v:.2f}" for v in values))
-        try: channel_width=float(self.channel_width.value()); sample_frames=self._channel_region_sample_count()
+        try: roi=self._roi_payload()
         except ValueError as exc: self.roi_status.setText(str(exc)); return
-        roi={"enabled":True,"x_start_ratio":x0,"y_start_ratio":y0,"x_end_ratio":x1,"y_end_ratio":y1,"user_defined":True,"wall_lines":[],"channel_region_enabled":self.channel_region_on.isChecked(),"channel_region_sample_frames":sample_frames,"channel_calibration_enabled":self.channel_cal_on.isChecked(),"channel_width_um":channel_width}; self.app.save(recognition_roi=roi)
+        self.app.save(recognition_roi=roi)
         self.roi_status.setText(f"已选择 ROI：左 {values[0]:.2f}% / 上 {values[1]:.2f}% / 右 {values[2]:.2f}% / 下 {values[3]:.2f}%。请确认两条内壁均完整可见。")
         self._analyze_user_roi()
 
@@ -737,9 +741,16 @@ class VideoPage(Page):
         coords=[float(x.strip())/100 for x in self.roi.text().split(",")]
         if len(coords)!=4 or not (0<=coords[0]<coords[2]<=1 and 0<=coords[1]<coords[3]<=1): raise ValueError("ROI 范围无效")
         width=float(self.channel_width.value())
-        if width<=0: raise ValueError("框选区域实际高度必须大于 0 μm")
+        height=float(self.channel_height.value())
+        if width<=0 or height<=0: raise ValueError("生成区内宽 W 和芯片深度 H 必须大于 0 μm")
         sample_frames=self._channel_region_sample_count()
-        return {"enabled":self.roi_on.isChecked(),"x_start_ratio":coords[0],"y_start_ratio":coords[1],"x_end_ratio":coords[2],"y_end_ratio":coords[3],"user_defined":self._roi_user_modified,"wall_lines":[dict(line) for line in self._selected_wall_lines] if len(self._selected_wall_lines)==2 else [],"channel_region_enabled":self.channel_region_on.isChecked(),"channel_region_sample_frames":sample_frames,"channel_calibration_enabled":self.channel_cal_on.isChecked(),"channel_width_um":width}
+        existing=dict(self.app.frontend_config.get("recognition_roi",{}) or {})
+        previous=existing.get("previous_channel_width_um")
+        existing_current=float(existing.get("generation_channel_width_um",existing.get("channel_width_um",width)) or width)
+        if not math.isclose(existing_current,width,rel_tol=0.0,abs_tol=1e-9): previous=existing_current
+        payload={"enabled":self.roi_on.isChecked(),"x_start_ratio":coords[0],"y_start_ratio":coords[1],"x_end_ratio":coords[2],"y_end_ratio":coords[3],"user_defined":self._roi_user_modified,"wall_lines":[dict(line) for line in self._selected_wall_lines] if len(self._selected_wall_lines)==2 else [],"channel_region_enabled":self.channel_region_on.isChecked(),"channel_region_sample_frames":sample_frames,"channel_calibration_enabled":self.channel_cal_on.isChecked(),"channel_width_um":width,"generation_channel_height_um":height,"generation_channel_width_um":width,"generation_volume_correction":float(existing.get("generation_volume_correction",1.0) or 1.0)}
+        if previous not in (None,""): payload["previous_channel_width_um"]=float(previous)
+        return payload
 
     def _analyze_user_roi(self):
         if not self._last_test_preview_b64 or not self._roi_user_modified: return
@@ -761,7 +772,9 @@ class VideoPage(Page):
             self.roi.setText(",".join(f"{v:.2f}" for v in values)); self.roi_on.setChecked(True)
             try: sample_frames=self._channel_region_sample_count()
             except ValueError as exc: self.roi_status.setText(str(exc)); return
-            applied["channel_region_enabled"]=self.channel_region_on.isChecked(); applied["channel_region_sample_frames"]=sample_frames; applied["channel_calibration_enabled"]=self.channel_cal_on.isChecked(); applied["channel_width_um"]=float(self.channel_width.value()); applied["user_defined"]=False; self.app.save(recognition_roi=applied)
+            physical=self._roi_payload(); applied["channel_region_enabled"]=self.channel_region_on.isChecked(); applied["channel_region_sample_frames"]=sample_frames; applied["channel_calibration_enabled"]=self.channel_cal_on.isChecked(); applied["channel_width_um"]=physical["channel_width_um"]; applied["generation_channel_height_um"]=physical["generation_channel_height_um"]; applied["generation_channel_width_um"]=physical["generation_channel_width_um"]; applied["generation_volume_correction"]=physical["generation_volume_correction"]
+            if "previous_channel_width_um" in physical: applied["previous_channel_width_um"]=physical["previous_channel_width_um"]
+            applied["user_defined"]=False; self.app.save(recognition_roi=applied)
         if analysis.get("ok"):
             source="用户 ROI" if analysis.get("used_user_roi") else "自动 ROI"
             self.roi_status.setText(f"{source} 标定成功：框选高度 {float(analysis.get('channel_width_um')):.2f} μm / {float(analysis.get('channel_width_px')):.2f} px = {float(analysis.get('pixel_to_micron')):.6f} μm/px；共显示 {len(hough_lines)} 条候选线。单击候选线附近即可选择，橙色表示已选。")
@@ -854,12 +867,12 @@ class PlantCalibrationExperimentDialog(QDialog):
         self._running=False
         self._positioned=False
         self.setWindowModality(Qt.WindowModality.NonModal)
-        self.setWindowTitle("泵-芯片自动阶跃标定")
+        self.setWindowTitle("生成区体积与 Q1/Q2 动力学标定")
         self.setMinimumWidth(720)
         self.resize(780,760)
         layout=QVBoxLayout(self)
         note=QLabel(
-            "系统将在当前流量附近独占控制泵，依次执行 Q1、Q2 和联合正负小阶跃。"
+            "系统使用生成区等效直径，在当前流量附近独占控制泵，依次执行 Q1、Q2 和联合正负小阶跃。"
             "完成相机验证以及 Q1/Q2 写入回读后即可开始；视觉服务和安全运行环境会在后台自动准备。"
             "实验按有效过线液滴数量推进，不设置固定实验时长；连续没有有效液滴时仅由安全看门狗停机。"
             "PID、BO 和前馈不会参与。暂停会安全停泵并中止本次标定，不能从中间继续。"
@@ -886,14 +899,35 @@ class PlantCalibrationExperimentDialog(QDialog):
         self.q1_step=decimal(cfg.get("plant_calibration_q1_step",max(0.5,min(2.0,initial_q1*0.05))),0.01,1000.0,suffix=" μL/min")
         self.q2_step=decimal(cfg.get("plant_calibration_q2_step",max(0.2,min(1.0,initial_q2*0.05))),0.01,1000.0,suffix=" μL/min")
         self.repetitions=QSpinBox(); self.repetitions.setRange(1,5); self.repetitions.setValue(int(cfg.get("plant_calibration_repetitions",2)))
-        self.baseline_count=QSpinBox(); self.baseline_count.setRange(3,200); self.baseline_count.setValue(int(cfg.get("plant_calibration_baseline_samples",5)))
+        self.validation_repetitions=QSpinBox(); self.validation_repetitions.setRange(1,3); self.validation_repetitions.setValue(int(cfg.get("plant_calibration_validation_repetitions",1)))
+        self.baseline_count=QSpinBox(); self.baseline_count.setRange(3,200); self.baseline_count.setValue(int(cfg.get("plant_calibration_baseline_samples",30)))
         self.stable_count=QSpinBox(); self.stable_count.setRange(3,200); self.stable_count.setValue(int(cfg.get("plant_calibration_stable_samples",5)))
         self.response_limit=QSpinBox(); self.response_limit.setRange(5,1000); self.response_limit.setValue(int(cfg.get("plant_calibration_response_observation_limit",30)))
         self.liveness_timeout=decimal(cfg.get("plant_calibration_vision_liveness_timeout_s",120.0),15.0,3600.0,1," s")
         self.minimum_response=decimal(cfg.get("plant_calibration_minimum_response_um",0.5),0.05,100.0,3," μm")
         self.stability=decimal(cfg.get("plant_calibration_stability_tolerance_um",1.0),0.05,100.0,3," μm")
+        self.continuous_phase_oil=QLineEdit(str(cfg.get("continuous_phase_oil","fluorinated oil")))
+        self.surfactant_name=QLineEdit(str(cfg.get("surfactant_name","")))
+        self.surfactant_concentration=decimal(cfg.get("surfactant_concentration_percent",2.0),0.0,100.0,3," %")
+        self.surfactant_basis=QComboBox()
+        for label,value in (("质量分数 w/w","w/w"),("体积分数 v/v","v/v"),("质量/体积 w/v","w/v"),("未注明","unspecified")):
+            self.surfactant_basis.addItem(label,value)
+        saved_basis=str(cfg.get("surfactant_concentration_basis","unspecified"))
+        basis_index=self.surfactant_basis.findData(saved_basis)
+        self.surfactant_basis.setCurrentIndex(max(0,basis_index))
+        self.aqueous_phase=QLineEdit(str(cfg.get("aqueous_phase","water")))
+        self.temperature=decimal(cfg.get("calibration_temperature_c",25.0),-20.0,100.0,2," °C")
+        roi_cfg=dict(cfg.get("recognition_roi",{}) or {})
+        saved_channel_size=roi_cfg.get("channel_width_um",50.0)
+        self.channel_height=decimal(roi_cfg.get("generation_channel_height_um",saved_channel_size),0.01,100000.0,2," μm")
+        self.channel_width=decimal(roi_cfg.get("generation_channel_width_um",saved_channel_size),0.01,100000.0,2," μm")
+        self.volume_correction=decimal(roi_cfg.get("generation_volume_correction",1.0),0.1,10.0,4,"")
+        form.addRow("生成区通道高度 H",self.channel_height); form.addRow("生成区通道宽度 W",self.channel_width); form.addRow("体积修正系数 κV",self.volume_correction)
+        form.addRow("连续相氟化油型号",self.continuous_phase_oil); form.addRow("表面活性剂名称",self.surfactant_name)
+        form.addRow("表面活性剂浓度",self.surfactant_concentration); form.addRow("浓度计量方式",self.surfactant_basis)
+        form.addRow("水相组成",self.aqueous_phase); form.addRow("标定温度",self.temperature)
         form.addRow("Q1 阶跃幅值",self.q1_step); form.addRow("Q2 阶跃幅值",self.q2_step)
-        form.addRow("正负阶跃重复数",self.repetitions); form.addRow("基线有效液滴数",self.baseline_count); form.addRow("响应稳定有效液滴数",self.stable_count); form.addRow("单回合最少观察液滴数",self.response_limit)
+        form.addRow("建模正负阶跃重复数",self.repetitions); form.addRow("独立验证正负阶跃重复数",self.validation_repetitions); form.addRow("基线有效液滴数",self.baseline_count); form.addRow("响应稳定有效液滴数",self.stable_count); form.addRow("单回合最少观察液滴数",self.response_limit)
         form.addRow("无有效液滴安全停机",self.liveness_timeout); form.addRow("最小可信直径响应",self.minimum_response); form.addRow("稳定阈值下限（自动修正）",self.stability)
         self.stability.setToolTip("实际判定阈值还会根据像素分辨率和基线实测噪声自动提高")
         self.config_scroll=QScrollArea()
@@ -903,7 +937,7 @@ class PlantCalibrationExperimentDialog(QDialog):
         self.config_scroll.setWidget(config_box)
         self.config_scroll.setMinimumHeight(240)
         layout.addWidget(self.config_scroll,1)
-        self._config_widgets=[*self.metadata.values(),self.q1_step,self.q2_step,self.repetitions,self.baseline_count,self.stable_count,self.response_limit,self.liveness_timeout,self.minimum_response,self.stability]
+        self._config_widgets=[*self.metadata.values(),self.continuous_phase_oil,self.surfactant_name,self.surfactant_concentration,self.surfactant_basis,self.aqueous_phase,self.temperature,self.channel_height,self.channel_width,self.volume_correction,self.q1_step,self.q2_step,self.repetitions,self.validation_repetitions,self.baseline_count,self.stable_count,self.response_limit,self.liveness_timeout,self.minimum_response,self.stability]
 
         status_box=QGroupBox("标定运行状态"); status_layout=QVBoxLayout(status_box)
         self.baseline_label=QLabel("当前基准流量：等待读取已验证的 Q1/Q2")
@@ -944,7 +978,8 @@ class PlantCalibrationExperimentDialog(QDialog):
             pump=getattr(snapshot,"pump_state",None)
             q1=float(getattr(pump,"q1_actual",None) or getattr(config,"initial_q1",self.app.frontend_config.get("initial_q1",50.0)))
             q2=float(getattr(pump,"q2_actual",None) or getattr(config,"initial_q2",self.app.frontend_config.get("initial_q2",20.0)))
-            self.baseline_label.setText(f"当前基准流量：Q1={q1:.3f}、Q2={q2:.3f} μL/min；总试验数为 6 × 重复数。")
+            total_trials=6*int(self.repetitions.value())+2*int(self.validation_repetitions.value())
+            self.baseline_label.setText(f"当前基准流量：Q1={q1:.3f}、Q2={q2:.3f} μL/min；总试验数 {total_trials}，其中末尾为独立验证。")
             for key,edit in self.metadata.items():
                 if not edit.text().strip() and active.get(key):edit.setText(str(active[key]))
         except Exception as exc:
@@ -958,6 +993,16 @@ class PlantCalibrationExperimentDialog(QDialog):
             repetitions=int(self.repetitions.value()),baseline_sample_count=int(self.baseline_count.value()),stable_sample_count=int(self.stable_count.value()),response_observation_limit=int(self.response_limit.value()),
             maximum_step_duration_s=0.0,vision_liveness_timeout_s=float(self.liveness_timeout.value()),minimum_response_um=float(self.minimum_response.value()),
             stability_tolerance_um=float(self.stability.value()),
+            channel_height_um=float(self.channel_height.value()),
+            channel_width_um=float(self.channel_width.value()),
+            volume_correction_factor=float(self.volume_correction.value()),
+            continuous_phase_oil=self.continuous_phase_oil.text().strip(),
+            surfactant_name=self.surfactant_name.text().strip(),
+            surfactant_concentration_percent=float(self.surfactant_concentration.value()),
+            surfactant_concentration_basis=str(self.surfactant_basis.currentData()),
+            aqueous_phase=self.aqueous_phase.text().strip(),
+            temperature_c=float(self.temperature.value()),
+            validation_repetitions=int(self.validation_repetitions.value()),
         )
 
     def _start(self):
@@ -976,17 +1021,30 @@ class PlantCalibrationExperimentDialog(QDialog):
             self.app.error("无法开始自动标定",str(exc)); return
         answer=QMessageBox.warning(
             self,"确认自动阶跃标定",
-            f"将执行 {6*config.repetitions} 次有界阶跃，按有效过线液滴数量推进，不设固定实验时长。\n"
+            f"将执行 {6*config.repetitions+2*config.validation_repetitions} 次有界阶跃，其中最后 {2*config.validation_repetitions} 次仅用于独立验证。按有效过线液滴数量推进，不设固定实验时长。\n"
             "请确认芯片、管路和收集容器安全，且操作人员保持在设备旁。是否开始？",
             QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,QMessageBox.StandardButton.No,
         )
         if answer!=QMessageBox.StandardButton.Yes:return
+        recognition_roi=dict(self.app.frontend_config.get("recognition_roi",{}) or {})
+        recognition_roi.update({
+            "channel_width_um":config.channel_width_um,
+            "generation_channel_height_um":config.channel_height_um,
+            "generation_channel_width_um":config.channel_width_um,
+            "generation_volume_correction":config.volume_correction_factor,
+            "flow_direction":"negative",
+        })
         self.app.save(
             **{key:edit.text().strip() for key,edit in self.metadata.items()},
             plant_calibration_q1_step=config.q1_step,plant_calibration_q2_step=config.q2_step,
             plant_calibration_repetitions=config.repetitions,plant_calibration_baseline_samples=config.baseline_sample_count,
+            plant_calibration_validation_repetitions=config.validation_repetitions,
             plant_calibration_stable_samples=config.stable_sample_count,plant_calibration_response_observation_limit=config.response_observation_limit,plant_calibration_vision_liveness_timeout_s=config.vision_liveness_timeout_s,
             plant_calibration_minimum_response_um=config.minimum_response_um,plant_calibration_stability_tolerance_um=config.stability_tolerance_um,
+            continuous_phase_oil=config.continuous_phase_oil,surfactant_name=config.surfactant_name,
+            surfactant_concentration_percent=config.surfactant_concentration_percent,surfactant_concentration_basis=config.surfactant_concentration_basis,
+            aqueous_phase=config.aqueous_phase,calibration_temperature_c=config.temperature_c,
+            recognition_roi=recognition_roi,
         )
         self.result=None; self._running=True; self.refresh_status()
         self.app.task(
@@ -1000,6 +1058,13 @@ class PlantCalibrationExperimentDialog(QDialog):
         state=str(getattr(getattr(snapshot,"system_state",None),"value",getattr(snapshot,"system_state",""))).upper()
         if state!="INITIALIZED":
             self.app.configure_prepare_initialize()
+        configure_generation=getattr(self.app.orchestrator,"configure_generation_measurement",None)
+        if callable(configure_generation) and hasattr(config,"channel_height_um"):
+            configure_generation(
+                channel_height_um=config.channel_height_um,
+                channel_width_um=config.channel_width_um,
+                volume_correction_factor=config.volume_correction_factor,
+            )
         return self.app.orchestrator.run_plant_calibration_experiment(config)
 
     def _completed(self,result):
@@ -1012,7 +1077,10 @@ class PlantCalibrationExperimentDialog(QDialog):
             self,"自动标定完成",
             f"已完成 {len(result.measurements)} 次阶跃，泵已安全停止。\n"
             f"响应延迟：{result.record.response_delay_median_ms:.1f} ± {result.record.response_delay_uncertainty_ms:.1f} ms\n"
-            f"直径灵敏度：{result.record.diameter_sensitivity_um_per_output:.6f} μm/输出量\n"
+            f"Q1/Q2 对数直径灵敏度：{result.record.q1_log_diameter_sensitivity:.6f} / {result.record.q2_log_diameter_sensitivity:.6f}\n"
+            f"FOPDT：τ={result.record.response_time_constant_ms:.1f} ms，拟合 MAE={result.record.model_fit_mae_um:.3f} μm，NRMSE={result.record.model_fit_nrmse:.3f}\n"
+            f"独立验证：MAE={result.record.validation_mae_um:.3f} μm，NRMSE={result.record.validation_nrmse:.3f}；PI {'已授权' if result.record.validated_for_pi else '未授权'}，MPC {'数据合格' if result.record.validated_for_mpc else '数据不足'}\n"
+            f"PI：Kp={result.record.controller_kp:.6f}，Ki={result.record.controller_ki:.6f}，Kd=0\n"
             f"通道结论：{channel_status}\n"
             f"局部有效流量：Q1 {result.record.q1_min:.3f}–{result.record.q1_max:.3f}，Q2 {result.record.q2_min:.3f}–{result.record.q2_max:.3f} μL/min",
         )
@@ -1057,7 +1125,7 @@ class PlantCalibrationExperimentDialog(QDialog):
         QMessageBox.information(
             self,"标定文件已保存",
             f"可加载标定：\n{saved['path']}\n\n原始阶跃测量：\n{saved['measurements_path']}\n\n"
-            "请点击“初始化”重新加载该标定；它不会自动打开前馈授权。",
+            "请点击“初始化”重新加载。只有通过独立验证且显示 PI 已授权的记录才能启动实时闭环；MPC 数据合格状态仅供后续模型使用。",
         )
 
     def refresh_status(self):
@@ -1243,7 +1311,7 @@ class InitPage(Page):
         calibration=dict(cfg.get("calibration",{}) or {})
         channel_cal=bool(roi.get("channel_calibration_enabled",False))
         if calibration:self.roi_card.set_status("ok","配置可用",f"{roi_state} · 已保存版本化像素标定")
-        elif channel_cal:self.roi_card.set_status("warning","待初始化检定",f"{roi_state} · 配置的已知管宽 {float(roi.get('channel_width_um',430.0)):g} μm 尚未实际检定")
+        elif channel_cal:self.roi_card.set_status("warning","待初始化检定",f"{roi_state} · 配置的生成区管宽 {float(roi.get('channel_width_um',50.0)):g} μm 尚未实际检定")
         else:self.roi_card.set_status("warning","仅保存配置",f"{roi_state} · 闭环前需要版本化标定")
         port=str(cfg.get("pump_port","") or "").strip().upper()
         pump_verified=bool(verification.get("pump",False))
@@ -1304,8 +1372,8 @@ class DropletGalleryDialog(QDialog):
         summary = QLabel(
             f"控制周期：{period_id or '--'}    采样识别帧：{len(frames)}    "
             f"不同有效液滴轨迹：{unique_droplet_count}\n"
-            "绿色圆圈表示该帧有效液滴，橙色圆圈表示该帧同时穿过计数线，"
-            "圆心白色数字为识别直径（μm），蓝色细线为计数线。"
+            "绿色矩形表示生成区内已配对的完整塞状液滴，橙色矩形表示该帧同时穿过计数线，"
+            "蓝色细线为计数线；帧号、轨迹 ID 和直径信息统一显示在图像下方。"
             + (f"\n说明：{reason}" if reason and reason != "ok" else "")
         )
         summary.setWordWrap(True)
@@ -1343,11 +1411,32 @@ class DropletGalleryDialog(QDialog):
             average = item.get("average_diameter_um")
             average_text = "--" if average is None else f"{float(average):.2f} μm"
             track_ids = ", ".join(str(value) for value in item.get("valid_track_ids", []) or []) or "无"
+            timestamp = float(item.get("timestamp", 0.0) or 0.0)
+            image_width = int(item.get("width", 0) or 0)
+            image_height = int(item.get("height", 0) or 0)
+            droplet_details = []
+            for droplet in item.get("valid_droplets", []) or []:
+                track_id = int(droplet.get("track_id", 0) or 0)
+                diameter_um = float(droplet.get("diameter_um", 0.0) or 0.0)
+                state = "穿线" if track_id in set(item.get("crossed_track_ids", []) or []) else "识别"
+                plug_length = droplet.get("plug_length_um")
+                length_text = (
+                    f"，塞长 {float(plug_length):.2f} μm"
+                    if plug_length is not None
+                    else ""
+                )
+                droplet_details.append(
+                    f"ID {track_id}：等效直径 {diameter_um:.2f} μm{length_text}（{state}）"
+                )
+            droplet_text = "；".join(droplet_details) or "无"
             detail = QLabel(
+                f"帧号：{frame_id}    时间戳：{timestamp:.3f} s    "
+                f"图像：{image_width}×{image_height} px\n"
                 f"有效液滴：{valid_count}    本帧穿线：{crossed_count}    "
-                f"平均直径：{average_text}\n有效轨迹 ID：{track_ids}"
+                f"平均直径：{average_text}    有效轨迹 ID：{track_ids}\n"
+                f"液滴明细：{droplet_text}"
             )
-            detail.setAlignment(Qt.AlignCenter)
+            detail.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
             detail.setWordWrap(True)
             card_layout.addWidget(image_label)
             card_layout.addWidget(detail)
@@ -2038,7 +2127,7 @@ class MonitorPage(Page):
             f"自适应状态：{adaptive_status}",
             f"自适应说明：{getattr(ctrl,'adaptive_reason','') or '无'}",
             f"Kp / Ki / Kd：{number(getattr(ctrl,'kp',None),6)} / {number(getattr(ctrl,'ki',None),6)} / {number(getattr(ctrl,'kd',None),6)}",
-            f"Q1/Q2 调节倍率：{number(getattr(ctrl,'q1_output_gain',None),2)} : {number(getattr(ctrl,'q2_output_gain',None),2)}",
+            f"Q1/Q2 当前灵敏度分配系数：{number(getattr(ctrl,'q1_output_gain',None),2)} / {number(getattr(ctrl,'q2_output_gain',None),2)}",
             f"请求/实际分配输出：{number(getattr(ctrl,'requested_output',None),4)} / {number(getattr(ctrl,'realized_output',None),4)}",
             f"BO/PID 工作点 Q1/Q2：{number(getattr(ctrl,'operating_point_q1',None))} / {number(getattr(ctrl,'operating_point_q2',None))} μL/min",
             f"前馈状态：{yes(getattr(ctrl,'feedforward_active',False))}；{getattr(ctrl,'feedforward_reason','') or '无'}",
@@ -2146,7 +2235,10 @@ class TuningPage(Page):
         super().__init__(app)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 12, 16, 12)
-        layout.addWidget(app.title("液滴识别算法调参", "使用本地样本调参；保存后立即应用到实时采样识别，不修改泵机或 PID"))
+        layout.addWidget(app.title(
+            "生成区液滴识别算法调参",
+            "用生成区样本调节中心采样带、弯月面阈值与塞状液滴配对；保存后立即应用，不修改泵机或 PID",
+        ))
         tuning_sample = str(app.frontend_config.get("tuning_sample", ""))
         if not tuning_sample:
             video = str(app.frontend_config.get("video_source", ""))
@@ -2157,8 +2249,27 @@ class TuningPage(Page):
             app.save_tuning_sample,
             settings_store=app.vision_tuning_settings_store,
             on_parameters_saved=app.apply_vision_tuning,
+            pixel_to_micron=float(app.frontend_config.get("pixel_to_micron", 1.0) or 1.0),
         )
         layout.addWidget(self.workbench, 1)
+
+    def on_show(self):
+        self.workbench.set_pixel_to_micron(
+            float(self.app.frontend_config.get("pixel_to_micron", 1.0) or 1.0)
+        )
+        roi = dict(self.app.frontend_config.get("recognition_roi", {}) or {})
+        saved_channel_size = float(roi.get("channel_width_um", 50.0) or 50.0)
+        self.workbench.set_generation_geometry(
+            channel_height_um=float(
+                roi.get("generation_channel_height_um", saved_channel_size)
+                or saved_channel_size
+            ),
+            channel_width_um=float(
+                roi.get("generation_channel_width_um", saved_channel_size)
+                or saved_channel_size
+            ),
+            volume_correction=float(roi.get("generation_volume_correction", 1.0) or 1.0),
+        )
 
 
 class FrontendApp(QMainWindow):
@@ -2269,10 +2380,9 @@ class FrontendApp(QMainWindow):
         initialized=state in {"INITIALIZED","CALIBRATING","OPTIMIZING","STABILIZING","RUNNING","PAUSED","STOPPING","STOPPED"}
         verification=dict(getattr(self,"device_verification",{}) or {})
         calibration_ready=bool(verification.get("camera",False) and verification.get("pump_write",False))
-        monitor_available=initialized or state=="ERROR" or calibration_ready
         running=state in {"CALIBRATING","OPTIMIZING","STABILIZING","RUNNING","PAUSED"}
-        status_map={"parameter":"complete" if base else "active","video":"complete" if video else ("active" if base else "locked"),"pump":"complete" if pump else ("active" if video else "locked"),"init":"error" if state=="ERROR" else ("complete" if initialized else ("active" if video and pump else "locked")),"monitor":"error" if state=="ERROR" else ("active" if running or calibration_ready else ("complete" if state=="STOPPED" else ("locked" if not initialized else "active"))),"status":"error" if state=="ERROR" else "","tuning":""}
-        enabled={"parameter":True,"video":base,"pump":video,"init":video and pump,"monitor":monitor_available,"status":True,"tuning":True}
+        status_map={"parameter":"complete" if base else "active","video":"complete" if video else ("active" if base else "locked"),"pump":"complete" if pump else ("active" if video else "locked"),"init":"error" if state=="ERROR" else ("complete" if initialized else ("active" if video and pump else "locked")),"monitor":"error" if state=="ERROR" else ("active" if running or calibration_ready else ("complete" if state=="STOPPED" else "")),"status":"error" if state=="ERROR" else "","tuning":""}
+        enabled={"parameter":True,"video":base,"pump":video,"init":video and pump,"monitor":True,"status":True,"tuning":True}
         for key,item in self._nav_items.items():
             item.setData(Qt.UserRole+3,status_map[key])
             item.setFlags((Qt.ItemIsSelectable|Qt.ItemIsEnabled) if enabled[key] else Qt.NoItemFlags)

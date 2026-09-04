@@ -36,7 +36,7 @@ class FiveFrameMotionTests(unittest.TestCase):
 
         self.assertEqual(service._speed_sample_count, 1)
         self.assertAlmostEqual(service._average_droplet_speed_um_s or 0.0, 200.0)
-        self.assertAlmostEqual(service._droplet_generation_rate_hz, 2.0)
+        self.assertAlmostEqual(service._droplet_generation_rate_hz, 50.0)
 
     def test_frame_gap_restarts_the_five_frame_window(self) -> None:
         service = PipelineVisionService.__new__(PipelineVisionService)

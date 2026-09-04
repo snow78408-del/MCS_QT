@@ -104,6 +104,8 @@ class VisionPipeline:
                 debug_image=np.empty((0, 0, 3), dtype=np.uint8),
                 helper_mask=np.zeros(gray.shape[:2], dtype=np.uint8),
                 diameter_valid=[],
+                plug_lengths_px=[],
+                equivalent_diameters_px=[],
             )
         else:
             detections = self.detector.detect(gray)
@@ -295,5 +297,13 @@ class VisionPipeline:
             track.metadata["diameter_valid"] = 1.0 if diameter_valid else 0.0
             if diameter_valid:
                 track.metadata["observed_radius"] = float(detections.radii[detection_index])
+                if detection_index < len(detections.plug_lengths_px):
+                    track.metadata["plug_length_px"] = float(
+                        detections.plug_lengths_px[detection_index]
+                    )
+                if detection_index < len(detections.equivalent_diameters_px):
+                    track.metadata["equivalent_diameter_px"] = float(
+                        detections.equivalent_diameters_px[detection_index]
+                    )
             else:
                 track.metadata.pop("observed_radius", None)

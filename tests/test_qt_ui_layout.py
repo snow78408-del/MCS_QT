@@ -5,11 +5,13 @@ from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QDoubleSpinBox, QLabel, QSpinBox
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QApplication, QDoubleSpinBox, QLabel, QListWidgetItem, QSpinBox
 
 from backend.orchestrator.state import SystemState
 from frontend.qt_app import (
     CollapsibleSection,
+    FrontendApp,
     InitPage,
     MonitorPage,
     ParameterPage,
@@ -42,6 +44,9 @@ class _PageApp:
 
     def show_page(self, key):
         self.shown = key
+
+    def refresh_navigation(self, _snapshot=None):
+        pass
 
     @staticmethod
     def error(_title, message):
@@ -110,6 +115,47 @@ def test_monitor_page_owns_plant_calibration_entry() -> None:
     assert monitor_page.plant_calibration_button.text()=="打开标定窗口"
     assert "视频" in monitor_page.plant_calibration_summary.text()
     pump_page.close(); monitor_page.close()
+
+
+def test_monitor_navigation_is_available_before_initialization() -> None:
+    _application()
+    item = QListWidgetItem("运行监控")
+    item.setData(Qt.UserRole + 1, "运行监控")
+    item.setData(Qt.UserRole + 2, 5)
+    holder = SimpleNamespace(
+        frontend_config={},
+        device_verification={"camera": False, "pump": False, "pump_write": False},
+        _nav_items={"monitor": item},
+        _nav_collapsed=False,
+    )
+    holder._navigation_label = lambda key, label, step: FrontendApp._navigation_label(
+        holder, key, label, step
+    )
+
+    FrontendApp.refresh_navigation(holder)
+
+    assert item.flags() & Qt.ItemIsEnabled
+    assert item.flags() & Qt.ItemIsSelectable
+    assert item.data(Qt.UserRole + 3) != "locked"
+
+
+def test_monitor_page_keeps_pid_start_disabled_before_initialization() -> None:
+    _application()
+    page = MonitorPage(_PageApp())
+    snapshot = SimpleNamespace(
+        system_state=SystemState.IDLE,
+        config=None,
+        plant_calibration_experiment={},
+        optimization={},
+        disturbance_model={},
+    )
+
+    page._update_operation_matrix(snapshot)
+
+    assert page.action_buttons["初始化"].isEnabled()
+    assert not page.action_buttons["开始"].isEnabled()
+    assert not page.pause_button.isEnabled()
+    page.close()
 
 
 def test_pump_write_readback_is_required_and_invalidated_by_flow_change() -> None:
@@ -225,6 +271,32 @@ def test_video_page_hides_camera_transport_fields_for_local_video() -> None:
     assert not page.devices.isVisible()
     assert not page.scan_button.isVisible()
     assert page.browse_button.isVisible()
+    page.close()
+
+
+def test_video_page_keeps_visible_width_and_chip_depth_independent() -> None:
+    _application()
+    page = VideoPage(
+        _PageApp(
+            {
+                "recognition_roi": {
+                    "channel_width_um": 60.0,
+                    "generation_volume_correction": 1.07,
+                }
+            }
+        )
+    )
+
+    assert page.channel_width.value() == 60.0
+    page.channel_width.setValue(70.0)
+    page.channel_height.setValue(45.0)
+    roi = page._roi_payload()
+
+    assert roi["channel_width_um"] == 70.0
+    assert roi["generation_channel_height_um"] == 45.0
+    assert roi["generation_channel_width_um"] == 70.0
+    assert roi["generation_volume_correction"] == 1.07
+    assert roi["previous_channel_width_um"] == 60.0
     page.close()
 
 

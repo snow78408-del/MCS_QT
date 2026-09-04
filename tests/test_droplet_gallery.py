@@ -59,6 +59,7 @@ def test_gallery_publishes_crossing_evidence_when_period_completes():
     assert frame["valid_droplet_count"] == 1
     assert frame["crossed_droplet_count"] == 1
     assert frame["valid_track_ids"] == [7]
+    assert frame["crossed_track_ids"] == [7]
     assert frame["average_diameter_um"] == 48.0
     assert frame["valid_droplets"] == [
         {

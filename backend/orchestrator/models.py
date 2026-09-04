@@ -139,6 +139,10 @@ class RecognitionSnapshot:
     filtering_rule: str = "none"
     calibration_id: str = ""
     calibration_uncertainty_um_per_px: float | None = None
+    measurement_region: str = "generation"
+    generation_channel_height_um: float = 50.0
+    generation_channel_width_um: float = 50.0
+    generation_volume_correction: float = 1.0
 
 
 @dataclass(slots=True)

@@ -19,6 +19,8 @@ class DetectionResult:
     debug_image: np.ndarray
     helper_mask: np.ndarray
     diameter_valid: List[bool] = field(default_factory=list)
+    plug_lengths_px: List[float] = field(default_factory=list)
+    equivalent_diameters_px: List[float] = field(default_factory=list)
 
 
 class DropletDetector:
@@ -37,10 +39,14 @@ class DropletDetector:
             else float(np.sqrt(self._runtime_min_radius * self._runtime_max_radius))
         )
         self._configured_preferred_radius = float(self._runtime_preferred_radius)
+        self._pixel_to_micron = 1.0
 
     def configure_expected_diameter(self, diameter_um: float, pixel_to_micron: float) -> None:
-        """Keep the legacy hook without leaking the PID target into detection."""
-        _ = (diameter_um, pixel_to_micron)
+        """Configure physical scale without leaking the PID target into detection."""
+        _ = diameter_um
+        scale = float(pixel_to_micron)
+        if np.isfinite(scale) and scale > 0.0:
+            self._pixel_to_micron = scale
 
     def reset_adaptive_size(self) -> None:
         self._runtime_preferred_radius = float(self._configured_preferred_radius)
@@ -66,8 +72,10 @@ class DropletDetector:
         return preferred
 
     def detect(self, frame: np.ndarray, mode: Optional[str] = None) -> DetectionResult:
-        _ = mode
         gray = self._ensure_gray(frame)
+        selected_mode = str(mode or self._config.measurement_mode).strip().lower()
+        if selected_mode == "generation_plug":
+            return self._detect_generation_plugs(gray)
         corrected = self._preprocess(gray)
         centers, radii = self._detect_hough_candidates(corrected)
         diameter_valid = [
@@ -81,6 +89,292 @@ class DropletDetector:
             helper_mask=self._build_bead_helper_mask(gray),
             diameter_valid=diameter_valid,
         )
+
+    def _detect_generation_plugs(
+        self,
+        gray: np.ndarray,
+        trace: dict[str, object] | None = None,
+    ) -> DetectionResult:
+        """Measure detached C-regime plugs from paired menisci.
+
+        The rectified channel is reduced to a robust one-dimensional centre
+        profile.  Adjacent, strong meniscus peaks are paired only when their
+        separation is compatible with a detached plug.  Each accepted length
+        is converted to volume using the square-channel formula from
+        van Steijn et al. (Scientific Reports, 2017), then reported as an
+        equivalent-sphere diameter so the existing controller keeps one clear
+        physical setpoint.
+        """
+        height, width = gray.shape[:2]
+        flow_axis = "x" if width >= height else "y"
+        working = gray if flow_axis == "x" else gray.T
+        cross_size, axial_size = working.shape
+        band_ratio = min(0.90, max(0.20, float(self._config.generation_center_band_ratio)))
+        band_size = max(3, int(round(cross_size * band_ratio)))
+        band_start = max(0, (cross_size - band_size) // 2)
+        band = working[band_start : band_start + band_size]
+        corrected = self._preprocess(working)
+        corrected_band = corrected[band_start : band_start + band_size]
+        profile = np.median(corrected_band.astype(np.float32), axis=0)
+        profile = cv2.GaussianBlur(profile.reshape(1, -1), (0, 0), 1.2).reshape(-1)
+        gradient = np.abs(np.gradient(profile))
+        median_energy = float(np.median(gradient))
+        mad = float(np.median(np.abs(gradient - median_energy)))
+        robust_sigma = max(0.25, 1.4826 * mad)
+        threshold = median_energy + float(self._config.generation_edge_mad_multiplier) * robust_sigma
+        corrected_float = corrected.astype(np.float32)
+        edge_2d = np.abs(np.gradient(corrected_float, axis=1))
+
+        scale = max(1e-9, float(self._pixel_to_micron))
+        channel_h_px = float(self._config.generation_channel_height_um) / scale
+        channel_w_px = float(self._config.generation_channel_width_um) / scale
+        reference_width_px = max(2.0, min(channel_h_px, channel_w_px))
+        min_peak_gap = max(
+            2,
+            int(round(reference_width_px * float(self._config.generation_min_edge_separation_ratio))),
+        )
+        peak_indices = self._local_profile_peaks(gradient, threshold, min_peak_gap)
+        min_length = reference_width_px * float(self._config.generation_min_length_ratio)
+        max_length = reference_width_px * float(self._config.generation_max_length_ratio)
+        profile_sigma = max(1.0, float(np.std(profile)))
+        transverse_gradient = np.abs(np.gradient(corrected_float, axis=0))
+        transverse_margin = max(
+            2,
+            min(
+                max(1, cross_size // 4),
+                max(
+                    int(round(reference_width_px * 0.08)),
+                    int(round(cross_size * 0.12)),
+                ),
+            ),
+        )
+        transverse_inner = transverse_gradient[
+            transverse_margin : max(transverse_margin + 1, cross_size - transverse_margin)
+        ]
+        transverse_threshold = max(
+            1.0,
+            float(np.percentile(transverse_inner, 80.0)),
+        )
+        minimum_outline_ratio = min(
+            1.0,
+            max(0.0, float(self._config.generation_min_capsule_outline_ratio)),
+        )
+
+        candidates: list[tuple[float, int, int, float, float]] = []
+        for left, right in zip(peak_indices, peak_indices[1:]):
+            length_px = float(right - left)
+            if length_px < min_length or length_px > max_length:
+                continue
+            pad = max(2, int(round(reference_width_px * 0.20)))
+            inside = profile[left + 1 : right]
+            outside_parts = []
+            if left - pad >= 0:
+                outside_parts.append(profile[left - pad : left])
+            if right + pad <= axial_size:
+                outside_parts.append(profile[right : right + pad])
+            if inside.size < 3 or not outside_parts:
+                continue
+            outside = np.concatenate(outside_parts)
+            signed_contrast = float(np.median(inside)) - float(np.median(outside))
+            polarity = str(self._config.generation_polarity).strip().lower()
+            contrast = abs(signed_contrast)
+            threshold_contrast = (
+                float(self._config.generation_min_profile_contrast_sigma) * profile_sigma
+            )
+            polarity_valid = (
+                signed_contrast >= threshold_contrast
+                if polarity == "brighter"
+                else signed_contrast <= -threshold_contrast
+                if polarity == "darker"
+                else contrast >= threshold_contrast
+            )
+            outline_support = self._capsule_outline_support(
+                transverse_gradient,
+                left=left,
+                right=right,
+                row_margin=transverse_margin,
+                edge_threshold=transverse_threshold,
+                reference_width_px=reference_width_px,
+            )
+            if outline_support < minimum_outline_ratio:
+                continue
+            # Phase-contrast halos can reverse or flatten the median intensity
+            # inside a complete capsule, so polarity is a score preference and
+            # never a substitute for the required two-dimensional outline.
+            appearance_score = contrast if polarity_valid else 0.0
+            support_values: list[float] = []
+            for edge_index in (left, right):
+                edge_start = max(0, edge_index - 2)
+                edge_stop = min(axial_size, edge_index + 3)
+                local_edge = np.max(edge_2d[:, edge_start:edge_stop], axis=1)
+                support_values.append(
+                    float(np.count_nonzero(local_edge >= threshold * 0.50))
+                    / float(max(1, cross_size))
+                )
+            if min(support_values) < float(
+                self._config.generation_min_meniscus_support_ratio
+            ):
+                continue
+            edge_score = float(gradient[left] + gradient[right])
+            candidates.append(
+                (
+                    edge_score
+                    + appearance_score
+                    + outline_support * transverse_threshold,
+                    left,
+                    right,
+                    length_px,
+                    outline_support,
+                )
+            )
+
+        # Intervals share a meniscus when the bright/dark phase assignment is
+        # ambiguous.  Keep the stronger non-overlapping interval.
+        selected: list[tuple[int, int, float]] = []
+        selected_outline_support: list[float] = []
+        occupied: set[int] = set()
+        for _score, left, right, length_px, outline_support in sorted(candidates, reverse=True):
+            if left in occupied or right in occupied:
+                continue
+            occupied.update((left, right))
+            selected.append((left, right, length_px))
+            selected_outline_support.append(outline_support)
+        selected_with_support = sorted(
+            zip(selected, selected_outline_support),
+            key=lambda item: item[0][0],
+        )
+        selected = [item for item, _support in selected_with_support]
+        selected_outline_support = [support for _item, support in selected_with_support]
+
+        if trace is not None:
+            trace.update(
+                {
+                    "flow_axis": flow_axis,
+                    "working": working,
+                    "corrected": corrected,
+                    "band_start": band_start,
+                    "band_size": band_size,
+                    "profile": profile,
+                    "gradient": gradient,
+                    "gradient_threshold": threshold,
+                    "peak_indices": peak_indices,
+                    "selected_intervals": list(selected),
+                    "reference_width_px": reference_width_px,
+                    "minimum_length_px": min_length,
+                    "maximum_length_px": max_length,
+                    "transverse_gradient": transverse_gradient,
+                    "transverse_gradient_threshold": transverse_threshold,
+                    "selected_outline_support": selected_outline_support,
+                }
+            )
+
+        centers: list[np.ndarray] = []
+        radii: list[float] = []
+        lengths: list[float] = []
+        diameters: list[float] = []
+        valid: list[bool] = []
+        for left, right, length_px in selected:
+            equivalent_px = self._plug_equivalent_diameter_px(
+                length_px,
+                channel_h_px,
+                channel_w_px,
+            )
+            if equivalent_px is None:
+                continue
+            axial_center = (float(left) + float(right)) * 0.5
+            center = (
+                np.asarray((axial_center, cross_size * 0.5), dtype=np.float32)
+                if flow_axis == "x"
+                else np.asarray((cross_size * 0.5, axial_center), dtype=np.float32)
+            )
+            full = left > 0 and right < axial_size - 1
+            centers.append(center)
+            radii.append(equivalent_px * 0.5)
+            lengths.append(length_px)
+            diameters.append(equivalent_px)
+            valid.append(full)
+
+        helper = self._build_bead_helper_mask(gray)
+        return DetectionResult(
+            centers=centers,
+            radii=radii,
+            debug_image=np.empty((0, 0, 3), dtype=np.uint8),
+            helper_mask=helper,
+            diameter_valid=valid,
+            plug_lengths_px=lengths,
+            equivalent_diameters_px=diameters,
+        )
+
+    @staticmethod
+    def _capsule_outline_support(
+        transverse_gradient: np.ndarray,
+        *,
+        left: int,
+        right: int,
+        row_margin: int,
+        edge_threshold: float,
+        reference_width_px: float,
+    ) -> float:
+        """Return axial coverage having separated upper/lower capsule edges."""
+        height, width = transverse_gradient.shape[:2]
+        trim = max(1, int(round(reference_width_px * 0.08)))
+        start = max(0, int(left) + trim)
+        stop = min(width, int(right) - trim)
+        row_start = max(0, int(row_margin))
+        row_stop = min(height, height - int(row_margin))
+        if stop <= start or row_stop - row_start < 3:
+            return 0.0
+
+        minimum_separation = max(2, int(round(reference_width_px * 0.18)))
+        maximum_separation = max(
+            minimum_separation,
+            int(round(reference_width_px * 1.25)),
+        )
+        supported = 0
+        for column in range(start, stop):
+            edge_rows = np.flatnonzero(
+                transverse_gradient[row_start:row_stop, column] >= float(edge_threshold)
+            )
+            if edge_rows.size < 2:
+                continue
+            separation = int(edge_rows[-1] - edge_rows[0])
+            if minimum_separation <= separation <= maximum_separation:
+                supported += 1
+        return float(supported) / float(max(1, stop - start))
+
+    @staticmethod
+    def _local_profile_peaks(values: np.ndarray, threshold: float, minimum_gap: int) -> list[int]:
+        raw = [
+            index
+            for index in range(1, max(1, len(values) - 1))
+            if float(values[index]) >= float(threshold)
+            and float(values[index]) >= float(values[index - 1])
+            and float(values[index]) >= float(values[index + 1])
+        ]
+        selected: list[int] = []
+        for index in sorted(raw, key=lambda item: float(values[item]), reverse=True):
+            if all(abs(index - previous) >= int(minimum_gap) for previous in selected):
+                selected.append(index)
+        return sorted(selected)
+
+    def _plug_equivalent_diameter_px(
+        self,
+        length_px: float,
+        height_px: float,
+        width_px: float,
+    ) -> float | None:
+        if min(length_px, height_px, width_px) <= 0.0:
+            return None
+        inverse_sum = (2.0 / height_px) + (2.0 / width_px)
+        effective_area = height_px * width_px - (4.0 - np.pi) * inverse_sum ** -2
+        volume_px3 = (
+            float(self._config.generation_volume_correction)
+            * effective_area
+            * (length_px - width_px / 3.0)
+        )
+        if not np.isfinite(volume_px3) or volume_px3 <= 0.0:
+            return None
+        return float(np.cbrt(6.0 * volume_px3 / np.pi))
 
     def _ensure_gray(self, frame: np.ndarray) -> np.ndarray:
         if frame is None or getattr(frame, "size", 0) == 0:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +16,7 @@ from backend.pid_control import (
     PlantCalibrationObservation,
     build_plant_calibration_result,
     identify_channel_sensitivities,
+    identify_channel_log_sensitivities,
     save_plant_calibration_result,
 )
 from backend.pid_control.calibration import load_plant_calibration
@@ -49,10 +51,11 @@ def _measurement(
     q1_change = direction * 2.0 if channel == "q1" else 0.0
     q2_change = direction * 1.0 if channel == "q2" else 0.0
     actuator_step = None
-    if channel == "combined":
-        q1_change = -direction * 2.0
-        q2_change = direction * 1.0
-        actuator_step = float(direction)
+    if channel in {"combined", "validation"}:
+        fraction = 1.0 if channel == "combined" else 0.6
+        q1_change = -direction * 2.0 * fraction
+        q2_change = direction * 1.0 * fraction
+        actuator_step = float(direction) * fraction
     command_started = 10.0
     return PlantCalibrationMeasurement(
         trial_id=trial_id,
@@ -129,8 +132,16 @@ def test_step_measurements_identify_channel_signs_and_combined_gain() -> None:
     assert q2_sensitivity == pytest.approx(1.5)
     assert result.record.q1_control_sign == -1.0
     assert result.record.q2_control_sign == 1.0
-    assert result.record.q1_output_gain == pytest.approx(2.0)
-    assert result.record.q2_output_gain == pytest.approx(1.0)
+    log_q1,log_q2=identify_channel_log_sensitivities(measurements)
+    assert result.record.schema_version == 3
+    assert result.record.measurement_region == "generation"
+    assert result.record.q1_log_diameter_sensitivity == pytest.approx(log_q1)
+    assert result.record.q2_log_diameter_sensitivity == pytest.approx(log_q2)
+    assert result.record.q1_output_gain > 0.0
+    assert result.record.q2_output_gain > 0.0
+    assert result.record.q1_output_gain / result.record.q2_output_gain != pytest.approx(2.0)
+    assert result.record.controller_kp > 0.0
+    assert result.record.controller_ki >= 0.0
     assert result.record.diameter_sensitivity_um_per_output == pytest.approx(3.5)
     assert result.record.response_delay_median_ms > 0.0
     assert result.record.response_delay_uncertainty_ms >= 0.0
@@ -139,6 +150,71 @@ def test_step_measurements_identify_channel_signs_and_combined_gain() -> None:
     assert result.record.q2_min == pytest.approx(19.0)
     assert result.record.q2_max == pytest.approx(21.0)
     assert result.record.total_flow_max == pytest.approx(72.0)
+
+
+def test_full_response_fit_and_independent_validation_authorize_predictive_model() -> None:
+    time_constant_ms = 1000.0
+
+    def with_curve(item: PlantCalibrationMeasurement) -> PlantCalibrationMeasurement:
+        observations = []
+        for index, elapsed_ms in enumerate((200.0, 700.0, 1200.0, 1600.0, 2200.0, 3200.0, 4500.0), start=1):
+            active_ms = max(0.0, elapsed_ms - float(item.response_delay_ms))
+            fraction = 1.0 - math.exp(-active_ms / time_constant_ms)
+            observations.append(
+                PlantCalibrationObservation(
+                    frame_id=index,
+                    capture_monotonic=item.command_started_monotonic + elapsed_ms / 1000.0,
+                    observed_monotonic=item.command_started_monotonic + elapsed_ms / 1000.0,
+                    diameter_um=item.baseline_diameter_um + item.diameter_change_um * fraction,
+                    droplet_count=1,
+                    droplet_id=index,
+                    generation_frequency_hz=25.0,
+                    diameter_cv=0.02,
+                )
+            )
+        return replace(item, response_observations=tuple(observations))
+
+    measurements = [
+        with_curve(item) if item.channel == "combined" else item
+        for item in _measurements()
+    ]
+    for direction in (1, -1):
+        validation = _measurement(
+            f"validation-{direction}",
+            "validation",
+            direction,
+            direction * 2.1,
+            delay_ms=1260.0,
+        )
+        measurements.append(with_curve(validation))
+
+    result = build_plant_calibration_result(
+        config=_config(),
+        measurements=measurements,
+        session_id="session-12345678",
+        started_at="2026-08-30T10:00:00+00:00",
+        q1_min=15.0,
+        q1_max=100.0,
+        q2_min=5.0,
+        q2_max=25.0,
+        total_flow_max=125.0,
+        min_q1_q2_gap=1.0,
+    )
+
+    assert result.record.model_fit_method == "robust_fopdt_grid"
+    assert result.record.response_time_constant_ms == pytest.approx(time_constant_ms, rel=0.35)
+    assert result.record.model_fit_nrmse < 0.1
+    assert result.record.validation_sample_count == 14
+    assert result.record.validation_nrmse < 0.1
+    assert result.record.validated_for_pi
+    assert result.record.validated_for_mpc
+    assert result.record.authorized_for_pi
+    assert result.record.continuous_phase_oil == "fluorinated oil"
+    assert result.record.surfactant_concentration_percent == pytest.approx(2.0)
+    assert result.record.surfactant_concentration_basis == "unspecified"
+    assert result.record.aqueous_phase == "water"
+    assert result.record.flow_measurement_kind == "device_parameter_readback"
+    assert result.record.baseline_generation_frequency_hz == 0.0
 
 
 def test_paired_steps_cancel_baseline_drift_that_flips_individual_responses() -> None:
@@ -189,7 +265,7 @@ def test_calibration_save_keeps_loadable_record_and_separate_raw_audit() -> None
         assert loaded.calibration_id == result.record.calibration_id
         assert saved["measurement_count"] == 12
         assert len(audit["measurements"]) == 12
-        assert audit["record"]["measurement_source"] == "automated_visual_step_response"
+        assert audit["record"]["measurement_source"] == "generation_zone_volume_step_response"
     finally:
         record_path.unlink(missing_ok=True)
         audit_path.unlink(missing_ok=True)
@@ -510,7 +586,8 @@ def test_orchestrator_runs_calibration_under_exclusive_state_and_stops_pump() ->
         assert result.record.diameter_sensitivity_um_per_output == pytest.approx(3.5)
         assert service._state == SystemState.STOPPED
         assert service.get_snapshot().plant_calibration_experiment["status"] == "completed"
-        assert len(calibration_sequence) == 24
+        assert len(calibration_sequence) == 28
+        assert result.record.validated_for_pi
         for index in range(0, len(calibration_sequence), 2):
             baseline_entry = calibration_sequence[index]
             assert baseline_entry[0] == "baseline"

@@ -74,6 +74,26 @@ class ChannelRegionConfig:
 
 @dataclass
 class DetectorConfig:
+    # The desktop runtime overrides this to ``generation_plug``.  Keeping the
+    # library default preserves old, explicitly selected observation-zone
+    # tuning profiles while the live application uses the generation-zone
+    # model below.
+    measurement_mode: Literal["observation_circle", "generation_plug"] = "observation_circle"
+    generation_channel_height_um: float = 50.0
+    generation_channel_width_um: float = 50.0
+    generation_volume_correction: float = 1.0
+    generation_center_band_ratio: float = 0.60
+    generation_edge_mad_multiplier: float = 3.0
+    generation_min_length_ratio: float = 2.50
+    generation_max_length_ratio: float = 12.0
+    generation_min_edge_separation_ratio: float = 0.12
+    generation_min_profile_contrast_sigma: float = 0.35
+    generation_polarity: Literal["brighter", "darker", "either"] = "either"
+    generation_min_meniscus_support_ratio: float = 0.12
+    # A C-regime plug is not just two axial transitions: its upper and lower
+    # capsule edges must persist between the menisci. This rejects the carrier
+    # phase gap, which has the same two interfaces in the opposite order.
+    generation_min_capsule_outline_ratio: float = 0.45
     # Image-domain measurement bounds. These are independent of the PID target.
     min_radius: float = 18.0
     max_radius: float = 32.0

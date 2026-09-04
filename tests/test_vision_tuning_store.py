@@ -17,7 +17,7 @@ def test_first_load_creates_user_parameter_file_with_defaults(tmp_path) -> None:
     result = store.load_or_create()
 
     assert result.status is TuningLoadStatus.CREATED
-    assert result.detector == DetectorConfig()
+    assert result.detector == DetectorConfig(measurement_mode="generation_plug")
     assert result.channel_region == ChannelRegionConfig()
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["schema_version"] == VISION_TUNING_SCHEMA_VERSION
@@ -69,6 +69,26 @@ def test_delete_old_parameters_and_recreate_defaults(tmp_path) -> None:
 
     detector, channel = store.delete_and_create_defaults()
 
-    assert detector == DetectorConfig()
+    assert detector == DetectorConfig(measurement_mode="generation_plug")
     assert channel == ChannelRegionConfig()
     assert store.load_or_create().status is TuningLoadStatus.LOADED
+
+
+def test_schema_v1_profile_without_capsule_outline_field_is_migrated_in_memory(tmp_path) -> None:
+    path = tmp_path / "vision_tuning_parameters.json"
+    detector = vars(DetectorConfig()).copy()
+    detector.pop("generation_min_capsule_outline_ratio")
+    payload = {
+        "schema_version": VISION_TUNING_SCHEMA_VERSION,
+        "detector": detector,
+        "channel_region": vars(ChannelRegionConfig()),
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = VisionTuningSettingsStore(path).load_or_create()
+
+    assert result.status is TuningLoadStatus.LOADED
+    assert (
+        result.detector.generation_min_capsule_outline_ratio
+        == DetectorConfig().generation_min_capsule_outline_ratio
+    )

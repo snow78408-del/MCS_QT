@@ -1,5 +1,7 @@
 ﻿from __future__ import annotations
 
+import math
+
 from .adaptive import AdaptivePIDManager
 from .base import BaseDiameterController
 from .config import PIDConfig, PIDControlMode
@@ -115,14 +117,27 @@ class DiameterPIDController(BaseDiameterController):
 
         target = float(pid_input.target_diameter_um)
         current = float(pid_input.current_diameter_um)
-        error = target - current
-        inside_deadband = abs(error) <= float(self.config.diameter_deadband)
+        diameter_error = target - current
+        calibrated_allocation = bool(self.config.log_sensitivity_calibrated)
+        error = (
+            float(math.log(target / current))
+            if calibrated_allocation
+            else diameter_error
+        )
+        inside_deadband = abs(diameter_error) <= float(self.config.diameter_deadband)
         if inside_deadband:
             decay = min(1.0, max(0.0, float(self.config.integral_decay_in_deadband)))
             self.integral *= decay
         adaptive_active = False
         adaptive_reason = "diameter inside deadband; adaptive state retained" if inside_deadband else "classic PID mode"
-        if not inside_deadband and adaptive_enabled:
+        if calibrated_allocation:
+            # The identified generation-zone PI gains already include plant
+            # dynamics.  Online heuristic gain adaptation would mix physical
+            # units and invalidate that identification.
+            adaptive_enabled = False
+            self.kp, self.ki, self.kd = self.parameter_manager.base_gains()
+            adaptive_reason = "generation-zone calibrated PI"
+        elif not inside_deadband and adaptive_enabled:
             state = self.adaptive.update(pid_input, error)
             self.kp, self.ki, self.kd = self.parameter_manager.clamp_gains(state.kp, state.ki, state.kd)
             adaptive_active = bool(state.active)
@@ -165,8 +180,22 @@ class DiameterPIDController(BaseDiameterController):
 
         q1_base = float(self._q1_bias) if self.config.use_initial_flow_as_output_bias else q1_current
         q2_base = float(self._q2_bias) if self.config.use_initial_flow_as_output_bias else q2_current
-        q1_coefficient = float(self.config.q1_control_sign) * float(self.config.q1_output_gain)
-        q2_coefficient = float(self.config.q2_control_sign) * float(self.config.q2_output_gain)
+        if calibrated_allocation:
+            g1 = float(self.config.q1_log_diameter_sensitivity)
+            g2 = float(self.config.q2_log_diameter_sensitivity)
+            denominator = (
+                g1 * g1
+                + g2 * g2
+                + float(self.config.sensitivity_allocation_regularization)
+            )
+            # First-order expansion of Q * exp(delta log Q) about the saved
+            # operating point.  The resulting coefficients are flow change
+            # per unit requested log-diameter correction.
+            q1_coefficient = q1_base * g1 / denominator
+            q2_coefficient = q2_base * g2 / denominator
+        else:
+            q1_coefficient = float(self.config.q1_control_sign) * float(self.config.q1_output_gain)
+            q2_coefficient = float(self.config.q2_control_sign) * float(self.config.q2_output_gain)
         q1_flow_min = float(self.config.q1_min)
         q1_flow_max = float(self.config.q1_max)
         q2_flow_min = float(self.config.q2_min)
@@ -246,10 +275,8 @@ class DiameterPIDController(BaseDiameterController):
             requested_output = rate_limit(requested_output, self._last_output, self.config.output_rate_limit)
             u_final = clamp(requested_output, actuator_low, actuator_high)
 
-        # Differential control keeps the two phases from being accelerated or
-        # decelerated together. error = target - measured:
-        #   droplet too large (error < 0): Q1 up, Q2 down
-        #   droplet too small (error > 0): Q1 down, Q2 up
+        # The calibrated sensitivity vector determines both directions and
+        # relative authority.  No Q1/Q2 sign or 2:1 ratio is assumed here.
         q1_ideal = q1_base + q1_coefficient * u_final
         q2_ideal = q2_base + q2_coefficient * u_final
         q1_raw = q1_ideal
@@ -317,7 +344,7 @@ class DiameterPIDController(BaseDiameterController):
             self._last_frame_id = int(pid_input.frame_id)
 
         common = dict(
-            diameter_error=error,
+            diameter_error=diameter_error,
             adjustment=realized_output,
             p_term=p_term,
             i_term=i_term,
@@ -334,8 +361,8 @@ class DiameterPIDController(BaseDiameterController):
             feedforward_active=feedforward_active,
             feedforward_reason=feedforward_reason,
             control_mode=mode,
-            q1_output_gain=float(self.config.q1_output_gain),
-            q2_output_gain=float(self.config.q2_output_gain),
+            q1_output_gain=abs(float(q1_coefficient)),
+            q2_output_gain=abs(float(q2_coefficient)),
             frame_id=int(pid_input.frame_id),
             actuator_saturated=allocation_saturated,
             requested_output=requested_output,

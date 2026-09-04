@@ -9,6 +9,7 @@ from .calibration_experiment import (
     PlantCalibrationObservation,
     build_plant_calibration_result,
     identify_channel_sensitivities,
+    identify_channel_log_sensitivities,
     save_plant_calibration_result,
 )
 from .diameter_pid import DiameterPIDController
@@ -27,6 +28,7 @@ __all__ = [
     "PlantCalibrationObservation",
     "build_plant_calibration_result",
     "identify_channel_sensitivities",
+    "identify_channel_log_sensitivities",
     "save_plant_calibration_result",
     "DiameterPIDController",
     "VisionMetrics",

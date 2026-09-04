@@ -25,6 +25,11 @@ def _calibration() -> dict[str, object]:
     }
 
 
+def _authorize_generation_pid(service: OrchestratorService) -> None:
+    service._plant_calibration=SimpleNamespace()
+    service.pid_config.log_sensitivity_calibrated=True
+
+
 class _PumpStub:
     def __init__(self, *, stop_ok: bool = True, start_ok: bool = True) -> None:
         self.serial_config = SimpleNamespace(port="", address=1, baudrate=1200, parity="N")
@@ -49,6 +54,21 @@ class _PumpStub:
 
 
 class PumpInteractionFlowTests(unittest.TestCase):
+    def test_realtime_pid_cannot_start_without_generation_dynamics_mapping(self) -> None:
+        adapter=SimpleNamespace(start=lambda: (_ for _ in ()).throw(AssertionError("must not start")))
+        service=OrchestratorService(
+            vision_service=SimpleNamespace(),vision_adapter=adapter,pump_service=_PumpStub()
+        )
+        service._cfg=SystemConfig(
+            target_diameter=50.0,pixel_to_micron=1.0,video_source_type="camera",
+            video_source="",initial_q1=50.0,initial_q2=20.0,
+            control_interval_ms=500,calibration=_calibration(),
+        )
+        service._state=SystemState.INITIALIZED
+
+        with self.assertRaisesRegex(RuntimeError,"生成区 Q1/Q2 动力学标定"):
+            service.start()
+
     def test_hardware_rejects_q1_not_above_q2_even_if_runtime_gap_is_mutated(self) -> None:
         from backend.pump_hardware.service import PumpHardwareService
 
@@ -117,10 +137,10 @@ class PumpInteractionFlowTests(unittest.TestCase):
             {
                 "channel_calibration_status": "calibrated",
                 "channel_calibration_confidence": 1.0,
-                "scale_source": "channel_430um",
+                "scale_source": "generation_channel_width",
                 "pixel_to_micron": 1.6475,
-                "channel_width_um": 430.0,
-                "channel_width_px": 261.0,
+                "channel_width_um": 50.0,
+                "channel_width_px": 30.35,
             }
         )
 
@@ -136,7 +156,7 @@ class PumpInteractionFlowTests(unittest.TestCase):
                 "channel_calibration_confidence": 0.0,
                 "scale_source": "configured_unverified",
                 "pixel_to_micron": 1.6475,
-                "channel_width_um": 430.0,
+                "channel_width_um": 50.0,
                 "channel_width_px": None,
             }
         )
@@ -267,6 +287,7 @@ class PumpInteractionFlowTests(unittest.TestCase):
         service._pump_control_enabled = True
         service._pump_state.connected = True
         service._pump_state.comm_established = True
+        _authorize_generation_pid(service)
 
         with self.assertRaises(RuntimeError):
             service.start()
@@ -350,6 +371,7 @@ class PumpInteractionFlowTests(unittest.TestCase):
         service._pump_control_enabled = True
         service._pump_state.connected = True
         service._pump_state.comm_established = True
+        _authorize_generation_pid(service)
 
         start_errors: list[BaseException] = []
 
@@ -612,6 +634,7 @@ class PumpInteractionFlowTests(unittest.TestCase):
         service._pump_control_enabled = True
         service._pump_state.connected = True
         service._pump_state.comm_established = True
+        _authorize_generation_pid(service)
 
         with self.assertRaises(RuntimeError):
             service.start()

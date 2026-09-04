@@ -45,6 +45,26 @@ class VisionTuningTests(unittest.TestCase):
         self.assertTrue(all(stage.image.size > 0 for stage in stages))
         self.assertEqual(len(result.centers), len(result.radii))
 
+    def test_generation_inspection_uses_plug_stages_and_live_pixel_scale(self):
+        frame = np.full((60, 320, 3), 100, dtype=np.uint8)
+        frame[8:52, 60:200] = 190
+        config = DetectorConfig(
+            measurement_mode="generation_plug",
+            generation_min_length_ratio=2.5,
+            generation_polarity="brighter",
+        )
+
+        result, stages = inspect_frame(frame, config, pixel_to_micron=1.25)
+
+        self.assertEqual(len(stages), 6)
+        self.assertIn("中心采样带", stages[2].name)
+        self.assertIn("边缘峰", stages[3].name)
+        self.assertIn("弯月面配对", stages[4].name)
+        self.assertIn("等效直径", stages[-1].name)
+        self.assertNotIn("Hough", " ".join(stage.name for stage in stages))
+        self.assertTrue(result.plug_lengths_px)
+        self.assertIn("μm", stages[-1].statistics)
+
     def test_channel_region_is_exposed_as_a_major_stage_before_detection(self):
         frames = []
         for index in range(12):

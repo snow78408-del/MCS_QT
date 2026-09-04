@@ -179,7 +179,7 @@ class PipelineVisionService:
         self._run_generation = 0
         self._calibration_metadata: dict[str, Any] = {}
         self._channel_calibration_enabled = False
-        self._channel_width_um = 430.0
+        self._channel_width_um = 50.0
         self._channel_width_px: float | None = None
         self._channel_calibration_status = "disabled"
         self._channel_calibration_confidence = 0.0
@@ -253,7 +253,22 @@ class PipelineVisionService:
             from ..vision.config import default_config
             from ..vision.pipeline import VisionPipeline
 
-            self._pipeline = VisionPipeline(default_config(), logger=self._log)
+            config = default_config()
+            config.detector.measurement_mode = "generation_plug"
+            config.detector.generation_channel_height_um = 50.0
+            config.detector.generation_channel_width_um = 50.0
+            config.metrics.flow_axis = "x"
+            # The commissioned generation-zone view moves detached droplets
+            # from right to left. This remains configurable in the saved ROI.
+            config.metrics.flow_direction = "negative"
+            config.tracker.tracker_type = "nearest"
+            config.tracker.match_distance = 90.0
+            config.tracker.match_distance_radius_ratio = 4.0
+            config.tracker.radius_match_ratio = 1.0
+            config.tracker.max_unmatched_frames = 2
+            config.tracker.confirmation_window = 1
+            config.tracker.confirmation_min_hits = 1
+            self._pipeline = VisionPipeline(config, logger=self._log)
         return self._pipeline
 
     def wait_for_recognition_snapshot(
@@ -319,7 +334,8 @@ class PipelineVisionService:
             uniformity_status="当前无液滴",
             uniformity_reason=reason,
             pixel_to_micron=float(self._pixel_to_micron),
-            scale_source=("channel_430um" if self._channel_calibration_status == "calibrated" else "configured"),
+            scale_source=("generation_channel_width" if self._channel_calibration_status == "calibrated" else "configured"),
+            measurement_region="generation",
             channel_width_um=(self._channel_width_um if self._channel_calibration_enabled else None),
             channel_width_px=self._channel_width_px,
             channel_calibration_status=self._channel_calibration_status,
@@ -391,6 +407,10 @@ class PipelineVisionService:
         # can move farther than the old 120 px gate between processed frames.
         pipeline.config.tracker.match_distance = 180.0
         pipeline.config.tracker.match_distance_radius_ratio = 4.0
+        pipeline.detector.configure_expected_diameter(
+            self._expected_diameter_um,
+            self._pixel_to_micron,
+        )
         min_r, preferred_r, max_r = pipeline.detector.runtime_radius_range()
         self._log(
             "[VISION][DETECTOR][SCALE] "
@@ -408,22 +428,58 @@ class PipelineVisionService:
         channel_region = ChannelRegionConfig(**vars(channel_region_config))
         with self._pipeline_lock:
             pipeline = self._ensure_pipeline()
+            current = pipeline.config.detector
+            # Physical geometry belongs to the camera/ROI calibration.  The
+            # tuning page may change only the generation detector's image
+            # thresholds, never the calibrated H/W/kappa values or mode.
+            detector.measurement_mode = "generation_plug"
+            detector.generation_channel_height_um = float(
+                current.generation_channel_height_um
+            )
+            detector.generation_channel_width_um = float(
+                current.generation_channel_width_um
+            )
+            detector.generation_volume_correction = float(
+                current.generation_volume_correction
+            )
             pipeline.apply_tuning_config(detector, channel_region)
-            min_r, preferred_r, max_r = pipeline.detector.runtime_radius_range()
+            pipeline.detector.configure_expected_diameter(
+                self._expected_diameter_um,
+                self._pixel_to_micron,
+            )
         self._log(
             "[VISION][TUNING][APPLIED] "
-            f"radius_px={min_r:.2f}/{preferred_r:.2f}/{max_r:.2f} "
-            f"sensitivity={detector.sensitivity:.3f} "
-            f"radius_adjustment_percent={detector.radius_adjustment_percent:+.3f} "
+            f"mode={detector.measurement_mode} "
+            f"center_band={detector.generation_center_band_ratio:.3f} "
+            f"edge_mad={detector.generation_edge_mad_multiplier:.3f} "
+            f"length_ratio={detector.generation_min_length_ratio:.3f}.."
+            f"{detector.generation_max_length_ratio:.3f} "
+            f"contrast_sigma={detector.generation_min_profile_contrast_sigma:.3f} "
+            f"meniscus_support={detector.generation_min_meniscus_support_ratio:.3f} "
+            f"capsule_outline={detector.generation_min_capsule_outline_ratio:.3f} "
+            f"polarity={detector.generation_polarity} "
             f"channel_region_enabled={channel_region.enabled}"
         )
         return {
             "applied": True,
-            "min_radius": min_r,
-            "preferred_radius": preferred_r,
-            "max_radius": max_r,
-            "sensitivity": float(detector.sensitivity),
-            "radius_adjustment_percent": float(detector.radius_adjustment_percent),
+            "measurement_mode": detector.measurement_mode,
+            "generation_center_band_ratio": float(detector.generation_center_band_ratio),
+            "generation_edge_mad_multiplier": float(detector.generation_edge_mad_multiplier),
+            "generation_min_length_ratio": float(detector.generation_min_length_ratio),
+            "generation_max_length_ratio": float(detector.generation_max_length_ratio),
+            "generation_min_edge_separation_ratio": float(
+                detector.generation_min_edge_separation_ratio
+            ),
+            "generation_min_profile_contrast_sigma": float(
+                detector.generation_min_profile_contrast_sigma
+            ),
+            "generation_min_meniscus_support_ratio": float(
+                detector.generation_min_meniscus_support_ratio
+            ),
+            "generation_min_capsule_outline_ratio": float(
+                detector.generation_min_capsule_outline_ratio
+            ),
+            "generation_polarity": detector.generation_polarity,
             "channel_region_enabled": bool(channel_region.enabled),
         }
 
@@ -468,15 +524,34 @@ class PipelineVisionService:
             if abs(line["x2"] - line["x1"]) + abs(line["y2"] - line["y1"]) >= 0.05:
                 wall_lines.append(line)
         config.wall_lines = wall_lines if len(wall_lines) == 2 else []
+        flow_direction = str(values.get("flow_direction", "negative") or "negative").lower()
+        if flow_direction not in {"positive", "negative", "any"}:
+            raise ValueError("生成区流动方向必须为 positive、negative 或 any")
+        pipeline.config.metrics.flow_direction = flow_direction
         if config.x_end_ratio <= config.x_start_ratio or config.y_end_ratio <= config.y_start_ratio:
             raise ValueError("识别 ROI 的结束坐标必须大于开始坐标")
         config.crop_top_ratio = 0.0
         self._channel_calibration_enabled = bool(values.get("channel_calibration_enabled", False))
-        self._channel_width_um = float(values.get("channel_width_um", 430.0))
+        self._channel_width_um = float(values.get("channel_width_um", 50.0))
         if self._channel_width_um <= 0.0:
             raise ValueError("框选区域实际高度必须大于 0 μm")
         if self._channel_calibration_enabled and not config.enabled:
             raise ValueError("启用已知高度标定前必须先启用并框选 ROI")
+        detector = pipeline.config.detector
+        detector.measurement_mode = "generation_plug"
+        detector.generation_channel_height_um = float(
+            values.get("generation_channel_height_um", self._channel_width_um)
+        )
+        detector.generation_channel_width_um = float(
+            values.get("generation_channel_width_um", self._channel_width_um)
+        )
+        detector.generation_volume_correction = float(
+            values.get("generation_volume_correction", 1.0)
+        )
+        if detector.generation_channel_height_um <= 0.0 or detector.generation_channel_width_um <= 0.0:
+            raise ValueError("生成区通道高度和宽度必须大于 0 μm")
+        if detector.generation_volume_correction <= 0.0:
+            raise ValueError("生成区体积修正系数必须大于 0")
         pipeline.channel_region_detector.reset()
         self._log(
             f"[VISION][ROI] enabled={config.enabled} "
@@ -515,6 +590,10 @@ class PipelineVisionService:
             if selected_width is not None and selected_width > 1.0:
                 scale = self._channel_width_um / selected_width
                 self._pixel_to_micron = float(scale)
+                pipeline.detector.configure_expected_diameter(
+                    self._expected_diameter_um,
+                    self._pixel_to_micron,
+                )
                 self._channel_width_px = float(selected_width)
                 self._channel_calibration_confidence = 1.0
                 self._channel_calibration_status = "calibrated"
@@ -547,6 +626,10 @@ class PipelineVisionService:
                 scale = self._channel_width_um / center
                 if 0.05 <= scale <= 100.0:
                     self._pixel_to_micron = float(scale)
+                    pipeline.detector.configure_expected_diameter(
+                        self._expected_diameter_um,
+                        self._pixel_to_micron,
+                    )
                     self._channel_width_px = center
                     self._channel_calibration_confidence = float(median([item[1] for item in self._channel_width_samples]))
                     self._channel_calibration_status = "calibrated"
@@ -604,7 +687,9 @@ class PipelineVisionService:
                 f"自动标定检测到的移动目标尺寸不稳定（稳健 CV={robust_cv:.1f}%），"
                 "请缩小 ROI、排除气泡和反光后重试"
             )
-        preferred = self._ensure_pipeline().detector.calibrate_preferred_radius(radii)
+        detector = self._ensure_pipeline().detector
+        generation_mode = detector._config.measurement_mode == "generation_plug"
+        preferred = radius_median if generation_mode else detector.calibrate_preferred_radius(radii)
         brightness = sorted(item[1] for item in stats)
         noise = sorted(item[2] for item in stats)
         center_contrasts = sorted(item[3] for item in stats)
@@ -630,6 +715,13 @@ class PipelineVisionService:
             "polarity": polarity,
             "center_contrast_threshold": detector_config.candidate_min_center_contrast,
             "ring_contrast_threshold": detector_config.candidate_min_ring_contrast,
+            "measurement_region": "generation" if generation_mode else "observation",
+            "measurement_model": (
+                "square_channel_plug_volume_to_equivalent_diameter"
+                if generation_mode
+                else "hough_circle_diameter"
+            ),
+            "volume_correction": float(detector_config.generation_volume_correction),
         }
         self._log(f"[VISION][CALIBRATION] {result}")
         return result
@@ -696,7 +788,7 @@ class PipelineVisionService:
         self,
         preview_png_base64: str,
         roi: dict[str, Any] | None = None,
-        channel_width_um: float = 430.0,
+        channel_width_um: float = 50.0,
         configured_pixel_to_micron: float = 1.0,
         hough_parameters: dict[str, float | int] | None = None,
     ) -> dict[str, Any]:
@@ -1166,7 +1258,7 @@ class PipelineVisionService:
             result.tracking,
             observed_ids,
             float(timestamp or result.timestamp),
-            new_cross,
+            len(control.crossed_track_ids),
             int(frame_id if frame_id is not None else result.frame_index),
         )
         has_droplet = active_count > 0
@@ -1259,7 +1351,7 @@ class PipelineVisionService:
             droplet_generation_rate_hz=self._droplet_generation_rate_hz,
             pixel_to_micron=scale,
             scale_source=(
-                "channel_430um"
+                "generation_channel_width"
                 if self._channel_calibration_status == "calibrated"
                 else ("calibration_file" if self._calibration_metadata else "configured_unverified")
             ),
@@ -1276,6 +1368,16 @@ class PipelineVisionService:
                 None
                 if self._calibration_metadata.get("uncertainty_um_per_px") is None
                 else float(self._calibration_metadata["uncertainty_um_per_px"])
+            ),
+            measurement_region="generation",
+            generation_channel_height_um=float(
+                self._ensure_pipeline().config.detector.generation_channel_height_um
+            ),
+            generation_channel_width_um=float(
+                self._ensure_pipeline().config.detector.generation_channel_width_um
+            ),
+            generation_volume_correction=float(
+                self._ensure_pipeline().config.detector.generation_volume_correction
             ),
             **diagnostics,
         )
@@ -1357,6 +1459,7 @@ class PipelineVisionService:
                     continue
                 cx, cy = float(track.position[0]), float(track.position[1])
                 diameter_um = radius * 2.0 * float(self._pixel_to_micron)
+                plug_length_px = float(track.metadata.get("plug_length_px", 0.0) or 0.0)
                 valid_diameters_um.append(diameter_um)
                 valid_droplets.append(
                     {
@@ -1365,61 +1468,36 @@ class PipelineVisionService:
                         "center_y_px": cy,
                         "radius_px": radius,
                         "diameter_um": diameter_um,
+                        **(
+                            {
+                                "plug_length_px": plug_length_px,
+                                "plug_length_um": plug_length_px * float(self._pixel_to_micron),
+                            }
+                            if plug_length_px > 0.0
+                            else {}
+                        ),
                     }
                 )
                 color = (0, 165, 255) if track_id in crossed_ids else (40, 220, 70)
                 thickness = 3 if track_id in crossed_ids else 2
-                cv2.circle(
-                    annotated,
-                    (int(round(cx)), int(round(cy))),
-                    max(2, int(round(radius))),
-                    color,
-                    thickness,
-                    cv2.LINE_AA,
-                )
-                cv2.putText(
-                    annotated,
-                    f"ID {track_id}",
-                    (
-                        max(2, int(round(cx - radius))),
-                        max(16, int(round(cy - radius - 5))),
-                    ),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.42,
-                    color,
-                    1,
-                    cv2.LINE_AA,
-                )
-                diameter_label = f"{diameter_um:.1f}"
-                font_scale = 0.38
-                (text_width, text_height), baseline = cv2.getTextSize(
-                    diameter_label,
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    font_scale,
-                    1,
-                )
-                text_x = max(1, min(frame_w - text_width - 1, int(round(cx - text_width / 2))))
-                text_y = max(
-                    text_height + 1,
-                    min(frame_h - baseline - 1, int(round(cy + text_height / 2))),
-                )
-                cv2.rectangle(
-                    annotated,
-                    (text_x - 1, text_y - text_height - 1),
-                    (text_x + text_width + 1, text_y + baseline + 1),
-                    (0, 0, 0),
-                    -1,
-                )
-                cv2.putText(
-                    annotated,
-                    diameter_label,
-                    (text_x, text_y),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    font_scale,
-                    (255, 255, 255),
-                    1,
-                    cv2.LINE_AA,
-                )
+                if plug_length_px > 0.0:
+                    half_length = plug_length_px * 0.5
+                    if frame_w >= frame_h:
+                        top_left = (max(0, int(round(cx - half_length))), 1)
+                        bottom_right = (min(frame_w - 1, int(round(cx + half_length))), frame_h - 2)
+                    else:
+                        top_left = (1, max(0, int(round(cy - half_length))))
+                        bottom_right = (frame_w - 2, min(frame_h - 1, int(round(cy + half_length))))
+                    cv2.rectangle(annotated, top_left, bottom_right, color, thickness, cv2.LINE_AA)
+                else:
+                    cv2.circle(
+                        annotated,
+                        (int(round(cx)), int(round(cy))),
+                        max(2, int(round(radius))),
+                        color,
+                        thickness,
+                        cv2.LINE_AA,
+                    )
 
             metrics_config = self._ensure_pipeline().config.metrics
             axis = str(metrics_config.flow_axis).strip().lower()
@@ -1432,18 +1510,6 @@ class PipelineVisionService:
                 cv2.line(annotated, (line_position, 0), (line_position, frame_h - 1), (255, 210, 40), 1)
 
             resolved_frame_id = int(frame_id if frame_id is not None else result.frame_index)
-            header = f"Frame {resolved_frame_id} | valid {len(valid_ids)} | crossed {len(crossed_ids)}"
-            cv2.rectangle(annotated, (0, 0), (min(frame_w - 1, 340), 25), (0, 0, 0), -1)
-            cv2.putText(
-                annotated,
-                header,
-                (7, 18),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.48,
-                (255, 255, 255),
-                1,
-                cv2.LINE_AA,
-            )
             encoded_ok, encoded = cv2.imencode(
                 ".jpg",
                 annotated,
@@ -1458,6 +1524,7 @@ class PipelineVisionService:
                     "valid_droplet_count": len(valid_ids),
                     "crossed_droplet_count": len(crossed_ids),
                     "valid_track_ids": sorted(valid_ids),
+                    "crossed_track_ids": sorted(crossed_ids),
                     "valid_droplets": valid_droplets,
                     "average_diameter_um": (
                         float(np.mean(valid_diameters_um)) if valid_diameters_um else None
@@ -1522,7 +1589,17 @@ class PipelineVisionService:
         cutoff = timestamp - GENERATION_RATE_WINDOW_S
         while self._crossing_times and self._crossing_times[0] < cutoff:
             self._crossing_times.popleft()
-        self._droplet_generation_rate_hz = len(self._crossing_times) / GENERATION_RATE_WINDOW_S
+        if len(self._crossing_times) >= 2:
+            intervals = [
+                later - earlier
+                for earlier, later in zip(self._crossing_times, list(self._crossing_times)[1:])
+                if later > earlier
+            ]
+            self._droplet_generation_rate_hz = (
+                1.0 / float(median(intervals)) if intervals else 0.0
+            )
+        else:
+            self._droplet_generation_rate_hz = 0.0
 
     def _capture_loop(self) -> None:
         while not self._stop_event.is_set():

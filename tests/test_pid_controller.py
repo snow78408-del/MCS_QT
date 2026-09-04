@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import unittest
 
+import pytest
+
 from backend.pid_control.config import PIDConfig, PIDControlMode
 from backend.pid_control.diameter_pid import DiameterPIDController
 from backend.pid_control.models import PIDInput
@@ -159,6 +161,26 @@ class DiameterPidTests(unittest.TestCase):
         )
         self.assertGreater(command.q1, 100.0)
         self.assertLess(command.q2, 10.0)
+
+    def test_generation_log_sensitivities_replace_fixed_two_to_one_allocation(self) -> None:
+        config=PIDConfig(
+            control_mode=PIDControlMode.CLASSIC_PID.value,
+            base_kp=1.0,base_ki=0.0,base_kd=0.0,
+            q1_log_diameter_sensitivity=-0.25,
+            q2_log_diameter_sensitivity=0.75,
+            sensitivity_allocation_regularization=0.01,
+            log_sensitivity_calibrated=True,
+            output_rate_limit=10.0,
+        )
+        controller=DiameterPIDController(config)
+        command=controller.update_input(
+            _input(frame_id=1,q1=100.0,q2=10.0,current=40.0)
+        )
+
+        assert command.q1 < 100.0
+        assert command.q2 > 10.0
+        assert command.q1_output_gain / command.q2_output_gain == pytest.approx(10.0/3.0)
+        assert command.diameter_error == pytest.approx(10.0)
 
     def test_zero_control_sign_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
