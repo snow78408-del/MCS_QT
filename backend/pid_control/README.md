@@ -42,6 +42,9 @@ Safety behavior is internal to this package:
 - repeated `frame_id` is rejected,
 - integral/output/feedforward are bounded,
 - output rate changes are limited,
+- optional `PIDInput.integration_dt` limits integration without changing the
+  actual derivative time base; orchestration commits speculative PID state only
+  after a successful pump transaction,
 - feedforward falls back to zero when the model is stale, invalid, or low
   confidence.
 - BO hands its confirmed Q1/Q2 point to `set_operating_point()`, which resets
@@ -57,3 +60,17 @@ channel width and out-of-plane depth are independent. Full combined-step
 curves are robustly fitted to a shared FOPDT model, followed by separate
 validation steps. Old schema-v1/v2 records remain loadable for audit but do not
 authorize the real-time PI loop.
+
+Calibration observation horizons are persisted with experiment settings:
+`minimum_response_wait_s=30`, `low_response_wait_s=60`, and
+`stability_duration_s=3`. These are operator-adjustable starting values, not
+identified pump constants. A confirmed onset permits response completion before
+the 30-second horizon, using a full stable window after both onset and transaction
+completion. Baseline waiting remains unchanged. The low-response horizon and
+stable window run concurrently. Orchestration requires valid droplet counts
+and elapsed capture time before classifying a stable response; full transient
+curves remain available for fitting. The default is now 8 trials (6 modeling
+steps plus 2 held-out validation steps), with one modeling repetition. Saved
+settings remain respected; the dialog offers an explicit single-pass preset.
+Validation thresholds are unchanged. Repeatability studies require additional
+repetitions; fewer trials do not establish equivalent identification precision.

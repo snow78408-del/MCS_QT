@@ -116,6 +116,12 @@ class RecognitionSnapshot:
     average_droplet_speed_um_s: float | None = None
     speed_sample_count: int = 0
     droplet_generation_rate_hz: float = 0.0
+    frequency_valid: bool = False
+    frequency_reason: str = "continuous gate not initialized"
+    frequency_passage_count: int = 0
+    measurement_window_start: float | None = None
+    measurement_window_end: float | None = None
+    measurement_sample_start: float | None = None
     pixel_to_micron: float = 0.0
     scale_source: str = "configured"
     channel_width_um: float | None = None
@@ -225,6 +231,10 @@ class ControlSnapshot:
     actuator_saturated: bool = False
     requested_output: float = 0.0
     realized_output: float = 0.0
+    basis_command_id: int = 0
+    command_id: int = 0
+    command_completed_monotonic: float = 0.0
+    feedback_ready_after: float = 0.0
 
 
 @dataclass(slots=True)

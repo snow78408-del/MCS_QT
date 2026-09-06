@@ -898,11 +898,14 @@ class PlantCalibrationExperimentDialog(QDialog):
         initial_q1=float(cfg.get("initial_q1",50.0)); initial_q2=float(cfg.get("initial_q2",20.0))
         self.q1_step=decimal(cfg.get("plant_calibration_q1_step",max(0.5,min(2.0,initial_q1*0.05))),0.01,1000.0,suffix=" μL/min")
         self.q2_step=decimal(cfg.get("plant_calibration_q2_step",max(0.2,min(1.0,initial_q2*0.05))),0.01,1000.0,suffix=" μL/min")
-        self.repetitions=QSpinBox(); self.repetitions.setRange(1,5); self.repetitions.setValue(int(cfg.get("plant_calibration_repetitions",2)))
+        self.repetitions=QSpinBox(); self.repetitions.setRange(1,5); self.repetitions.setValue(int(cfg.get("plant_calibration_repetitions",1)))
         self.validation_repetitions=QSpinBox(); self.validation_repetitions.setRange(1,3); self.validation_repetitions.setValue(int(cfg.get("plant_calibration_validation_repetitions",1)))
         self.baseline_count=QSpinBox(); self.baseline_count.setRange(3,200); self.baseline_count.setValue(int(cfg.get("plant_calibration_baseline_samples",30)))
         self.stable_count=QSpinBox(); self.stable_count.setRange(3,200); self.stable_count.setValue(int(cfg.get("plant_calibration_stable_samples",5)))
         self.response_limit=QSpinBox(); self.response_limit.setRange(5,1000); self.response_limit.setValue(int(cfg.get("plant_calibration_response_observation_limit",30)))
+        self.response_wait=decimal(cfg.get("plant_calibration_minimum_response_wait_s",30.0),0.1,3600.0,1," s")
+        self.low_response_wait=decimal(cfg.get("plant_calibration_low_response_wait_s",60.0),0.1,7200.0,1," s")
+        self.stability_duration=decimal(cfg.get("plant_calibration_stability_duration_s",3.0),0.1,300.0,1," s")
         self.liveness_timeout=decimal(cfg.get("plant_calibration_vision_liveness_timeout_s",120.0),15.0,3600.0,1," s")
         self.minimum_response=decimal(cfg.get("plant_calibration_minimum_response_um",0.5),0.05,100.0,3," μm")
         self.stability=decimal(cfg.get("plant_calibration_stability_tolerance_um",1.0),0.05,100.0,3," μm")
@@ -928,6 +931,13 @@ class PlantCalibrationExperimentDialog(QDialog):
         form.addRow("水相组成",self.aqueous_phase); form.addRow("标定温度",self.temperature)
         form.addRow("Q1 阶跃幅值",self.q1_step); form.addRow("Q2 阶跃幅值",self.q2_step)
         form.addRow("建模正负阶跃重复数",self.repetitions); form.addRow("独立验证正负阶跃重复数",self.validation_repetitions); form.addRow("基线有效液滴数",self.baseline_count); form.addRow("响应稳定有效液滴数",self.stable_count); form.addRow("单回合最少观察液滴数",self.response_limit)
+        form.addRow("基线等待／未确认响应时等待",self.response_wait)
+        form.addRow("低响应判定前观察等待",self.low_response_wait)
+        form.addRow("稳定窗口最短持续时间",self.stability_duration)
+        self.single_pass_button=QPushButton("一次建模（8 组）")
+        self.single_pass_button.setToolTip("建模正反方向各一次，保留两组独立验证；不改变等待、样本数或稳定阈值。正式重复性实验需另行增加重复数。")
+        self.single_pass_button.clicked.connect(lambda: (self.repetitions.setValue(1),self.validation_repetitions.setValue(1)))
+        form.addRow("减少重复试验",self.single_pass_button)
         form.addRow("无有效液滴安全停机",self.liveness_timeout); form.addRow("最小可信直径响应",self.minimum_response); form.addRow("稳定阈值下限（自动修正）",self.stability)
         self.stability.setToolTip("实际判定阈值还会根据像素分辨率和基线实测噪声自动提高")
         self.config_scroll=QScrollArea()
@@ -938,6 +948,7 @@ class PlantCalibrationExperimentDialog(QDialog):
         self.config_scroll.setMinimumHeight(240)
         layout.addWidget(self.config_scroll,1)
         self._config_widgets=[*self.metadata.values(),self.continuous_phase_oil,self.surfactant_name,self.surfactant_concentration,self.surfactant_basis,self.aqueous_phase,self.temperature,self.channel_height,self.channel_width,self.volume_correction,self.q1_step,self.q2_step,self.repetitions,self.validation_repetitions,self.baseline_count,self.stable_count,self.response_limit,self.liveness_timeout,self.minimum_response,self.stability]
+        self._config_widgets.extend([self.response_wait,self.low_response_wait,self.stability_duration,self.single_pass_button])
 
         status_box=QGroupBox("标定运行状态"); status_layout=QVBoxLayout(status_box)
         self.baseline_label=QLabel("当前基准流量：等待读取已验证的 Q1/Q2")
@@ -993,6 +1004,9 @@ class PlantCalibrationExperimentDialog(QDialog):
             repetitions=int(self.repetitions.value()),baseline_sample_count=int(self.baseline_count.value()),stable_sample_count=int(self.stable_count.value()),response_observation_limit=int(self.response_limit.value()),
             maximum_step_duration_s=0.0,vision_liveness_timeout_s=float(self.liveness_timeout.value()),minimum_response_um=float(self.minimum_response.value()),
             stability_tolerance_um=float(self.stability.value()),
+            minimum_response_wait_s=float(self.response_wait.value()),
+            low_response_wait_s=float(self.low_response_wait.value()),
+            stability_duration_s=float(self.stability_duration.value()),
             channel_height_um=float(self.channel_height.value()),
             channel_width_um=float(self.channel_width.value()),
             volume_correction_factor=float(self.volume_correction.value()),
@@ -1021,7 +1035,8 @@ class PlantCalibrationExperimentDialog(QDialog):
             self.app.error("无法开始自动标定",str(exc)); return
         answer=QMessageBox.warning(
             self,"确认自动阶跃标定",
-            f"将执行 {6*config.repetitions+2*config.validation_repetitions} 次有界阶跃，其中最后 {2*config.validation_repetitions} 次仅用于独立验证。按有效过线液滴数量推进，不设固定实验时长。\n"
+            f"将执行 {6*config.repetitions+2*config.validation_repetitions} 次有界阶跃，其中最后 {2*config.validation_repetitions} 次仅用于独立验证。\n"
+            f"基线等待 {config.minimum_response_wait_s:g} 秒；阶跃检测到可信响应后可提前结束，需满足有效液滴数量及持续稳定 {config.stability_duration_s:g} 秒。未检测到响应则观察至 {config.low_response_wait_s:g} 秒，稳定窗口并行累计，不设固定总实验时长。\n"
             "请确认芯片、管路和收集容器安全，且操作人员保持在设备旁。是否开始？",
             QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,QMessageBox.StandardButton.No,
         )
@@ -1041,6 +1056,9 @@ class PlantCalibrationExperimentDialog(QDialog):
             plant_calibration_validation_repetitions=config.validation_repetitions,
             plant_calibration_stable_samples=config.stable_sample_count,plant_calibration_response_observation_limit=config.response_observation_limit,plant_calibration_vision_liveness_timeout_s=config.vision_liveness_timeout_s,
             plant_calibration_minimum_response_um=config.minimum_response_um,plant_calibration_stability_tolerance_um=config.stability_tolerance_um,
+            plant_calibration_minimum_response_wait_s=config.minimum_response_wait_s,
+            plant_calibration_low_response_wait_s=config.low_response_wait_s,
+            plant_calibration_stability_duration_s=config.stability_duration_s,
             continuous_phase_oil=config.continuous_phase_oil,surfactant_name=config.surfactant_name,
             surfactant_concentration_percent=config.surfactant_concentration_percent,surfactant_concentration_basis=config.surfactant_concentration_basis,
             aqueous_phase=config.aqueous_phase,calibration_temperature_c=config.temperature_c,
@@ -1165,6 +1183,8 @@ class PlantCalibrationExperimentDialog(QDialog):
                 f"\n阶跃响应：{response_state}；响应漂移/有效阈值：{fmt(response_drift)} / {fmt(response_tolerance)} μm"
                 f"\n实时比例/响应阈值：{fmt(response_scale)} μm/px（{response_scale_source}）/ {fmt(response_threshold)} μm"
             )
+        for key,label in (("baseline_wait_remaining_s","基线等待剩余"),("response_wait_remaining_s","响应等待剩余"),("low_response_wait_remaining_s","低响应观察等待剩余")):
+            if key in experiment:sample_detail+=f"\n{label}：{float(experiment[key]):.1f} s"
         self.status_label.setText(f"准备状态：{readiness}\n系统状态：{state}\n实验状态：{experiment.get('status','idle')}\n当前步骤：{phase}"+sample_detail+(f"\n说明：{reason}" if reason else ""))
         calibrating=state=="CALIBRATING"
         self._running=calibrating or self._running

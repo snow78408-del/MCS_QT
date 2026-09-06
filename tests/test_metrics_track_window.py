@@ -35,6 +35,7 @@ class MetricsTrackWindowTests(unittest.TestCase):
 
         self.assertEqual(completed.control.period_id, 1)
         self.assertEqual(completed.control.sample_size, 1)
+        self.assertEqual(completed.control.sample_start_time, 1.0)
         self.assertEqual(completed.control.frame_droplet_count, 1)
         self.assertAlmostEqual(completed.control.average_diameter or 0.0, 51.0)
         self.assertEqual(completed.control.frame_single_cell_rate, 100.0)

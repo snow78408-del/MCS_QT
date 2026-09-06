@@ -26,7 +26,7 @@ class PlantCalibrationExperimentConfig:
     syringe_profile: str
     q1_step: float
     q2_step: float
-    repetitions: int = 2
+    repetitions: int = 1
     baseline_sample_count: int = 5
     stable_sample_count: int = 5
     # A step with no detectable single-droplet onset is still a usable
@@ -57,6 +57,10 @@ class PlantCalibrationExperimentConfig:
     validation_step_fraction: float = 0.6
     validation_mae_limit_um: float = 2.0
     validation_nrmse_limit: float = 0.25
+    # Operator-visible observation horizons, not measured plant constants.
+    minimum_response_wait_s: float = 30.0
+    low_response_wait_s: float = 60.0
+    stability_duration_s: float = 3.0
 
     def __post_init__(self) -> None:
         for name in (
@@ -83,6 +87,9 @@ class PlantCalibrationExperimentConfig:
             "validation_step_fraction",
             "validation_mae_limit_um",
             "validation_nrmse_limit",
+            "minimum_response_wait_s",
+            "low_response_wait_s",
+            "stability_duration_s",
         ):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0.0:
@@ -91,6 +98,8 @@ class PlantCalibrationExperimentConfig:
             raise ValueError("calibration experiment maximum_step_duration_s must be finite and nonnegative")
         if int(self.repetitions) < 1:
             raise ValueError("calibration experiment repetitions must be positive")
+        if self.low_response_wait_s < self.minimum_response_wait_s:
+            raise ValueError("low-response observation horizon must cover the minimum response wait")
         if int(self.validation_repetitions) < 1:
             raise ValueError("calibration experiment needs at least one validation repetition")
         if not 0.1 <= float(self.validation_step_fraction) <= 1.0:

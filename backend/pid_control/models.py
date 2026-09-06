@@ -74,6 +74,8 @@ class PIDInput:
     measurement_noise_est: float = 0.0
     control_jitter_ms: float = 0.0
     pump_response_delay_ms: float = 0.0
+    # Optional integration horizon; dt remains the real derivative time base.
+    integration_dt: float | None = None
 
 
 @dataclass(slots=True)

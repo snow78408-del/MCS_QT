@@ -132,7 +132,8 @@ class RecognitionPanel(ttk.LabelFrame):
             self._format_float(rec.average_droplet_speed_um_s, " um/s", 2),
         )
         set_var_if_changed(self.speed_sample_count_var, str(rec.speed_sample_count))
-        set_var_if_changed(self.generation_rate_var, f"{rec.droplet_generation_rate_hz:.2f} Hz")
+        set_var_if_changed(self.generation_rate_var,
+                           f"{rec.droplet_generation_rate_hz:.2f} Hz" if rec.frequency_valid else "-- (计数无效)")
         if rec.frame_width > 0 and rec.frame_height > 0:
             set_var_if_changed(self.resolution_var, f"{rec.frame_width} x {rec.frame_height}")
         else:

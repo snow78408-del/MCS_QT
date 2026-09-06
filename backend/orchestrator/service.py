@@ -32,6 +32,7 @@ from ..pump_hardware import ChannelParams, PumpHardwareService
 from ..pump_hardware.invariants import effective_q1_q2_gap, q1_is_strictly_above_q2
 from .config import OrchestratorConfig
 from .drift import DriftSupervisor
+from .feedback_hold import FeedbackHold
 from .models import (
     ControlSnapshot,
     FrameSnapshot,
@@ -101,6 +102,8 @@ class OrchestratorService:
             )
         }
         self._pid_controller = DiameterPIDController(self.pid_config)
+        self._feedback_hold = FeedbackHold()
+        self._control_step_lock = threading.Lock()
         self._plant_calibration: PlantCalibrationRecord | None = None
         self._plant_calibration_experiment: dict[str, Any] = {
             "status": "idle",
@@ -110,6 +113,7 @@ class OrchestratorService:
             "total_trials": 0,
         }
         self._plant_calibration_in_progress = False
+        self._calibration_last_write: tuple[float, float, float, int, str] | None = None
         self._drift_supervisor = DriftSupervisor()
         pump_runtime = getattr(self.pump_service, "runtime_config", None)
         if pump_runtime is not None and hasattr(pump_runtime, "min_q1_q2_gap"):
@@ -622,6 +626,20 @@ class OrchestratorService:
         return float(drift_um) <= float(effective_tolerance_um)
 
     @staticmethod
+    def _calibration_time_tail(
+        observations: list[PlantCalibrationObservation], count: int, duration_s: float,
+    ) -> list[PlantCalibrationObservation]:
+        """Retain enough recent droplets to cover BOTH count and elapsed time."""
+        if not observations:
+            return []
+        observations = sorted(observations, key=lambda item: item.capture_monotonic)
+        start = max(0, len(observations) - count)
+        cutoff = observations[-1].capture_monotonic - duration_s
+        while start > 0 and observations[start].capture_monotonic > cutoff:
+            start -= 1
+        return observations[start:]
+
+    @staticmethod
     def _calibration_response_decision(
         observations: list[PlantCalibrationObservation],
         *,
@@ -632,17 +650,29 @@ class OrchestratorService:
         stability_tolerance_um: float,
         pixel_to_micron: float,
         noise_reference: tuple[PlantCalibrationObservation, ...],
+        eligible_after: float | None = None,
+        low_response_after: float | None = None,
+        stability_duration_s: float = 0.0,
+        confirmed_response_after: float | None = None,
     ) -> tuple[str | None, list[PlantCalibrationObservation]]:
         """Classify only a stable tail after the minimum droplet count.
 
-        A stable sub-threshold tail is a real low-response observation.  An
+        A stable sub-threshold tail is low response within the chosen horizon. An
         unstable tail is not a failure at the minimum count; callers keep
         collecting and reconsider after every new valid crossing droplet.
         """
         if len(observations) < int(minimum_observation_count):
             return None, []
         count = int(stable_sample_count)
-        tail = observations[-count:]
+        # A confirmed onset permits early completion, but the entire stable
+        # window must be after that onset (and transaction completion).
+        cutoff = eligible_after
+        if confirmed_response_after is not None:
+            cutoff = confirmed_response_after
+        eligible = [item for item in observations if cutoff is None or item.capture_monotonic >= cutoff]
+        tail = OrchestratorService._calibration_time_tail(eligible, count, stability_duration_s)
+        if not tail or tail[-1].capture_monotonic - tail[0].capture_monotonic < stability_duration_s:
+            return None, []
         if len(tail) < count or not OrchestratorService._calibration_droplet_window_is_stable(
             tail,
             float(stability_tolerance_um),
@@ -653,6 +683,8 @@ class OrchestratorService:
         steady_diameter = float(median(item.diameter_um for item in tail))
         if abs(steady_diameter - float(baseline_diameter_um)) >= float(response_threshold_um):
             return "detected_stable", tail
+        if low_response_after is not None and tail[-1].capture_monotonic < low_response_after:
+            return None, []
         return "below_detection_threshold", tail
 
     def _collect_stable_calibration_baseline(
@@ -674,6 +706,9 @@ class OrchestratorService:
         required = int(config.baseline_sample_count)
         minimum_collected = max(required, int(minimum_observation_count or required))
         collected = 0
+        receipt = self._calibration_last_write
+        origin = receipt[2] if receipt is not None and receipt[3:] == (generation, token.session_id) else time.monotonic()
+        eligible_after = origin + config.minimum_response_wait_s
         while True:
             self._require_calibration_lifecycle(generation, token)
             self._safety.heartbeat(token, timeout_s=5.0)
@@ -690,9 +725,10 @@ class OrchestratorService:
                     if new_droplets:
                         seen_droplet_ids.update(item.droplet_id for item in new_droplets)
                         last_valid_droplet = time.monotonic()
+                        new_droplets = tuple(item for item in new_droplets if item.capture_monotonic >= eligible_after)
                         collected += len(new_droplets)
                         observations.extend(new_droplets)
-                        observations = observations[-required:]
+                        observations = self._calibration_time_tail(observations, required, config.stability_duration_s)
                         diameters = [item.diameter_um for item in observations]
                         pixel_to_micron = float(
                             getattr(rec,"pixel_to_micron",0.0)
@@ -712,8 +748,10 @@ class OrchestratorService:
                             baseline_recent_range_um=(max(diameters)-min(diameters) if diameters else None),
                             baseline_median_drift_um=drift,
                             baseline_effective_tolerance_um=effective_tolerance,
+                            baseline_wait_remaining_s=max(0.0, eligible_after-time.monotonic()),
                         )
-                        if collected >= minimum_collected and self._calibration_droplet_window_is_stable(
+                        span_ok = bool(observations and observations[-1].capture_monotonic-observations[0].capture_monotonic >= config.stability_duration_s)
+                        if collected >= minimum_collected and span_ok and self._calibration_droplet_window_is_stable(
                             observations,
                             float(config.stability_tolerance_um),
                             pixel_to_micron,
@@ -737,6 +775,20 @@ class OrchestratorService:
         token: RunToken,
         next_trial_id: str,
     ) -> tuple[float, float]:
+        self._require_calibration_lifecycle(generation, token)
+        receipt = self._calibration_last_write
+        if receipt is not None and receipt[3:] == (generation, token.session_id) and receipt[:2] == (baseline_q1, baseline_q2):
+            run_state = self.pump_service.read_run_state()
+            if not run_state.ok or run_state.parsed_reply is None:
+                raise RuntimeError("baseline reuse failed: pump running state cannot be verified")
+            running, reason = self.pump_service.are_required_channels_running([1, 2], run_state.parsed_reply)
+            if not running:
+                raise RuntimeError(f"baseline reuse failed: {reason}")
+            actual_q1, actual_q2 = self.pump_service.get_current_q_state()
+            self._require_calibration_lifecycle(generation, token)
+            if self._flow_matches("Q1", baseline_q1, actual_q1)[0] and self._flow_matches("Q2", baseline_q2, actual_q2)[0]:
+                self._log(f"[PLANT_CAL][BASELINE_REUSE] next_trial={next_trial_id}; fresh run/flow readback verified; no duplicate write")
+                return float(actual_q1), float(actual_q2)
         self._update_plant_calibration_experiment(
             phase=f"{next_trial_id}: returning to the common baseline",
             current_trial=next_trial_id,
@@ -789,6 +841,7 @@ class OrchestratorService:
             self._pump_state.last_update_reason = "plant calibration flow update succeeded"
             self._pump_state.last_error = ""
             self._refresh_pump_channels(communication_ok=True, error="")
+            self._calibration_last_write = (float(q1), float(q2), time.monotonic(), generation, token.session_id)
         return (
             float(q1_actual),
             float(q2_actual),
@@ -910,6 +963,9 @@ class OrchestratorService:
         try:
             self._update_plant_calibration_experiment(
                 phase=f"{trial_id}：执行阶跃并等待有效液滴响应",
+                baseline_wait_remaining_s=0.0,
+                response_wait_remaining_s=config.minimum_response_wait_s,
+                low_response_wait_remaining_s=config.low_response_wait_s,
             )
             actual_q1, actual_q2, command_started, readback_completed = (
                 self._apply_calibration_flow(
@@ -927,9 +983,10 @@ class OrchestratorService:
                 self._require_calibration_lifecycle(generation, token)
                 self._safety.heartbeat(token, timeout_s=5.0)
                 with samples_lock:
-                    post_command = [
-                        item for item in samples if item.capture_monotonic >= command_started
-                    ]
+                    post_command = sorted(
+                        (item for item in samples if item.capture_monotonic >= command_started),
+                        key=lambda item: item.capture_monotonic,
+                    )
                 self._update_plant_calibration_experiment(
                     response_valid_droplets=len(post_command),
                     response_required_droplets=int(config.stable_sample_count),
@@ -958,10 +1015,16 @@ class OrchestratorService:
                     stability_tolerance_um=float(config.stability_tolerance_um),
                     pixel_to_micron=pixel_to_micron,
                     noise_reference=baseline,
+                    eligible_after=readback_completed + config.minimum_response_wait_s,
+                    low_response_after=readback_completed + config.low_response_wait_s,
+                    stability_duration_s=config.stability_duration_s,
+                    confirmed_response_after=(max(readback_completed, onset.capture_monotonic) if onset is not None else None),
                 )
                 self._update_plant_calibration_experiment(
                     response_median_drift_um=response_drift,
                     response_effective_tolerance_um=effective_stability_tolerance,
+                    response_wait_remaining_s=(0.0 if onset is not None else max(0.0, readback_completed + config.minimum_response_wait_s-time.monotonic())),
+                    low_response_wait_remaining_s=max(0.0, readback_completed + config.low_response_wait_s-time.monotonic()),
                 )
                 if decision == "detected_stable" and onset is not None:
                     stable_tail = decision_tail
@@ -971,12 +1034,13 @@ class OrchestratorService:
                     stable_tail = decision_tail
                     response_classification = decision
                     self._update_plant_calibration_experiment(
-                        phase=f"{trial_id}: stable low response recorded; continuing",
+                        phase=f"{trial_id}：本次观察未检测到可信响应；继续",
                         response_detected=False,
                         response_classification=response_classification,
                         reason=(
                             f"stable response remained below {response_threshold:.3f} um after "
-                            f"{len(post_command)} valid droplets; retained as a valid low-response observation"
+                            f"{len(post_command)} valid droplets within the configured observation horizon; "
+                            "later response is not excluded"
                         ),
                     )
                     break
@@ -1127,6 +1191,7 @@ class OrchestratorService:
             "total_trials": total_trials,
             "measurement_count": 0,
         }
+        self._calibration_last_write = None
         token: RunToken | None = None
         adapter_started = False
         pump_start_attempted = False
@@ -2038,7 +2103,34 @@ class OrchestratorService:
             )
         if not current:
             return None
+        if update_res.ok and self._state != SystemState.CALIBRATING:
+            # Use receipt of the completed, verified transaction, never its
+            # start or a device acknowledgement, as the conservative origin.
+            completed_at = time.monotonic()
+            wait_s, source = self._post_command_wait()
+            with self._lock:
+                if generation != self._lifecycle_generation or self._stop_event.is_set() or self._pause_event.is_set():
+                    return None
+                self._feedback_hold.record(completed_at, wait_s, source)
+            self._log(
+                f"[PID][POST_COMMAND] command_id={self._feedback_hold.command_id} "
+                f"completed_monotonic={completed_at:.6f} "
+                f"ready_after={self._feedback_hold.ready_after:.6f} source={source}"
+            )
         return update_res
+
+    def _post_command_wait(self) -> tuple[float, str]:
+        record = self._plant_calibration
+        if record is not None and record.authorized_for_pi:
+            # FOPDT 3*tau is an approximate 95% response horizon, not a
+            # measurement proving that the physical system has settled.
+            wait_ms = record.conservative_response_delay_ms + 3.0 * (
+                record.response_time_constant_ms + record.response_time_constant_uncertainty_ms
+            )
+            if math.isfinite(wait_ms) and wait_ms > 0:
+                return wait_ms / 1000.0, "validated_FOPDT_delay_plus_3tau_estimate"
+        interval_ms = getattr(self._cfg, "control_interval_ms", self.runtime.default_control_interval_ms)
+        return max(0.001, float(interval_ms) / 1000.0), "one_configured_period_unvalidated_fallback"
 
     def _control_heartbeat_timeout_s(
         self,
@@ -3000,6 +3092,17 @@ class OrchestratorService:
                 self._safety.trip("control thread exited unexpectedly")
 
     def run_control_step(self) -> None:
+        step_lock = getattr(self, "_control_step_lock", None)
+        if step_lock is None:
+            return self._run_control_step()
+        if not step_lock.acquire(blocking=False):
+            return
+        try:
+            self._run_control_step()
+        finally:
+            step_lock.release()
+
+    def _run_control_step(self) -> None:
         token = getattr(self, "_run_token", None)
         safety = getattr(self, "_safety", None)
         if safety is not None and (token is None or not safety.permits(token)):
@@ -3258,6 +3361,34 @@ class OrchestratorService:
             self._run_stabilizing_step(rec=rec, now=now, monotonic_now=monotonic_now)
             return
 
+        hold = self._feedback_hold
+        hold_reason = hold.rejection_reason(
+            monotonic_now, getattr(rec, "measurement_window_start", None),
+            getattr(rec, "measurement_window_end", None),
+        )
+        source_start = getattr(rec, "measurement_sample_start", None)
+        if hold.command_id and not hold_reason and (
+            source_start is None or not math.isfinite(source_start) or source_start < hold.ready_after
+        ):
+            hold_reason = "尺寸轨迹含等待期内的测量或来源时间缺失，等待全新样本"
+        if hold_reason:
+            self._update_control_snapshot(ControlSnapshot(
+                diameter_error=target_diameter_um - float(current_avg_diameter),
+                adjustment=0.0, q1_command=self._pump_state.q1, q2_command=self._pump_state.q2,
+                freeze_feedback=True, suggested_stop=False, reason=hold_reason, timestamp=now,
+                frame_id=int(rec.frame_id), control_period_id=int(rec.control_period_id),
+                basis_command_id=hold.command_id, feedback_ready_after=hold.ready_after,
+            ))
+            self._log(f"[PID][HOLD] {hold_reason}")
+            return
+        self._log(
+            f"[PID][BASIS] session_id={rec.session_id} generation={rec.run_generation} "
+            f"basis_command_id={hold.command_id} period_id={rec.control_period_id} "
+            f"window_start={getattr(rec, 'measurement_window_start', None)} "
+            f"window_end={getattr(rec, 'measurement_window_end', None)} frame_id={rec.frame_id}"
+            f" sample_start={source_start}"
+        )
+
         vm = VisionMetrics(
             avg_diameter=float(current_avg_diameter),
             droplet_count=int(rec.frame_droplet_count),
@@ -3307,6 +3438,7 @@ class OrchestratorService:
             current_q1=float(self._pump_state.q1),
             current_q2=float(self._pump_state.q2),
             dt=float(dt),
+            integration_dt=min(float(dt), float(control_config.control_interval_ms) / 1000.0),
             frame_id=int(rec.frame_id),
             vision_valid=bool(rec.valid_for_control),
             pump_communication_ok=bool(self._pump_state.comm_established and not self._pump_state.last_error),
@@ -3317,22 +3449,12 @@ class OrchestratorService:
             control_jitter_ms=jitter_ms,
             pump_response_delay_ms=float(getattr(disturbance_sample, "pump_response_delay_ms", 0.0) or 0.0),
         )
-        cmd = self._pid_controller.update_input(pid_input)
-        drift_supervisor = self._get_drift_supervisor()
-        previous_drift_recommendation = drift_supervisor.status().reoptimization_recommended
-        if not cmd.freeze_feedback and not cmd.suggested_stop:
-            drift_status = drift_supervisor.observe(
-                target_diameter_um=target_diameter_um,
-                diameter_error_um=float(cmd.diameter_error),
-                integral_state=float(self._pid_controller.integral),
-                integral_limit=float(self.pid_config.integral_limit),
-                actuator_saturated=bool(cmd.actuator_saturated),
-            )
-            if drift_status.reoptimization_recommended and not previous_drift_recommendation:
-                self._log(
-                    "[CONTROL][DRIFT] local PID authority is persistently exhausted; "
-                    "operator BO re-optimization recommended"
-                )
+        # Compute speculatively. Rejected, cancelled or failed commands must
+        # not advance integral, derivative, adaptive or feedforward history.
+        candidate_controller = copy.deepcopy(
+            self._pid_controller, {id(self._pid_controller.config): self._pid_controller.config}
+        )
+        cmd = candidate_controller.update_input(pid_input)
         operating_point = self._pid_controller.operating_point
         if int(rec.frame_id) > 0:
             self._last_control_frame_id = int(rec.frame_id)
@@ -3365,6 +3487,8 @@ class OrchestratorService:
             q2_output_gain=float(cmd.q2_output_gain),
             frame_id=int(cmd.frame_id),
             control_period_id=int(rec.control_period_id),
+            basis_command_id=hold.command_id,
+            feedback_ready_after=hold.ready_after,
             session_id=(token.session_id if token is not None else ""),
             run_generation=(token.generation if token is not None else 0),
             monotonic_timestamp=monotonic_now,
@@ -3481,6 +3605,29 @@ class OrchestratorService:
             self._set_state(SystemState.ERROR, error=failure_reason)
             return
         else:
+            with self._lock:
+                if (
+                    generation != self._lifecycle_generation
+                    or self._state != SystemState.RUNNING
+                    or self._stop_event.is_set() or self._pause_event.is_set()
+                    or (safety is not None and (token is None or not safety.permits(token)))
+                ):
+                    return
+                self._pid_controller = candidate_controller
+            ctrl.command_id = self._feedback_hold.command_id
+            ctrl.command_completed_monotonic = self._feedback_hold.completed_at
+            ctrl.feedback_ready_after = self._feedback_hold.ready_after
+            drift_supervisor = self._get_drift_supervisor()
+            previous_drift_recommendation = drift_supervisor.status().reoptimization_recommended
+            drift_status = drift_supervisor.observe(
+                target_diameter_um=target_diameter_um,
+                diameter_error_um=float(cmd.diameter_error),
+                integral_state=float(candidate_controller.integral),
+                integral_limit=float(self.pid_config.integral_limit),
+                actuator_saturated=bool(cmd.actuator_saturated),
+            )
+            if drift_status.reoptimization_recommended and not previous_drift_recommendation:
+                self._log("[CONTROL][DRIFT] local PID authority exhausted; operator BO re-optimization recommended")
             self._pump_state.last_update_ok = True
             self._pump_state.last_update_reason = "flow update succeeded"
             self._pump_state.last_error = ""

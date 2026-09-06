@@ -218,6 +218,17 @@ def test_plant_calibration_dialog_tracks_progress_and_locks_configuration() -> N
 
     assert dialog.start_button.text()=="运行标定"
     assert dialog.response_limit.value()==30
+    assert dialog.response_wait.value()==30.0
+    assert dialog.low_response_wait.value()==60.0
+    assert dialog.stability_duration.value()==3.0
+    assert dialog.repetitions.value()==1
+    dialog.repetitions.setValue(2)
+    dialog.validation_repetitions.setValue(2)
+    dialog.single_pass_button.click()
+    assert 6*dialog.repetitions.value()+2*dialog.validation_repetitions.value()==8
+    assert dialog.response_wait.value()==30.0
+    assert dialog.low_response_wait.value()==60.0
+    assert dialog.response_limit.value()==30
     assert dialog.stop_button.text()=="停止标定"
     assert dialog.close_button.text()=="关闭窗口"
     assert dialog.config_scroll.widgetResizable()

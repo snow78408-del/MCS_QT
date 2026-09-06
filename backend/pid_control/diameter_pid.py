@@ -155,7 +155,10 @@ class DiameterPIDController(BaseDiameterController):
             # feedforward term to act before the diameter error appears.
             u_pid = clamp(self._last_pid_output, self.config.output_min, self.config.output_max)
         else:
-            candidate_integral = self.integral + error * float(pid_input.dt)
+            integration_dt = float(pid_input.dt) if pid_input.integration_dt is None else min(
+                float(pid_input.dt), float(pid_input.integration_dt)
+            )
+            candidate_integral = self.integral + error * integration_dt
             candidate_integral = clamp(
                 candidate_integral,
                 -abs(self.config.integral_limit),
@@ -388,6 +391,10 @@ class DiameterPIDController(BaseDiameterController):
         )
 
     def _validate_input(self, pid_input: PIDInput) -> str:
+        if pid_input.integration_dt is not None and (
+            not is_finite(pid_input.integration_dt) or float(pid_input.integration_dt) < 0.0
+        ):
+            return "invalid integration horizon"
         if float(pid_input.dt) <= 0:
             return "dt <= 0"
         if not is_finite(pid_input.current_q1) or float(pid_input.current_q1) <= 0:

@@ -8,8 +8,10 @@ import numpy as np
 
 try:
     from .config import DebugConfig, DetectorConfig
+    from .capsule_profile import capsule_intervals
 except ImportError:
     from config import DebugConfig, DetectorConfig
+    from capsule_profile import capsule_intervals
 
 
 @dataclass
@@ -97,9 +99,9 @@ class DropletDetector:
     ) -> DetectionResult:
         """Measure detached C-regime plugs from paired menisci.
 
-        The rectified channel is reduced to a robust one-dimensional centre
-        profile.  Adjacent, strong meniscus peaks are paired only when their
-        separation is compatible with a detached plug.  Each accepted length
+        A transverse outline envelope separates capsule bodies from carrier
+        gaps. A centre profile provides fallback meniscus candidates when the
+        envelope has insufficient contrast. Each accepted length
         is converted to volume using the square-channel formula from
         van Steijn et al. (Scientific Reports, 2017), then reported as an
         equivalent-sphere diameter so the existing controller keeps one clear
@@ -160,8 +162,27 @@ class DropletDetector:
             max(0.0, float(self._config.generation_min_capsule_outline_ratio)),
         )
 
+        body_intervals = capsule_intervals(working)
+        if body_intervals is not None:
+            # Enhancement can erase a broad, weak boundary or amplify the
+            # background enough to reject it. Check envelope candidates in the
+            # same original intensity domain from which they were obtained.
+            transverse_gradient = np.abs(np.gradient(working.astype(np.float32), axis=0))
+            transverse_inner = transverse_gradient[
+                transverse_margin : max(transverse_margin + 1, cross_size - transverse_margin)
+            ]
+            transverse_threshold = max(1.0, float(np.percentile(transverse_inner, 80.0)))
+        # Centre-band peaks alone can disappear at a weak meniscus or pair
+        # across the carrier gap. Independent transverse outlines provide both
+        # body membership and missing endpoint candidates.
+        interval_pairs = (
+            list(zip(peak_indices, peak_indices[1:]))
+            if body_intervals is None else body_intervals
+        )
         candidates: list[tuple[float, int, int, float, float]] = []
-        for left, right in zip(peak_indices, peak_indices[1:]):
+        for left, right in interval_pairs:
+            if left <= 0 or right >= axial_size - 1:
+                continue
             length_px = float(right - left)
             if length_px < min_length or length_px > max_length:
                 continue
@@ -211,7 +232,7 @@ class DropletDetector:
                     float(np.count_nonzero(local_edge >= threshold * 0.50))
                     / float(max(1, cross_size))
                 )
-            if min(support_values) < float(
+            if body_intervals is None and min(support_values) < float(
                 self._config.generation_min_meniscus_support_ratio
             ):
                 continue
@@ -265,6 +286,7 @@ class DropletDetector:
                     "transverse_gradient": transverse_gradient,
                     "transverse_gradient_threshold": transverse_threshold,
                     "selected_outline_support": selected_outline_support,
+                    "body_intervals": body_intervals,
                 }
             )
 
@@ -330,16 +352,14 @@ class DropletDetector:
             minimum_separation,
             int(round(reference_width_px * 1.25)),
         )
-        supported = 0
-        for column in range(start, stop):
-            edge_rows = np.flatnonzero(
-                transverse_gradient[row_start:row_stop, column] >= float(edge_threshold)
-            )
-            if edge_rows.size < 2:
-                continue
-            separation = int(edge_rows[-1] - edge_rows[0])
-            if minimum_separation <= separation <= maximum_separation:
-                supported += 1
+        edges = transverse_gradient[row_start:row_stop, start:stop] >= float(edge_threshold)
+        first = np.argmax(edges, axis=0)
+        last = edges.shape[0] - 1 - np.argmax(edges[::-1], axis=0)
+        separation = last - first
+        supported = np.count_nonzero(
+            (np.count_nonzero(edges, axis=0) >= 2)
+            & (separation >= minimum_separation) & (separation <= maximum_separation)
+        )
         return float(supported) / float(max(1, stop - start))
 
     @staticmethod

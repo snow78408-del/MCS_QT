@@ -17,6 +17,7 @@ except Exception:  # pragma: no cover - handled at runtime for local video only
     cv2 = None
 
 from .models import FrameSnapshot, RecognitionSnapshot
+from backend.vision.line_counter import ContinuousLineCounter
 
 INDUSTRIAL_CAMERA_BACKENDS = {"hikrobot", "basler", "daheng", "flir", "allied_vision", "gentl"}
 PREVIEW_MAX_WIDTH = 640
@@ -245,6 +246,9 @@ class PipelineVisionService:
         }
         self._last_gallery_period_id = 0
         self._control_interval_ms = 300
+        self._line_counter = ContinuousLineCounter()
+        self._counting_wall_lines: list[dict[str, float]] = []
+        self._counting_line_ratio = 0.6
         self._latest = self._empty_snapshot("当前无有效液滴通过")
         self._latest_preview: FrameSnapshot | None = None
 
@@ -392,6 +396,7 @@ class PipelineVisionService:
                     except queue.Empty:
                         break
             self._ensure_pipeline().reset()
+            self._line_counter.reset()
 
     def set_calibration_metadata(self, metadata: dict[str, Any] | None) -> None:
         self._calibration_metadata = dict(metadata or {})
@@ -524,6 +529,9 @@ class PipelineVisionService:
             if abs(line["x2"] - line["x1"]) + abs(line["y2"] - line["y1"]) >= 0.05:
                 wall_lines.append(line)
         config.wall_lines = wall_lines if len(wall_lines) == 2 else []
+        self._counting_wall_lines = [dict(line) for line in config.wall_lines]
+        self._counting_line_ratio = float(pipeline.config.metrics.count_line_ratio)
+        self._line_counter.reset()
         flow_direction = str(values.get("flow_direction", "negative") or "negative").lower()
         if flow_direction not in {"positive", "negative", "any"}:
             raise ValueError("生成区流动方向必须为 positive、negative 或 any")
@@ -978,6 +986,7 @@ class PipelineVisionService:
             self._next_local_frame_time = 0.0
             self._ensure_pipeline().reset()
             self._reset_channel_calibration()
+            self._line_counter.reset()
             self._droplet_gallery_periods.clear()
             self._last_droplet_gallery = {
                 "period_id": 0,
@@ -1063,6 +1072,7 @@ class PipelineVisionService:
             self._droplet_generation_rate_hz = 0.0
             self._last_motion_frame_id = 0
             self._stop_event.clear()
+            self._line_counter.reset()
             self._worker = threading.Thread(target=self._capture_loop, name="vision-capture-loop", daemon=True)
             self._process_worker = threading.Thread(target=self._process_loop, name="vision-processing-loop", daemon=True)
             self._preview_worker = threading.Thread(target=self._preview_loop, name="vision-preview-loop", daemon=True)
@@ -1205,10 +1215,13 @@ class PipelineVisionService:
         timestamp: float | None = None,
         encode_frame: bool = False,
     ) -> RecognitionSnapshot:
+        with self._lock:
+            acquisition_meta = dict(self._frame_metadata.get(int(frame_id or 0), {}))
+        measurement_time = acquisition_meta.get("capture_monotonic", timestamp)
         with self._pipeline_lock:
             with self._lock:
                 self._try_channel_calibration(frame)
-            result = self._ensure_pipeline().process_frame(frame, timestamp=timestamp)
+            result = self._ensure_pipeline().process_frame(frame, timestamp=measurement_time)
         observed_ids = {int(track_id) for track_id, _ in result.tracking.matched_pairs}
         observed_ids.update(int(track_id) for track_id in result.tracking.new_track_ids)
         with self._lock:
@@ -1302,6 +1315,7 @@ class PipelineVisionService:
         crossed_track_diameters = {track_id:item[0] for track_id,item in calibration_events.items()}
         crossed_track_capture_monotonic = {track_id:item[1] for track_id,item in calibration_events.items()}
         crossed_track_frame_ids = {track_id:item[2] for track_id,item in calibration_events.items()}
+        frequency = self._line_counter.window(control.window_start_time, control.window_end_time)
         return RecognitionSnapshot(
             frame_droplet_count=active_count,
             total_droplet_count=total_count,
@@ -1348,7 +1362,13 @@ class PipelineVisionService:
             motion_window_frames=len(self._motion_observations),
             average_droplet_speed_um_s=self._average_droplet_speed_um_s,
             speed_sample_count=self._speed_sample_count,
-            droplet_generation_rate_hz=self._droplet_generation_rate_hz,
+            droplet_generation_rate_hz=float(frequency.rate_hz or 0.0),
+            frequency_valid=frequency.valid,
+            frequency_reason=frequency.reason,
+            frequency_passage_count=frequency.count,
+            measurement_window_start=control.window_start_time,
+            measurement_window_end=control.window_end_time,
+            measurement_sample_start=control.sample_start_time,
             pixel_to_micron=scale,
             scale_source=(
                 "generation_channel_width"
@@ -1672,6 +1692,16 @@ class PipelineVisionService:
                 frame_id, timestamp, frame = self._sampling_queue.get(timeout=0.05)
             except queue.Empty:
                 continue
+            try:
+                with self._lock:
+                    frame_meta = dict(self._frame_metadata.get(int(frame_id), {}))
+                sequence_id = int(frame_meta.get("hardware_frame_id", 0) or frame_id)
+                measurement_time = float(frame_meta.get("capture_monotonic", timestamp))
+                self._line_counter.observe_frame(frame, sequence_id, measurement_time,
+                                                 self._counting_wall_lines, line_ratio=self._counting_line_ratio)
+            except Exception as exc:
+                self._line_counter.reset()
+                self._log(f"[VISION][FREQUENCY][INVALID] {exc}")
             self._submit_processing_frame(frame_id, timestamp, frame)
 
     def _process_loop(self) -> None:

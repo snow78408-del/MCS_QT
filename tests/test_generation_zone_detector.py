@@ -4,6 +4,7 @@ import math
 
 import numpy as np
 import pytest
+import cv2
 
 from backend.vision.config import DebugConfig, DetectorConfig
 from backend.vision.detector import DropletDetector
@@ -71,3 +72,49 @@ def test_generation_detector_rejects_gap_and_keeps_full_capsule_outlines() -> No
 
     assert result.plug_lengths_px == pytest.approx([110.0, 130.0], abs=2.0)
     assert all(abs(length - 80.0) > 5.0 for length in result.plug_lengths_px)
+
+
+@pytest.mark.parametrize("inverted", [False, True])
+def test_weak_center_meniscus_is_recovered_from_capsule_body(inverted: bool) -> None:
+    frame = np.full((40, 400), 100, dtype=np.uint8)
+    # Strong longitudinal outlines with weak centre contrast at both ends.
+    for left, right in [(40, 140), (220, 320)]:
+        cv2.rectangle(frame, (left, 7), (right, 32), 180, 2)
+        frame[14:26, left-2:left+3] = 100
+        frame[14:26, right-2:right+3] = 100
+    if inverted:
+        frame = 255-frame
+    detector = DropletDetector(DetectorConfig(measurement_mode="generation_plug"), DebugConfig())
+    detector.configure_expected_diameter(100.0, 1.5)
+    result = detector.detect(frame)
+    assert len(result.plug_lengths_px) == 2
+    assert result.plug_lengths_px == pytest.approx([102, 102], abs=5)
+
+
+def test_partial_capsules_and_empty_uniform_channel_are_not_sizes() -> None:
+    detector = DropletDetector(DetectorConfig(measurement_mode="generation_plug"), DebugConfig())
+    frame = np.full((40, 400), 100, dtype=np.uint8)
+    assert not detector.detect(frame).plug_lengths_px
+    frame[5:35, :100] = 180
+    frame[5:35, 300:] = 180
+    assert not detector.detect(frame).plug_lengths_px
+
+
+def test_body_outline_validation_does_not_depend_on_enhancement(monkeypatch) -> None:
+    frame = np.full((40, 400), 100, dtype=np.uint8)
+    frame[6:34, 80:220] = 180
+    detector = DropletDetector(DetectorConfig(measurement_mode="generation_plug"), DebugConfig())
+    # Simulate enhancement flattening the boundary; original evidence survives.
+    monkeypatch.setattr(detector, "_preprocess", lambda image: np.full_like(image, 100))
+    assert detector.detect(frame).plug_lengths_px == pytest.approx([140], abs=3)
+
+
+def test_vectorized_outline_support_matches_column_reference() -> None:
+    gradient = np.random.default_rng(4).uniform(0, 10, size=(35, 150))
+    expected = 0
+    for column in range(12, 128):
+        rows = np.flatnonzero(gradient[4:31, column] >= 8)
+        expected += int(len(rows) >= 2 and 5 <= rows[-1]-rows[0] <= 38)
+    actual = DropletDetector._capsule_outline_support(
+        gradient, left=10, right=130, row_margin=4, edge_threshold=8, reference_width_px=30)
+    assert actual == expected / 116
