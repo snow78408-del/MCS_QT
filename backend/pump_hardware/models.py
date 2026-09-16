@@ -89,3 +89,4 @@ class FlowUpdateResult:
     readback_completed_monotonic: float = 0.0
     physical_response_started_monotonic: float | None = None
     physical_response_stable_monotonic: float | None = None
+    command_id: int = 0

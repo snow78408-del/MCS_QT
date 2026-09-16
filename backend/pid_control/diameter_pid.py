@@ -6,7 +6,7 @@ from .adaptive import AdaptivePIDManager
 from .base import BaseDiameterController
 from .config import PIDConfig, PIDControlMode
 from ..pump_hardware.invariants import effective_q1_q2_gap
-from .feedforward import FeedforwardCompensator
+from .feedforward import FeedforwardCompensator, TargetFeedforward
 from .models import PIDCommand, PIDInput, PumpState, TargetParams, VisionMetrics
 from .parameter_manager import PIDParameterManager
 from .safety import clamp, is_finite, rate_limit
@@ -176,10 +176,7 @@ class DiameterPIDController(BaseDiameterController):
             u_pid = clamp(p_term + i_term + d_term, self.config.output_min, self.config.output_max)
         self._last_pid_output = u_pid
 
-        ff = self.feedforward.compute(pid_input) if mode == PIDControlMode.ADAPTIVE_PID_WITH_FEEDFORWARD.value else None
-        u_ff = float(ff.u_ff) if ff is not None else 0.0
-        feedforward_active = bool(ff.active) if ff is not None else False
-        feedforward_reason = str(ff.reason or "") if ff is not None else "feedforward not selected"
+        ff = self.feedforward.compute(pid_input)
 
         q1_base = float(self._q1_bias) if self.config.use_initial_flow_as_output_bias else q1_current
         q2_base = float(self._q2_bias) if self.config.use_initial_flow_as_output_bias else q2_current
@@ -259,6 +256,15 @@ class DiameterPIDController(BaseDiameterController):
                 mode,
             )
 
+        target_ff = TargetFeedforward.compute(
+            self.config, target, q1_base=q1_base, q2_base=q2_base,
+            c1=q1_coefficient, c2=q2_coefficient,
+            output_low=actuator_low, output_high=actuator_high,
+            q1_bounds=(q1_flow_min, q1_flow_max), q2_bounds=(q2_flow_min, q2_flow_max),
+        )
+        u_ff = float(ff.u_ff) + float(target_ff.u_ff)
+        feedforward_active = bool(ff.active or target_ff.active)
+        feedforward_reason = f"目标：{target_ff.reason}；扰动：{ff.reason}"
         requested_output = clamp(u_pid + u_ff, self.config.output_min, self.config.output_max)
         requested_output = rate_limit(requested_output, self._last_output, self.config.output_rate_limit)
         u_final = clamp(requested_output, actuator_low, actuator_high)
@@ -354,6 +360,12 @@ class DiameterPIDController(BaseDiameterController):
             d_term=d_term,
             pid_output=u_pid,
             feedforward_output=u_ff,
+            target_feedforward_output=float(target_ff.u_ff),
+            target_feedforward_active=bool(target_ff.active),
+            target_feedforward_reason=str(target_ff.reason),
+            disturbance_feedforward_output=float(ff.u_ff),
+            disturbance_feedforward_active=bool(ff.active),
+            disturbance_feedforward_reason=str(ff.reason),
             final_output=realized_output,
             kp=self.kp,
             ki=self.ki,

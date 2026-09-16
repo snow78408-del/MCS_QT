@@ -12,7 +12,6 @@ def main() -> None:
 
     from run import run_frontend
 
-    run_frontend()
 
 
 if __name__ == "__main__":

@@ -41,6 +41,8 @@ def test_response_requires_elapsed_capture_time(start, spacing, diameter, expect
 @pytest.mark.parametrize("values", [
     {"minimum_response_wait_s": 0}, {"low_response_wait_s": 20},
     {"stability_duration_s": -1}, {"minimum_response_wait_s": float("nan")},
+    {"baseline_wait_s": -1}, {"baseline_wait_s": float("nan")},
+    {"baseline_wait_s": float("inf")},
 ])
 def test_invalid_calibration_horizons_rejected(values):
     config = PlantCalibrationExperimentConfig(
@@ -49,6 +51,19 @@ def test_invalid_calibration_horizons_rejected(values):
     )
     with pytest.raises(ValueError):
         replace(config, **values)
+
+
+def test_baseline_wait_is_independent_and_legacy_config_keeps_its_horizon():
+    config = PlantCalibrationExperimentConfig(
+        plant_id="rig", chip_id="chip", fluid_id="fluid", pump_model="pump",
+        syringe_profile="syringe", q1_step=2, q2_step=1,
+        minimum_response_wait_s=20,
+    )
+    assert config.effective_baseline_wait_s == 20
+    updated = replace(config, baseline_wait_s=0)
+    assert updated.effective_baseline_wait_s == 0
+    assert updated.minimum_response_wait_s == 20
+    assert updated.to_dict()["baseline_wait_s"] == 0
 
 
 @pytest.mark.parametrize("onset,expected", [(None, None), (5.0, "detected_stable"), (8.0, None)])
@@ -109,3 +124,16 @@ def test_baseline_reuse_needs_fresh_readback_and_current_lifecycle(case, writes)
     if case == "verified":
         assert calls == ["read"]
         assert service._calibration_last_write == receipt  # Do not restart physical waiting.
+
+
+@pytest.mark.parametrize("start,source_start,expected", [(5, 5, "detected_stable"), (8, 4, None), (8, 8, "detected_stable")])
+def test_early_response_uses_post_response_size_sources_without_extra_wait(start, source_start, expected):
+    samples = [replace(item, sample_start_monotonic=source_start) for item in observations(start, .1, 65)]
+    decision, _ = OrchestratorService._calibration_response_decision(
+        samples, baseline_diameter_um=60, response_threshold_um=.5,
+        stable_sample_count=5, minimum_observation_count=30, stability_tolerance_um=.2,
+        pixel_to_micron=.1, noise_reference=tuple(observations(0, 1, 60, 5)),
+        eligible_after=30, confirmed_response_after=5,
+        low_response_after=60, stability_duration_s=3,
+    )
+    assert decision == expected

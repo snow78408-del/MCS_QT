@@ -26,12 +26,16 @@ class ContinuousLineCounter:
     reverse flow, coalescence and unresolved gaps require separate validation.
     """
 
-    def __init__(self, *, history_limit: int = 20000, warmup_frames: int = 32) -> None:
+    def __init__(self, *, history_limit: int = 20000, warmup_frames: int = 32,
+                 minimum_phase_contrast: float = 12.0) -> None:
         if history_limit < 2 or warmup_frames < 4:
             raise ValueError("history_limit >= 2 and warmup_frames >= 4 required")
+        if not np.isfinite(minimum_phase_contrast) or not 0 < minimum_phase_contrast <= 255:
+            raise ValueError("minimum_phase_contrast must be in (0, 255]")
         self._lock = threading.RLock()
         self._limit = history_limit
         self._warmup = warmup_frames
+        self._minimum_phase_contrast = float(minimum_phase_contrast)
         self.reset()
 
     def reset(self) -> None:
@@ -94,7 +98,9 @@ class ContinuousLineCounter:
                 self._levels.append(score)
                 if len(self._levels) == self._warmup:
                     low, high = np.percentile(self._levels, [10, 90])
-                    if high - low >= 4.0 and high >= max(6.0, low * 1.5):
+                    # Do not learn two "phases" from low-amplitude texture or
+                    # compression flicker, even if their relative ratio is high.
+                    if high - low >= self._minimum_phase_contrast and high >= max(6.0, low * 1.5):
                         self._thresholds = (float(low + .3*(high-low)), float(low + .65*(high-low)))
             if self._thresholds is not None:
                 lower, upper = self._thresholds

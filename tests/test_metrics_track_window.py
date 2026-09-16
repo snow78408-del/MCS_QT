@@ -20,6 +20,22 @@ def _beads(track_ids: list[int]) -> BeadResult:
 
 
 class MetricsTrackWindowTests(unittest.TestCase):
+    def test_batch_clears_old_sizes_but_preserves_track_identity(self) -> None:
+        metrics = MetricsCalculator(MetricsConfig())
+        track = DropletTrack(id=7, position=np.array([80, 50]), radius=100, age=5)
+        tracking = TrackingResult([track], [(7, 0)], [], [], 1)
+        metrics.update(tracking, _beads([7]), 100, 200, timestamp=1.0)
+        metrics.begin_frame_batch(5)
+        track.radius = 25
+        track.position = np.array([140, 50])
+        result = metrics.update(tracking, _beads([7]), 100, 200, timestamp=10.0)
+        self.assertEqual(result.control.crossed_track_diameters, {7: 50.0})
+        self.assertEqual(result.control.crossed_track_sample_starts, {7: 10.0})
+        self.assertEqual(metrics._total_counted, 1)
+        metrics.begin_frame_batch(5)
+        metrics.update(tracking, _beads([7]), 100, 200, timestamp=20.0)
+        self.assertEqual(metrics._total_counted, 1)
+
     def test_repeated_frames_of_one_track_count_as_one_sample(self) -> None:
         metrics = MetricsCalculator(MetricsConfig(realtime_window_ms=500))
         track = DropletTrack(id=7, position=np.array([100, 50]), radius=25, age=5)
@@ -95,7 +111,7 @@ class MetricsTrackWindowTests(unittest.TestCase):
         self.assertEqual(completed.control.new_crossing_count, 1)
         self.assertEqual(completed.control.total_droplet_count, 1)
 
-    def test_false_size_outlier_does_not_freeze_diameter_feedback(self) -> None:
+    def test_real_large_droplet_is_preserved_in_feedback_statistics(self) -> None:
         config = MetricsConfig(
             realtime_window_ms=500,
             max_diameter_cv_for_control=25.0,
@@ -122,10 +138,11 @@ class MetricsTrackWindowTests(unittest.TestCase):
         completed = metrics.update(empty, _beads([]), 100, 200, timestamp=1.51)
 
         self.assertEqual(completed.control.frame_droplet_count, 5)
-        self.assertEqual(completed.control.sample_size, 4)
+        self.assertEqual(completed.control.sample_size, 5)
         self.assertTrue(completed.control.valid_for_control)
-        self.assertLess(completed.control.frame_diameter_cv or 100.0, 25.0)
-        self.assertAlmostEqual(completed.control.average_diameter or 0.0, 49.9, places=1)
+        self.assertGreater(completed.control.frame_diameter_cv or 0.0, 25.0)
+        self.assertAlmostEqual(completed.control.average_diameter or 0.0, 67.92, places=2)
+        self.assertEqual(completed.control.filtering_rule, "none")
 
     def test_high_diameter_cv_is_reported_but_does_not_freeze_feedback(self) -> None:
         config = MetricsConfig(

@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDou
     QSplitter, QStackedWidget, QStyle, QToolButton, QVBoxLayout, QWidget)
 
 from backend.orchestrator import BayesianOptimizationConfig, OrchestratorService
-from backend.orchestrator.models import SystemConfig
+from backend.orchestrator.models import SystemConfig, validate_control_batch
 from backend.vision.calibration import load_calibration
 from backend.pid_control import PlantCalibrationExperimentConfig
 from backend.pid_control.calibration import load_plant_calibration
@@ -423,6 +423,45 @@ class HoughParametersDialog(QDialog):
         self.accept()
 
 
+class ControlBatchDialog(QDialog):
+    def __init__(self, app, parent=None):
+        super().__init__(parent)
+        self.app = app
+        self.setWindowTitle("PID 采集与分析帧数")
+        self.resize(520, 280)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        cfg = app.frontend_config
+        self.capture_frames = QSpinBox()
+        self.analysis_frames = QSpinBox()
+        for widget, key in ((self.capture_frames, "control_capture_frames"), (self.analysis_frames, "control_analysis_frames")):
+            widget.setRange(5, 64)
+            widget.setSuffix(" 帧")
+            widget.setValue(int(cfg.get(key, 5)))
+        form.addRow("每周期采集帧数 N", self.capture_frames)
+        form.addRow("每周期分析帧数 M", self.analysis_frames)
+        layout.addLayout(form)
+        hint = QLabel("采满 N 帧 → 分析末尾连续 M 帧 → 汇总本批液滴尺寸 → PID → 调泵。\n"
+                      "M 不能大于 N；默认 5/5，可增加到 10/10 或更多。\n"
+                      "保存后从下一批生效。有效液滴不足时保持流量；泵的最短调节间隔和响应等待仍生效。")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        save = QPushButton("保存并启用批次控制")
+        save.clicked.connect(self._save)
+        layout.addWidget(save)
+
+    def _save(self):
+        capture, analysis = self.capture_frames.value(), self.analysis_frames.value()
+        try:
+            validate_control_batch(capture, analysis)
+            self.app.orchestrator.configure_control_batch(capture, analysis)
+        except (ValueError, RuntimeError) as exc:
+            self.app.error("批次参数无效", str(exc))
+            return
+        self.app.save(control_batch_enabled=True, control_capture_frames=capture, control_analysis_frames=analysis)
+        self.accept()
+
+
 class ParameterPage(Page):
     def __init__(self, app):
         super().__init__(app); cfg = app.frontend_config
@@ -433,13 +472,27 @@ class ParameterPage(Page):
         self.pixel = self.number_field(form, "相机像元尺寸", cfg.get("camera_pixel_size_um", 6.9), 0.001, 1000, decimals=4, suffix="μm")
         self.interval = self.number_field(
             form,
-            f"控制周期（最低 {MIN_CONTROL_INTERVAL_MS} ms）",
+            f"控制周期／批次最短间隔（最低 {MIN_CONTROL_INTERVAL_MS} ms）",
             int(cfg.get("control_interval_ms", DEFAULT_CONTROL_INTERVAL_MS)),
             MIN_CONTROL_INTERVAL_MS,
             MAX_CONTROL_INTERVAL_MS,
             suffix="ms",
             integer=True,
         )
+        self.batch_button = QPushButton("PID 采集／分析帧数…")
+        self.batch_button.clicked.connect(lambda: ControlBatchDialog(app, self).exec())
+        form.addRow("按帧批次控制", self.batch_button)
+        self.target_feedforward = QCheckBox("启用目标前馈（使用局部标定模型）")
+        self.target_feedforward.setChecked(bool(cfg.get("target_feedforward_enabled", False)))
+        self.disturbance_feedforward = QCheckBox("请求启用扰动前馈（需独立验证）")
+        self.disturbance_feedforward.setChecked(bool(cfg.get("disturbance_feedforward_enabled", False)))
+        form.addRow("前馈独立设置", self.target_feedforward)
+        form.addRow("", self.disturbance_feedforward)
+        ff_hint = QLabel("保存并重新初始化后生效；与固定／自适应反馈模式独立。目标前馈仅用于标定范围内。\n"
+                         "当前生成区尚无匹配输出单位的扰动前馈标定，勾选也不会绕过验证。")
+        ff_hint.setWordWrap(True)
+        ff_hint.setObjectName("formHint")
+        form.addRow("", ff_hint)
         calibration_row=QWidget(); calibration_layout=QHBoxLayout(calibration_row); calibration_layout.setContentsMargins(0,0,0,0)
         self.calibration_path=QLineEdit(str(cfg.get("calibration_path",""))); calibration_button=QPushButton("选择…"); set_button_role(calibration_button,"secondary"); calibration_button.clicked.connect(self._browse_calibration)
         calibration_layout.addWidget(self.calibration_path,1); calibration_layout.addWidget(calibration_button); form.addRow("版本化标定 JSON（可选）",calibration_row)
@@ -508,6 +561,8 @@ class ParameterPage(Page):
         except (ValueError,OSError) as exc: return self.app.error("参数错误", str(exc))
         self.app.save(target_diameter=target, magnification=mag, camera_pixel_size_um=pixel,
                       pixel_to_micron=scale, control_interval_ms=interval,
+                      target_feedforward_enabled=self.target_feedforward.isChecked(),
+                      disturbance_feedforward_enabled=self.disturbance_feedforward.isChecked(),
                       calibration_path=calibration_path,calibration=calibration,
                       plant_calibration_path=plant_calibration_path,plant_calibration=plant_calibration)
         self.app.show_page("video")
@@ -904,6 +959,8 @@ class PlantCalibrationExperimentDialog(QDialog):
         self.stable_count=QSpinBox(); self.stable_count.setRange(3,200); self.stable_count.setValue(int(cfg.get("plant_calibration_stable_samples",5)))
         self.response_limit=QSpinBox(); self.response_limit.setRange(5,1000); self.response_limit.setValue(int(cfg.get("plant_calibration_response_observation_limit",30)))
         self.response_wait=decimal(cfg.get("plant_calibration_minimum_response_wait_s",30.0),0.1,3600.0,1," s")
+        self.baseline_wait=decimal(cfg.get("plant_calibration_baseline_wait_s",cfg.get("plant_calibration_minimum_response_wait_s",30.0)),0.0,3600.0,1," s")
+        self.baseline_wait.setToolTip("从基线流量事务完成起计时；0 表示只等待有效液滴数和持续稳定判定。缩短此值可能采入上一阶跃的迟到响应。")
         self.low_response_wait=decimal(cfg.get("plant_calibration_low_response_wait_s",60.0),0.1,7200.0,1," s")
         self.stability_duration=decimal(cfg.get("plant_calibration_stability_duration_s",3.0),0.1,300.0,1," s")
         self.liveness_timeout=decimal(cfg.get("plant_calibration_vision_liveness_timeout_s",120.0),15.0,3600.0,1," s")
@@ -931,9 +988,15 @@ class PlantCalibrationExperimentDialog(QDialog):
         form.addRow("水相组成",self.aqueous_phase); form.addRow("标定温度",self.temperature)
         form.addRow("Q1 阶跃幅值",self.q1_step); form.addRow("Q2 阶跃幅值",self.q2_step)
         form.addRow("建模正负阶跃重复数",self.repetitions); form.addRow("独立验证正负阶跃重复数",self.validation_repetitions); form.addRow("基线有效液滴数",self.baseline_count); form.addRow("响应稳定有效液滴数",self.stable_count); form.addRow("单回合最少观察液滴数",self.response_limit)
-        form.addRow("基线等待／未确认响应时等待",self.response_wait)
+        form.addRow("基线等待时间",self.baseline_wait)
+        form.addRow("未确认响应时最短等待",self.response_wait)
         form.addRow("低响应判定前观察等待",self.low_response_wait)
         form.addRow("稳定窗口最短持续时间",self.stability_duration)
+        self.maximum_attempts=QSpinBox(); self.maximum_attempts.setRange(1,5)
+        self.maximum_attempts.setValue(int(cfg.get("plant_calibration_maximum_attempts",3)))
+        form.addRow("自动辨识最多轮数",self.maximum_attempts)
+        completion_hint=QLabel("目标：PID 独立验证与 MPC 数据验证均通过才算成功。未通过自动延长观察并增加重复；每轮使用新验证数据，达到轮数上限则停泵保留诊断。")
+        completion_hint.setWordWrap(True); form.addRow("成功条件",completion_hint)
         self.single_pass_button=QPushButton("一次建模（8 组）")
         self.single_pass_button.setToolTip("建模正反方向各一次，保留两组独立验证；不改变等待、样本数或稳定阈值。正式重复性实验需另行增加重复数。")
         self.single_pass_button.clicked.connect(lambda: (self.repetitions.setValue(1),self.validation_repetitions.setValue(1)))
@@ -948,7 +1011,7 @@ class PlantCalibrationExperimentDialog(QDialog):
         self.config_scroll.setMinimumHeight(240)
         layout.addWidget(self.config_scroll,1)
         self._config_widgets=[*self.metadata.values(),self.continuous_phase_oil,self.surfactant_name,self.surfactant_concentration,self.surfactant_basis,self.aqueous_phase,self.temperature,self.channel_height,self.channel_width,self.volume_correction,self.q1_step,self.q2_step,self.repetitions,self.validation_repetitions,self.baseline_count,self.stable_count,self.response_limit,self.liveness_timeout,self.minimum_response,self.stability]
-        self._config_widgets.extend([self.response_wait,self.low_response_wait,self.stability_duration,self.single_pass_button])
+        self._config_widgets.extend([self.baseline_wait,self.response_wait,self.low_response_wait,self.stability_duration,self.single_pass_button,self.maximum_attempts])
 
         status_box=QGroupBox("标定运行状态"); status_layout=QVBoxLayout(status_box)
         self.baseline_label=QLabel("当前基准流量：等待读取已验证的 Q1/Q2")
@@ -998,6 +1061,7 @@ class PlantCalibrationExperimentDialog(QDialog):
 
     def _config(self):
         return PlantCalibrationExperimentConfig(
+            maximum_attempts=int(self.maximum_attempts.value()), require_mpc_validation=True,
             plant_id=self.metadata["plant_id"].text().strip(),chip_id=self.metadata["chip_id"].text().strip(),
             fluid_id=self.metadata["fluid_id"].text().strip(),pump_model=self.metadata["pump_model"].text().strip(),
             syringe_profile=self.metadata["syringe_profile"].text().strip(),q1_step=float(self.q1_step.value()),q2_step=float(self.q2_step.value()),
@@ -1005,6 +1069,7 @@ class PlantCalibrationExperimentDialog(QDialog):
             maximum_step_duration_s=0.0,vision_liveness_timeout_s=float(self.liveness_timeout.value()),minimum_response_um=float(self.minimum_response.value()),
             stability_tolerance_um=float(self.stability.value()),
             minimum_response_wait_s=float(self.response_wait.value()),
+            baseline_wait_s=float(self.baseline_wait.value()),
             low_response_wait_s=float(self.low_response_wait.value()),
             stability_duration_s=float(self.stability_duration.value()),
             channel_height_um=float(self.channel_height.value()),
@@ -1036,7 +1101,7 @@ class PlantCalibrationExperimentDialog(QDialog):
         answer=QMessageBox.warning(
             self,"确认自动阶跃标定",
             f"将执行 {6*config.repetitions+2*config.validation_repetitions} 次有界阶跃，其中最后 {2*config.validation_repetitions} 次仅用于独立验证。\n"
-            f"基线等待 {config.minimum_response_wait_s:g} 秒；阶跃检测到可信响应后可提前结束，需满足有效液滴数量及持续稳定 {config.stability_duration_s:g} 秒。未检测到响应则观察至 {config.low_response_wait_s:g} 秒，稳定窗口并行累计，不设固定总实验时长。\n"
+            f"基线等待 {config.effective_baseline_wait_s:g} 秒；阶跃检测到可信响应后可提前结束，需满足有效液滴数量及持续稳定 {config.stability_duration_s:g} 秒。未检测到响应则观察至 {config.low_response_wait_s:g} 秒，稳定窗口并行累计，不设固定总实验时长。\n"
             "请确认芯片、管路和收集容器安全，且操作人员保持在设备旁。是否开始？",
             QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,QMessageBox.StandardButton.No,
         )
@@ -1052,11 +1117,12 @@ class PlantCalibrationExperimentDialog(QDialog):
         self.app.save(
             **{key:edit.text().strip() for key,edit in self.metadata.items()},
             plant_calibration_q1_step=config.q1_step,plant_calibration_q2_step=config.q2_step,
-            plant_calibration_repetitions=config.repetitions,plant_calibration_baseline_samples=config.baseline_sample_count,
+            plant_calibration_maximum_attempts=config.maximum_attempts,plant_calibration_repetitions=config.repetitions,plant_calibration_baseline_samples=config.baseline_sample_count,
             plant_calibration_validation_repetitions=config.validation_repetitions,
             plant_calibration_stable_samples=config.stable_sample_count,plant_calibration_response_observation_limit=config.response_observation_limit,plant_calibration_vision_liveness_timeout_s=config.vision_liveness_timeout_s,
             plant_calibration_minimum_response_um=config.minimum_response_um,plant_calibration_stability_tolerance_um=config.stability_tolerance_um,
             plant_calibration_minimum_response_wait_s=config.minimum_response_wait_s,
+            plant_calibration_baseline_wait_s=config.baseline_wait_s,
             plant_calibration_low_response_wait_s=config.low_response_wait_s,
             plant_calibration_stability_duration_s=config.stability_duration_s,
             continuous_phase_oil=config.continuous_phase_oil,surfactant_name=config.surfactant_name,
@@ -1086,18 +1152,31 @@ class PlantCalibrationExperimentDialog(QDialog):
         return self.app.orchestrator.run_plant_calibration_experiment(config)
 
     def _completed(self,result):
+        result.require_accepted()
         self.result=result; self._running=False; self.refresh_status()
+        diagnostics=result.diagnostics
+        validation_details="\n".join(
+            f"{item['trial_id']}：预测 {item['predicted_change_um']:+.3f} μm / 实测 {item['observed_change_um']:+.3f} μm，MAE {item['mae_um']:.3f} μm"
+            for item in diagnostics["trials"] if "predicted_change_um" in item
+        )
+        repeatability="；".join(
+            f"{name.upper()}：{item['detected_count']}/{item['trial_count']} 次确认响应，跨轮基线跨度 {item['baseline_span_um']:.3f} μm"
+            for name,item in diagnostics["channels"].items() if name in {"q1","q2"} and item["trial_count"]
+        )
         channel_status=(
-            f"Q1 {'参与控制' if result.record.q1_output_gain > 0.0 else '低于分辨率，已退出控制'}；"
-            f"Q2 {'参与控制' if result.record.q2_output_gain > 0.0 else '低于分辨率，已退出控制'}"
+            f"Q1 {'已辨识候选方向' if result.record.q1_output_gain > 0.0 else '本次未辨识出有效响应，暂不分配控制量'}；"
+            f"Q2 {'已辨识候选方向' if result.record.q2_output_gain > 0.0 else '本次未辨识出有效响应，暂不分配控制量'}"
         )
         QMessageBox.information(
-            self,"自动标定完成",
+            self,"自动标定成功：独立验证已通过",
             f"已完成 {len(result.measurements)} 次阶跃，泵已安全停止。\n"
             f"响应延迟：{result.record.response_delay_median_ms:.1f} ± {result.record.response_delay_uncertainty_ms:.1f} ms\n"
             f"Q1/Q2 对数直径灵敏度：{result.record.q1_log_diameter_sensitivity:.6f} / {result.record.q2_log_diameter_sensitivity:.6f}\n"
             f"FOPDT：τ={result.record.response_time_constant_ms:.1f} ms，拟合 MAE={result.record.model_fit_mae_um:.3f} μm，NRMSE={result.record.model_fit_nrmse:.3f}\n"
             f"独立验证：MAE={result.record.validation_mae_um:.3f} μm，NRMSE={result.record.validation_nrmse:.3f}；PI {'已授权' if result.record.validated_for_pi else '未授权'}，MPC {'数据合格' if result.record.validated_for_mpc else '数据不足'}\n"
+            f"验证标准：MAE ≤ {result.config.validation_mae_limit_um:g} μm，NRMSE ≤ {result.config.validation_nrmse_limit:g}；观测数 {result.record.validation_sample_count}\n"
+            f"{validation_details}\n{repeatability}\n"
+            "稳定但未检测到响应不等于故障或零增益；验证未通过表示预测误差或证据不足，不能由此判断有空气。\n"
             f"PI：Kp={result.record.controller_kp:.6f}，Ki={result.record.controller_ki:.6f}，Kd=0\n"
             f"通道结论：{channel_status}\n"
             f"局部有效流量：Q1 {result.record.q1_min:.3f}–{result.record.q1_max:.3f}，Q2 {result.record.q2_min:.3f}–{result.record.q2_max:.3f} μL/min",
@@ -1106,10 +1185,17 @@ class PlantCalibrationExperimentDialog(QDialog):
 
     def _failed(self,exc):
         self._running=False; self.refresh_status()
-        try: state=str(getattr(self.app.orchestrator.get_snapshot().system_state,"value","")).upper()
-        except Exception: state=""
+        try:
+            snapshot=self.app.orchestrator.get_snapshot()
+            state=str(getattr(snapshot.system_state,"value","")).upper()
+            status=str((snapshot.plant_calibration_experiment or {}).get("status",""))
+        except Exception: state=""; status=""
         if "cancelled by a lifecycle transition" in str(exc) and state in {"PAUSED","STOPPED"}:
             QMessageBox.information(self,"标定已中止","自动标定已由暂停或停止操作中止，泵已进入安全状态。")
+        elif status=="insufficient_response" and state=="STOPPED":
+            QMessageBox.information(self,"标定响应不足，需要重测",str(exc))
+        elif status=="validation_failed" and state=="STOPPED":
+            QMessageBox.information(self,"标定未成功：已达重试上限",str(exc))
         else:self.app.error("自动标定失败",str(exc))
 
     def _pause(self):
@@ -1143,7 +1229,8 @@ class PlantCalibrationExperimentDialog(QDialog):
         QMessageBox.information(
             self,"标定文件已保存",
             f"可加载标定：\n{saved['path']}\n\n原始阶跃测量：\n{saved['measurements_path']}\n\n"
-            "请点击“初始化”重新加载。只有通过独立验证且显示 PI 已授权的记录才能启动实时闭环；MPC 数据合格状态仅供后续模型使用。",
+            f"MPC 训练数据：\n{saved.get('mpc_training_path') or '本次未导出'}\n\n"
+            "已自动选入标定参数。请点击“初始化”加载，通过设备检查后可开始闭环 PID。MPC 数据包保留训练/验证分组，MPC 控制器部署仍需另外验证。",
         )
 
     def refresh_status(self):
@@ -1514,6 +1601,9 @@ class MonitorPage(Page):
         set_button_role(self.gallery_button,"secondary")
         self.gallery_button.clicked.connect(self._show_last_period_droplets)
         tools.addWidget(self.gallery_button); tools.addStretch()
+        self.batch_button = QPushButton("PID 采集／分析帧数…")
+        self.batch_button.clicked.connect(lambda: ControlBatchDialog(app, self).exec())
+        calibration_tools.addWidget(self.batch_button)
         control_layout.addLayout(lifecycle); control_layout.addLayout(calibration_tools); control_layout.addLayout(tools); layout.addWidget(control_bar)
 
         row=QSplitter(Qt.Horizontal)
@@ -2066,14 +2156,20 @@ class MonitorPage(Page):
         return "\n".join([
             f"控制周期：{getattr(rec,'control_period_id',0)}",
             f"当前帧编号：{getattr(rec,'frame_id',0)}",
-            f"本周期穿线液滴：{getattr(rec,'frame_droplet_count',0)}",
-            f"累计穿线液滴：{getattr(rec,'total_droplet_count',0)}",
+            f"当前画面确认液滴：{getattr(rec,'current_frame_droplet_count',0)}",
+            f"尺寸跟踪窗口通过数：{getattr(rec,'window_passage_count',0)}",
+            f"窗口尺寸样本数（每滴一份）：{getattr(rec,'valid_size_sample_count',0)}",
+            f"PID 帧批次：{getattr(rec,'control_batch_id',0) or '--'} · 采集 {getattr(rec,'batch_capture_frames',0)} / 分析 {getattr(rec,'batch_analysis_frames',0)} 帧",
+            f"采集／分析进度：{getattr(rec,'vision_performance_status','') or '--'}",
+            f"尺寸跟踪累计通过数：{getattr(rec,'total_droplet_count',0)}",
+            f"连续计数窗口通过数：{getattr(rec,'frequency_passage_count',0) if getattr(rec,'frequency_valid',False) else '无有效数据'}",
+            f"尺寸质量：{getattr(rec,'measurement_quality_reason','无有效数据')}",
             f"平均直径：{number(getattr(rec,'avg_diameter',None))} μm",
             f"液滴速度：{number(getattr(rec,'average_droplet_speed_um_s',None))} μm/s",
             f"速度样本数：{getattr(rec,'speed_sample_count',0)}",
             f"累计液滴级单珠率：{number(getattr(rec,'single_cell_rate',None))}%",
             f"本周期液滴级单珠率：{number(getattr(rec,'frame_single_cell_rate',None))}%",
-            f"原始/筛选后直径 CV：{number(getattr(rec,'raw_frame_diameter_cv',None))}% / {number(getattr(rec,'frame_diameter_cv',None))}%",
+            f"尺寸 CV：{number(getattr(rec,'frame_diameter_cv',None))}%",
             f"筛选规则：{getattr(rec,'filtering_rule','none')}",
             f"可用于控制：{yes(getattr(rec,'valid_for_control',False))}",
             f"管道标定：{calibration_status}",
@@ -2151,6 +2247,8 @@ class MonitorPage(Page):
             f"请求/实际分配输出：{number(getattr(ctrl,'requested_output',None),4)} / {number(getattr(ctrl,'realized_output',None),4)}",
             f"BO/PID 工作点 Q1/Q2：{number(getattr(ctrl,'operating_point_q1',None))} / {number(getattr(ctrl,'operating_point_q2',None))} μL/min",
             f"前馈状态：{yes(getattr(ctrl,'feedforward_active',False))}；{getattr(ctrl,'feedforward_reason','') or '无'}",
+            f"目标前馈：设置 {yes(getattr(config,'target_feedforward_enabled',False))} / 本周期生效 {yes(getattr(ctrl,'target_feedforward_active',False) and not getattr(ctrl,'freeze_feedback',False))} · 输出 {number(getattr(ctrl,'target_feedforward_output',0),4)}；{getattr(ctrl,'target_feedforward_reason','') or '等待有效控制周期'}",
+            f"扰动前馈：设置 {yes(getattr(config,'disturbance_feedforward_enabled',False))} / 本周期生效 {yes(getattr(ctrl,'disturbance_feedforward_active',False) and not getattr(ctrl,'freeze_feedback',False))} · 输出 {number(getattr(ctrl,'disturbance_feedforward_output',0),4)}；{getattr(ctrl,'disturbance_feedforward_reason','') or '等待有效控制周期'}",
             f"反馈冻结：{yes(getattr(ctrl,'freeze_feedback',False))}",
             f"控制说明：{getattr(ctrl,'reason','') or '无'}",
         ])
@@ -2451,7 +2549,7 @@ class FrontendApp(QMainWindow):
     def build_system_config(self):
         cfg=self.frontend_config; required=("target_diameter","pixel_to_micron","video_source_type","video_source","initial_q1","initial_q2","control_interval_ms"); missing=[k for k in required if k not in cfg]
         if missing: raise ValueError(f"缺少配置字段: {', '.join(missing)}")
-        return SystemConfig(target_diameter=float(cfg["target_diameter"]),pixel_to_micron=float(cfg["pixel_to_micron"]),video_source_type=str(cfg["video_source_type"]),video_source=str(cfg["video_source"]),initial_q1=float(cfg["initial_q1"]),initial_q2=float(cfg["initial_q2"]),control_interval_ms=int(cfg["control_interval_ms"]),pump_port=str(cfg.get("pump_port","")),pump_address=int(cfg.get("pump_address",1)),pump_baudrate=int(cfg.get("pump_baudrate",1200)),pump_parity=str(cfg.get("pump_parity","N")),mvs_sdk_path=str(cfg.get("mvs_sdk_path","")),camera_backend=str(cfg.get("camera_backend","")),camera_parameters=dict(cfg.get("camera_parameters",{}) or {}),recognition_roi=dict(cfg.get("recognition_roi",{}) or {}),calibration=dict(cfg.get("calibration",{}) or {}),plant_calibration=dict(cfg.get("plant_calibration",{}) or {}))
+        return SystemConfig(target_diameter=float(cfg["target_diameter"]),pixel_to_micron=float(cfg["pixel_to_micron"]),video_source_type=str(cfg["video_source_type"]),video_source=str(cfg["video_source"]),initial_q1=float(cfg["initial_q1"]),initial_q2=float(cfg["initial_q2"]),control_interval_ms=int(cfg["control_interval_ms"]),target_feedforward_enabled=bool(cfg.get("target_feedforward_enabled",False)),disturbance_feedforward_enabled=bool(cfg.get("disturbance_feedforward_enabled",False)),control_batch_enabled=bool(cfg.get("control_batch_enabled",False)),control_capture_frames=int(cfg.get("control_capture_frames",5)),control_analysis_frames=int(cfg.get("control_analysis_frames",5)),pump_port=str(cfg.get("pump_port","")),pump_address=int(cfg.get("pump_address",1)),pump_baudrate=int(cfg.get("pump_baudrate",1200)),pump_parity=str(cfg.get("pump_parity","N")),mvs_sdk_path=str(cfg.get("mvs_sdk_path","")),camera_backend=str(cfg.get("camera_backend","")),camera_parameters=dict(cfg.get("camera_parameters",{}) or {}),recognition_roi=dict(cfg.get("recognition_roi",{}) or {}),calibration=dict(cfg.get("calibration",{}) or {}),plant_calibration=dict(cfg.get("plant_calibration",{}) or {}))
     def configure_prepare_initialize(self):
         cfg=self.build_system_config(); self.orchestrator.configure(cfg); self.orchestrator.prepare_video(); self.orchestrator.initialize_system()
     def task(self,task,on_success=None,on_error=None,disable=None):

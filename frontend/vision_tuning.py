@@ -64,6 +64,7 @@ _PARAMETER_RANGES: dict[str, tuple[float, float, float]] = {
     "generation_min_profile_contrast_sigma": (0.0, 5.0, 0.05),
     "generation_min_meniscus_support_ratio": (0.01, 1.0, 0.01),
     "generation_min_capsule_outline_ratio": (0.10, 0.95, 0.01),
+    "generation_min_raw_outline_contrast": (0.5, 255.0, 0.5),
     "min_radius": (1.0, 300.0, 1.0),
     "max_radius": (2.0, 300.0, 1.0),
     "min_center_distance": (1.0, 300.0, 1.0),
@@ -815,6 +816,11 @@ class TuningWindow(QWidget):
                         "上下胶囊边缘最低覆盖率",
                         config.generation_min_capsule_outline_ratio,
                     ),
+                    self._number(
+                        "generation_min_raw_outline_contrast",
+                        "原图轮廓对比下限（灰度级）",
+                        config.generation_min_raw_outline_contrast,
+                    ),
                     self._choice(
                         "generation_polarity",
                         "液滴相对连续相亮暗",
@@ -1106,17 +1112,17 @@ class TuningWindow(QWidget):
         else:
             self._expanded_stages.discard(index)
 
-    def _save(self) -> None:
+    def _save(self) -> bool:
         if self._settings_store is None:
             QMessageBox.warning(self, "保存失败", "未配置算法参数存储位置。")
-            return
+            return False
         try:
             self.current_config.measurement_mode = "generation_plug"
             _validate_tuning_configs(self.current_config, self.current_channel_config)
             self._settings_store.save(self.current_config, self.current_channel_config)
         except Exception as exc:
             QMessageBox.warning(self, "保存失败", str(exc))
-            return
+            return False
 
         apply_error = ""
         if self._on_parameters_saved is not None:
@@ -1142,6 +1148,7 @@ class TuningWindow(QWidget):
             self.status.setText("算法参数已保存并应用到采样识别，从下一采样帧开始生效。")
         else:
             self.status.setText("算法参数已保存，并替代原用户参数。")
+        return not apply_error
 
 
 def main(video: str = "") -> None:

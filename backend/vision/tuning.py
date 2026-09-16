@@ -58,6 +58,7 @@ SEARCHABLE_FIELDS = (
     "generation_min_profile_contrast_sigma",
     "generation_min_meniscus_support_ratio",
     "generation_min_capsule_outline_ratio",
+    "generation_min_raw_outline_contrast",
 )
 
 
@@ -245,6 +246,7 @@ def _inspect_generation_frame(
                 f"对比 ≥ {config.generation_min_profile_contrast_sigma:g}σ；"
                 f"弯月面支撑 ≥ {config.generation_min_meniscus_support_ratio:g}；"
                 f"上下胶囊边缘覆盖 ≥ {config.generation_min_capsule_outline_ratio:g}；"
+                f"原图轮廓对比 ≥ {config.generation_min_raw_outline_contrast:g} 灰度级；"
                 f"极性 {config.generation_polarity}"
             ),
             statistics=f"有效配对 {len(result.centers)} 个",

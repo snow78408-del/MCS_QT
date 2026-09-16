@@ -27,8 +27,19 @@ class SystemConfig:
     recognition_roi: dict[str, Any] = field(default_factory=dict)
     calibration: dict[str, Any] = field(default_factory=dict)
     plant_calibration: dict[str, Any] = field(default_factory=dict)
+    control_batch_enabled: bool = False
+    control_capture_frames: int = 5
+    control_analysis_frames: int = 5
+    target_feedforward_enabled: bool = False
+    disturbance_feedforward_enabled: bool = False
 
     def __post_init__(self) -> None:
+        for name in ("target_feedforward_enabled", "disturbance_feedforward_enabled"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be boolean")
+        validate_control_batch(self.control_capture_frames, self.control_analysis_frames)
+        if not isinstance(self.control_batch_enabled, bool):
+            raise ValueError("control_batch_enabled must be boolean")
         finite_positive = {
             "target_diameter": self.target_diameter,
             "pixel_to_micron": self.pixel_to_micron,
@@ -65,6 +76,14 @@ class SystemConfig:
             PlantCalibrationRecord.from_mapping(dict(self.plant_calibration))
 
 
+def validate_control_batch(capture_frames: int, analysis_frames: int) -> None:
+    for value in (capture_frames, analysis_frames):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("采集和分析帧数必须是整数")
+    if not 5 <= analysis_frames <= capture_frames <= 64:
+        raise ValueError("帧数必须满足：5 ≤ 分析帧数 ≤ 采集帧数 ≤ 64")
+
+
 @dataclass(slots=True)
 class RecognitionSnapshot:
     frame_droplet_count: int
@@ -81,6 +100,9 @@ class RecognitionSnapshot:
     has_droplet: bool
     control_reason: str
     frame_png_base64: Optional[str] = None
+    control_batch_id: int = 0
+    batch_capture_frames: int = 0
+    batch_analysis_frames: int = 0
     frame_width: int = 0
     frame_height: int = 0
     video_source_type: str = ""
@@ -122,6 +144,13 @@ class RecognitionSnapshot:
     measurement_window_start: float | None = None
     measurement_window_end: float | None = None
     measurement_sample_start: float | None = None
+    measurement_sample_end: float | None = None
+    processing_completed_monotonic: float = 0.0
+    current_frame_droplet_count: int = 0
+    window_passage_count: int = 0
+    valid_size_sample_count: int = 0
+    measurement_quality_valid: bool = False
+    measurement_quality_reason: str = "waiting for calibrated size measurements"
     pixel_to_micron: float = 0.0
     scale_source: str = "configured"
     channel_width_um: float | None = None
@@ -140,6 +169,7 @@ class RecognitionSnapshot:
     raw_frame_diameters: list[float] = field(default_factory=list)
     crossed_track_diameters: dict[int, float] = field(default_factory=dict)
     crossed_track_capture_monotonic: dict[int, float] = field(default_factory=dict)
+    crossed_track_sample_starts: dict[int, float] = field(default_factory=dict)
     crossed_track_frame_ids: dict[int, int] = field(default_factory=dict)
     raw_frame_diameter_cv: float | None = None
     filtering_rule: str = "none"
@@ -207,6 +237,12 @@ class ControlSnapshot:
     d_term: float = 0.0
     pid_output: float = 0.0
     feedforward_output: float = 0.0
+    target_feedforward_output: float = 0.0
+    target_feedforward_active: bool = False
+    target_feedforward_reason: str = ""
+    disturbance_feedforward_output: float = 0.0
+    disturbance_feedforward_active: bool = False
+    disturbance_feedforward_reason: str = ""
     final_output: float = 0.0
     kp: float = 0.0
     ki: float = 0.0

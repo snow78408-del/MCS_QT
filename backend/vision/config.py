@@ -94,6 +94,9 @@ class DetectorConfig:
     # capsule edges must persist between the menisci. This rejects the carrier
     # phase gap, which has the same two interfaces in the opposite order.
     generation_min_capsule_outline_ratio: float = 0.45
+    # Raw 8-bit contour contrast against BOTH adjacent carrier regions.
+    # Enhancement alone must not turn background texture into a capsule.
+    generation_min_raw_outline_contrast: float = 12.0
     # Image-domain measurement bounds. These are independent of the PID target.
     min_radius: float = 18.0
     max_radius: float = 32.0

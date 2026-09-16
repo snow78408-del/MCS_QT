@@ -118,3 +118,73 @@ def test_vectorized_outline_support_matches_column_reference() -> None:
     actual = DropletDetector._capsule_outline_support(
         gradient, left=10, right=130, row_margin=4, edge_threshold=8, reference_width_px=30)
     assert actual == expected / 116
+
+
+@pytest.mark.parametrize("phase", [0.0, 0.7, 1.4, 2.1])
+def test_fixed_walls_shading_and_compression_texture_are_not_capsules(phase):
+    y, x = np.mgrid[:40, :500]
+    illumination = 9 * np.sin(x / 14 + phase) + 5 * np.cos(x / 47)
+    walls = 25 * np.exp(-((y - 5) / 1.8) ** 2) - 30 * np.exp(-((y - 34) / 2) ** 2)
+    texture = 2 * np.sin(x / 7 + y / 4) + np.random.default_rng(42).normal(0, .5, x.shape)
+    gray = np.uint8(np.clip(100 + illumination + walls + texture, 0, 255))
+    ok, jpeg = cv2.imencode('.jpg', gray, [cv2.IMWRITE_JPEG_QUALITY, 75])
+    assert ok
+    gray = cv2.imdecode(jpeg, cv2.IMREAD_GRAYSCALE)
+    detector = DropletDetector(DetectorConfig(measurement_mode="generation_plug",
+        generation_min_length_ratio=.9), DebugConfig())
+    detector.configure_expected_diameter(100, 1.5)
+    assert not detector.detect(gray).centers
+
+
+@pytest.mark.parametrize("polarity", [-1, 1])
+@pytest.mark.parametrize("background", [40, 150])
+def test_visible_raw_outline_survives_brightness_and_polarity_changes(polarity, background):
+    frame = np.full((40, 400), background, np.uint8)
+    cv2.rectangle(frame, (50, 7), (180, 32), background + polarity * 24, 2)
+    # Keep weak/missing central menisci while retaining their complete outline.
+    frame[14:26, 48:53] = background
+    frame[14:26, 178:183] = background
+    detector = DropletDetector(DetectorConfig(measurement_mode="generation_plug"), DebugConfig())
+    detector.configure_expected_diameter(100, 1.5)
+    assert detector.detect(frame).plug_lengths_px == pytest.approx([132], abs=5)
+
+
+@pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf"), 256])
+def test_raw_contrast_threshold_rejects_invalid_values(value):
+    with pytest.raises(ValueError, match="raw_outline_contrast"):
+        DropletDetector(DetectorConfig(generation_min_raw_outline_contrast=value), DebugConfig())
+
+
+@pytest.mark.parametrize("polarity", [-1, 1])
+@pytest.mark.parametrize("contrast", [24, 80])
+@pytest.mark.parametrize("vertical", [False, True])
+def test_close_capsules_do_not_use_neighbour_as_background(polarity, contrast, vertical):
+    frame = np.full((40, 420), 100, np.uint8)
+    for left in (40, 178):
+        cv2.rectangle(frame, (left, 7), (left + 130, 32), 100 + polarity * contrast, 2)
+    detector = DropletDetector(DetectorConfig(measurement_mode="generation_plug"), DebugConfig())
+    detector.configure_expected_diameter(100, 1.5)
+    result = detector.detect(frame.T.copy() if vertical else frame)
+    assert result.plug_lengths_px == pytest.approx([134, 134], abs=3)
+    assert all(result.diameter_valid)
+
+
+@pytest.mark.parametrize("neighbour", ["partial", "too_short"])
+def test_rejected_neighbour_is_excluded_from_carrier_reference(neighbour):
+    frame = np.full((40, 300), 100, np.uint8)
+    # The left body cannot be measured, but it is still not carrier fluid.
+    left = -30 if neighbour == "partial" else 40
+    cv2.rectangle(frame, (left, 7), (70, 32), 180, 2)
+    cv2.rectangle(frame, (78, 7), (208, 32), 180, 2)
+    detector = DropletDetector(DetectorConfig(measurement_mode="generation_plug"), DebugConfig())
+    detector.configure_expected_diameter(100, 1.5)
+    assert detector.detect(frame).plug_lengths_px == pytest.approx([134], abs=3)
+
+
+def test_unresolved_carrier_gap_does_not_borrow_neighbour_pixels():
+    frame = np.full((40, 420), 100, np.uint8)
+    for left in (40, 176):
+        cv2.rectangle(frame, (left, 7), (left + 130, 32), 180, 2)
+    detector = DropletDetector(DetectorConfig(measurement_mode="generation_plug"), DebugConfig())
+    detector.configure_expected_diameter(100, 1.5)
+    assert not detector.detect(frame).centers

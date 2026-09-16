@@ -75,3 +75,19 @@ def test_gallery_publishes_crossing_evidence_when_period_completes():
         cv2.IMREAD_COLOR,
     )
     assert decoded.shape[:2] == (120, 180)
+
+
+def test_frame_batch_gallery_includes_the_last_analyzed_frame():
+    service = PipelineVisionService()
+    service._batch_gallery_period = 1
+    track = DropletTrack(id=7, position=np.array([80.0, 60.0]), radius=10.0, age=5)
+    for frame_id in range(1, 6):
+        service._update_droplet_gallery(
+            _result(1 if frame_id == 5 else 0, [7], [], track),
+            frame_id=frame_id, timestamp=float(frame_id),
+        )
+        if frame_id < 5:
+            assert service.get_last_control_period_droplets()["sample_frame_count"] == 0
+    gallery = service.get_last_control_period_droplets()
+    assert gallery["sample_frame_count"] == 5
+    assert [frame["frame_id"] for frame in gallery["frames"]] == [1, 2, 3, 4, 5]

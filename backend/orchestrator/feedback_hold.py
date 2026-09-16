@@ -13,10 +13,10 @@ class FeedbackHold:
     ready_after: float = 0.0
     wait_source: str = ""
 
-    def record(self, completed_at: float, wait_s: float, source: str) -> None:
+    def record(self, completed_at: float, wait_s: float, source: str, *, command_id: int | None = None) -> None:
         if not math.isfinite(completed_at) or not math.isfinite(wait_s) or wait_s < 0:
             raise ValueError("feedback wait must have finite time and nonnegative duration")
-        self.command_id += 1
+        self.command_id = self.command_id + 1 if command_id is None else command_id
         self.completed_at = completed_at
         self.ready_after = completed_at + wait_s
         self.wait_source = source

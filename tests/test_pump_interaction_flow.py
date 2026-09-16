@@ -505,7 +505,7 @@ class PumpInteractionFlowTests(unittest.TestCase):
             reason="CH2 readback failed",
         )
         service = OrchestratorService(vision_service=SimpleNamespace(), pump_service=pump)
-        service._cfg = SystemConfig(50.0, 1.0, "camera", "", 50.0, 20.0, 500)
+        service._cfg = SystemConfig(55.0, 1.0, "camera", "", 50.0, 20.0, 500)
         service._state = SystemState.RUNNING
         service._pump_control_enabled = True
         service._pump_state.comm_established = True
@@ -525,6 +525,10 @@ class PumpInteractionFlowTests(unittest.TestCase):
             avg_diameter=50.0,
             frame_droplet_count=1,
             frame_diameter_cv=0.0,
+            frame_diameter_std=0.0,
+            pixel_to_micron=1.0,
+            measurement_sample_start=__import__("time").monotonic()-2,
+            measurement_sample_end=__import__("time").monotonic()-1,
             scale_source="calibration_file",
             session_id=token.session_id,
             run_generation=token.generation,
@@ -535,7 +539,7 @@ class PumpInteractionFlowTests(unittest.TestCase):
             predict=lambda _sample: None,
         )
         service._pid_controller.update_input = lambda _input: PIDCommand(
-            q1=50.0,
+            q1=49.0,
             q2=20.0,
             diameter_error=1.0,
             adjustment=0.1,

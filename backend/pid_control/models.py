@@ -39,6 +39,12 @@ class PIDCommand:
     d_term: float = 0.0
     pid_output: float = 0.0
     feedforward_output: float = 0.0
+    target_feedforward_output: float = 0.0
+    target_feedforward_active: bool = False
+    target_feedforward_reason: str = ""
+    disturbance_feedforward_output: float = 0.0
+    disturbance_feedforward_active: bool = False
+    disturbance_feedforward_reason: str = ""
     final_output: float = 0.0
     kp: float = 0.0
     ki: float = 0.0

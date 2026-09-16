@@ -22,6 +22,14 @@ class PIDControlMode(StrEnum):
 @dataclass(slots=True)
 class PIDConfig:
     control_mode: str = PIDControlMode.ADAPTIVE_PID_WITH_FEEDFORWARD.value
+    target_feedforward_enabled: bool = False
+    # None preserves the old combined-mode API; explicit selection is independent
+    # of fixed/adaptive feedback. Production SystemConfig always supplies a bool.
+    disturbance_feedforward_enabled: bool | None = None
+    target_feedforward_calibrated: bool = False
+    feedforward_baseline_q1: float = 0.0
+    feedforward_baseline_q2: float = 0.0
+    feedforward_baseline_diameter_um: float = 0.0
 
     base_kp: float = 0.08
     base_ki: float = 0.01
@@ -105,6 +113,11 @@ class PIDConfig:
     adjustment_max: float | None = None
 
     def __post_init__(self) -> None:
+        for name in ("target_feedforward_enabled", "target_feedforward_calibrated"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be boolean")
+        if self.disturbance_feedforward_enabled is not None and not isinstance(self.disturbance_feedforward_enabled, bool):
+            raise ValueError("disturbance_feedforward_enabled must be boolean or None")
         for item in fields(self):
             value = getattr(self, item.name)
             if isinstance(value, (int, float)) and not isinstance(value, bool) and not math.isfinite(float(value)):

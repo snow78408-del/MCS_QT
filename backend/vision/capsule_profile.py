@@ -41,3 +41,46 @@ def capsule_intervals(gray: np.ndarray) -> list[tuple[int, int]] | None:
         for start, stop in zip(starts, stops)
         if np.count_nonzero(seeds[start:stop]) >= max(3, (stop - start) * 0.4)
     ]
+
+
+def raw_outline_contrast(
+    smoothed: np.ndarray,
+    left: int,
+    right: int,
+    *,
+    background_start: int = 0,
+    background_stop: int | None = None,
+) -> float:
+    """Contour change relative to each flank, in original grayscale units.
+
+    Subtracting adjacent transverse profiles cancels stationary walls; using
+    their 5–95% range also cancels a uniform illumination step. Both flanks
+    must provide evidence, so a single boundary is not a complete capsule.
+    Input is lightly smoothed original data, never normalized or CLAHE data.
+    Background bounds exclude neighbouring capsule bodies, including partial
+    or size-rejected ones. Fewer than two carrier columns is insufficient
+    evidence, rather than permission to sample the next droplet.
+    """
+    height, width = smoothed.shape
+    margin = max(1, int(height * 0.12))
+    pad = max(3, int(round(height * 0.30)))
+    trim = max(2, int(round((right - left) * 0.15)))
+    body = smoothed[margin:height - margin, left + trim:right - trim]
+    flank_start = min(left, max(0, left - pad, background_start))
+    flank_stop = max(right + 1, min(
+        width, right + pad + 1,
+        width if background_stop is None else background_stop,
+    ))
+    flanks = (
+        smoothed[margin:height - margin, flank_start:left],
+        smoothed[margin:height - margin, right + 1:flank_stop],
+    )
+    if body.shape[0] < 3 or body.shape[1] < 3 or any(part.shape[1] < 2 for part in flanks):
+        return 0.0
+    inside = np.median(body, axis=1)
+    contrasts = []
+    for part in flanks:
+        difference = inside - np.median(part, axis=1)
+        low, high = np.percentile(difference, [5, 95])
+        contrasts.append(float(high - low))
+    return min(contrasts)

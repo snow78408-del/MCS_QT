@@ -104,6 +104,7 @@ def test_generation_stages_expose_only_live_meniscus_parameters() -> None:
             "generation_min_profile_contrast_sigma",
             "generation_min_meniscus_support_ratio",
             "generation_min_capsule_outline_ratio",
+            "generation_min_raw_outline_contrast",
             "generation_polarity",
     ]
     assert window.current_config.measurement_mode == "generation_plug"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 # Only a fallback for configurations that omit the field. Normal runs use the
 # value entered by the user; configure() validates it without rewriting it.
@@ -30,3 +31,27 @@ class OrchestratorConfig:
     # exchanges and can legitimately exceed the normal control-loop watchdog.
     # Keep it bounded, but give the in-flight hardware transaction enough time.
     pump_update_watchdog_timeout_s: float = pump_update_watchdog_timeout_s
+    # Provisional policy limits, to be reviewed against stable-device recordings.
+    response_guard_tolerance_um: float = 4.0
+    response_guard_recovery_s: float = 15.0
+    response_guard_timeout_s: float = 120.0
+    response_guard_max_attempts: int = 3
+    response_guard_retry_step: float = 1.0
+    response_guard_retry_budget: float = 4.0
+    calibration_unstable_timeout_s: float = 180.0
+
+    def __post_init__(self) -> None:
+        for name in (
+            "response_guard_tolerance_um", "response_guard_recovery_s",
+            "response_guard_timeout_s", "response_guard_retry_step",
+            "response_guard_retry_budget", "calibration_unstable_timeout_s",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        if (isinstance(self.response_guard_max_attempts, bool)
+                or not isinstance(self.response_guard_max_attempts, int)
+                or self.response_guard_max_attempts < 1):
+            raise ValueError("response_guard_max_attempts must be a positive integer")
+        if self.response_guard_timeout_s <= self.response_guard_recovery_s:
+            raise ValueError("response guard timeout must exceed recovery duration")

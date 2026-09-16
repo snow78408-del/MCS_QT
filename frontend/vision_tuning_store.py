@@ -114,6 +114,10 @@ class VisionTuningSettingsStore:
             values["generation_min_capsule_outline_ratio"] = float(
                 getattr(defaults, "generation_min_capsule_outline_ratio")
             )
+        if section == "detector" and "generation_min_raw_outline_contrast" not in values:
+            values["generation_min_raw_outline_contrast"] = float(
+                getattr(defaults, "generation_min_raw_outline_contrast")
+            )
         if set(values) != expected:
             missing = sorted(expected - set(values))
             extra = sorted(set(values) - expected)
@@ -144,4 +148,6 @@ class VisionTuningSettingsStore:
             if not valid:
                 raise ValueError(f"{section}.{name} 的类型或数值无效")
             checked[name] = value
+        if section == "detector" and not 0 < checked["generation_min_raw_outline_contrast"] <= 255:
+            raise ValueError("原图轮廓对比下限必须在 (0, 255] 内")
         return checked

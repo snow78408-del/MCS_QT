@@ -8,10 +8,10 @@ import numpy as np
 
 try:
     from .config import DebugConfig, DetectorConfig
-    from .capsule_profile import capsule_intervals
+    from .capsule_profile import capsule_intervals, raw_outline_contrast
 except ImportError:
     from config import DebugConfig, DetectorConfig
-    from capsule_profile import capsule_intervals
+    from capsule_profile import capsule_intervals, raw_outline_contrast
 
 
 @dataclass
@@ -29,6 +29,8 @@ class DropletDetector:
     """Detect droplets using illumination correction and one Hough transform."""
 
     def __init__(self, config: DetectorConfig, debug: DebugConfig) -> None:
+        if not np.isfinite(config.generation_min_raw_outline_contrast) or not 0 < config.generation_min_raw_outline_contrast <= 255:
+            raise ValueError("generation_min_raw_outline_contrast must be in (0, 255]")
         self._config = config
         self._debug = debug
         self._circle_offset_cache: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
@@ -163,6 +165,8 @@ class DropletDetector:
         )
 
         body_intervals = capsule_intervals(working)
+        raw_smoothed = cv2.GaussianBlur(working.astype(np.float32), (0, 0), 0.8)
+        raw_contrast_checks: list[tuple[int, int, float]] = []
         if body_intervals is not None:
             # Enhancement can erase a broad, weak boundary or amplify the
             # background enough to reject it. Check envelope candidates in the
@@ -180,11 +184,29 @@ class DropletDetector:
             if body_intervals is None else body_intervals
         )
         candidates: list[tuple[float, int, int, float, float]] = []
-        for left, right in interval_pairs:
+        for interval_index, (left, right) in enumerate(interval_pairs):
             if left <= 0 or right >= axial_size - 1:
                 continue
             length_px = float(right - left)
             if length_px < min_length or length_px > max_length:
+                continue
+            # Envelope intervals are ordered and disjoint. Exclude all nearby
+            # bodies before size filtering so even partial neighbours cannot
+            # contaminate the carrier-phase reference of a complete droplet.
+            background_start, background_stop = 0, axial_size
+            if body_intervals is not None:
+                if interval_index > 0:
+                    background_start = interval_pairs[interval_index - 1][1] + 1
+                if interval_index + 1 < len(interval_pairs):
+                    background_stop = interval_pairs[interval_index + 1][0]
+            raw_contrast = raw_outline_contrast(
+                raw_smoothed, left, right,
+                background_start=background_start,
+                background_stop=background_stop,
+            )
+            if trace is not None:
+                raw_contrast_checks.append((left, right, raw_contrast))
+            if raw_contrast < float(self._config.generation_min_raw_outline_contrast):
                 continue
             pad = max(2, int(round(reference_width_px * 0.20)))
             inside = profile[left + 1 : right]
@@ -287,6 +309,8 @@ class DropletDetector:
                     "transverse_gradient_threshold": transverse_threshold,
                     "selected_outline_support": selected_outline_support,
                     "body_intervals": body_intervals,
+                    "raw_outline_contrast_checks": raw_contrast_checks,
+                    "minimum_raw_outline_contrast": self._config.generation_min_raw_outline_contrast,
                 }
             )
 

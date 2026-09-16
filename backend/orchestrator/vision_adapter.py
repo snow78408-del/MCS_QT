@@ -16,7 +16,7 @@ try:
 except Exception:  # pragma: no cover - handled at runtime for local video only
     cv2 = None
 
-from .models import FrameSnapshot, RecognitionSnapshot
+from .models import FrameSnapshot, RecognitionSnapshot, validate_control_batch
 from backend.vision.line_counter import ContinuousLineCounter
 
 INDUSTRIAL_CAMERA_BACKENDS = {"hikrobot", "basler", "daheng", "flir", "allied_vision", "gentl"}
@@ -203,6 +203,17 @@ class PipelineVisionService:
         self._preview_queue: queue.Queue[tuple[int, float, Any]] = queue.Queue(maxsize=PREVIEW_QUEUE_SIZE)
         self._sampling_queue: queue.Queue[tuple[int, float, Any]] = queue.Queue(maxsize=SAMPLING_QUEUE_SIZE)
         self._capture_batch: list[tuple[int, float, Any]] = []
+        self._control_batch_active = False
+        self._control_batch_pending = False
+        self._control_batch_id = 0
+        self._control_capture_frames = 5
+        self._control_analysis_frames = 5
+        self._control_batch_not_before = 0.0
+        self._control_batch_processed = 0
+        self._control_batch_assignments: dict[int, int] = {}
+        self._pinned_batch_metadata: dict[int, dict[str, Any]] = {}
+        self._queued_batch_metadata: dict[int, dict[int, dict[str, Any]]] = {}
+        self._batch_gallery_period = 0
         self._analysis_batch_started_at = 0.0
         self._next_analysis_batch_time = 0.0
         self._stop_event = threading.Event()
@@ -230,7 +241,7 @@ class PipelineVisionService:
             maxlen=MOTION_WINDOW_FRAMES
         )
         self._crossing_times: deque[float] = deque(maxlen=1000)
-        self._calibration_crossing_events: dict[int, tuple[float, float, int, int]] = {}
+        self._calibration_crossing_events: dict[int, tuple[float, float, int, int, float]] = {}
         self._average_droplet_speed_um_s: float | None = None
         self._speed_sample_count = 0
         self._droplet_generation_rate_hz = 0.0
@@ -381,7 +392,8 @@ class PipelineVisionService:
 
     def set_run_context(self, session_id: str, generation: int) -> None:
         """Bind subsequently captured frames to one control run."""
-        with self._lock:
+        with self._pipeline_lock, self._lock:
+            self.cancel_control_batch()
             self._session_id = str(session_id or "")
             self._run_generation = int(generation)
             self._capture_batch.clear()
@@ -484,6 +496,7 @@ class PipelineVisionService:
             "generation_min_capsule_outline_ratio": float(
                 detector.generation_min_capsule_outline_ratio
             ),
+            "generation_min_raw_outline_contrast": float(detector.generation_min_raw_outline_contrast),
             "generation_polarity": detector.generation_polarity,
             "channel_region_enabled": bool(channel_region.enabled),
         }
@@ -497,6 +510,53 @@ class PipelineVisionService:
             "[VISION][METRICS][WINDOW] "
             f"control_interval_ms={pipeline.config.metrics.realtime_window_ms}"
         )
+
+    def request_control_batch(self, capture_frames: int, analysis_frames: int) -> int:
+        """Arm one fresh batch; the control worker requests the next after PID."""
+        validate_control_batch(capture_frames, analysis_frames)
+        with self._lock:
+            self._control_batch_active = True
+            self._control_batch_pending = True
+            self._control_batch_id += 1
+            self._control_capture_frames = capture_frames
+            self._control_analysis_frames = analysis_frames
+            self._control_batch_processed = 0
+            self._control_batch_not_before = time.monotonic()
+            self._capture_batch.clear()
+            self._next_analysis_batch_time = 0.0
+            self._control_batch_assignments.clear()
+            self._queued_batch_metadata.clear()
+            while not self._frame_queue.empty():
+                try:
+                    self._frame_queue.get_nowait()
+                except queue.Empty:
+                    break
+            return self._control_batch_id
+
+    def cancel_control_batch(self) -> None:
+        """Invalidate pending results and return to continuous observation."""
+        with self._lock:
+            self._control_batch_active = False
+            self._control_batch_pending = False
+            self._control_batch_id += 1
+            self._capture_batch.clear()
+            self._control_batch_assignments.clear()
+            self._queued_batch_metadata.clear()
+            while not self._frame_queue.empty():
+                try:
+                    self._frame_queue.get_nowait()
+                except queue.Empty:
+                    break
+            self._recognition_condition.notify_all()
+
+    def wait_for_control_batch(self, request_id: int, timeout: float = 0.1) -> RecognitionSnapshot:
+        with self._recognition_condition:
+            self._recognition_condition.wait_for(
+                lambda: self._latest.control_batch_id == request_id
+                or self._stop_event.is_set() or self._control_batch_id != request_id,
+                timeout=max(0.0, timeout),
+            )
+            return replace(self._latest)
 
     def set_recognition_roi(self, roi: dict[str, Any] | None) -> None:
         pipeline = self._ensure_pipeline()
@@ -747,12 +807,21 @@ class PipelineVisionService:
             processing_fps = self._rate(self._processing_times, now)
             period_frames = sum(value >= period_start for value in self._processing_times)
             period_replaced = sum(value >= period_start for value in self._replacement_times)
+            analysis_frames = self._control_analysis_frames if self._control_batch_active else MOTION_WINDOW_FRAMES
             pending_frames = (
-                int(self._frame_queue.qsize()) * MOTION_WINDOW_FRAMES
-                + (MOTION_WINDOW_FRAMES if self._processing_busy else 0)
+                int(self._frame_queue.qsize()) * analysis_frames
+                + (max(0, analysis_frames - self._control_batch_processed) if self._processing_busy and self._control_batch_active
+                   else MOTION_WINDOW_FRAMES if self._processing_busy else 0)
                 + len(self._capture_batch)
             )
-            if capture_fps <= 0.0:
+            if self._control_batch_active:
+                if self._control_batch_pending:
+                    status = f"批次 {self._control_batch_id}：采集 {len(self._capture_batch)}/{self._control_capture_frames} 帧"
+                elif self._latest.control_batch_id == self._control_batch_id:
+                    status = f"批次 {self._control_batch_id}：已完成，等待 PID／下一周期"
+                else:
+                    status = f"批次 {self._control_batch_id}：分析 {self._control_batch_processed}/{analysis_frames} 帧"
+            elif capture_fps <= 0.0:
                 status = "相机没有新画面"
             elif period_frames <= 0:
                 status = "识别线程未完成处理"
@@ -1216,8 +1285,10 @@ class PipelineVisionService:
         encode_frame: bool = False,
     ) -> RecognitionSnapshot:
         with self._lock:
-            acquisition_meta = dict(self._frame_metadata.get(int(frame_id or 0), {}))
-        measurement_time = acquisition_meta.get("capture_monotonic", timestamp)
+            acquisition_meta = dict(self._pinned_batch_metadata.get(
+                int(frame_id or 0), self._frame_metadata.get(int(frame_id or 0), {})
+            ))
+        measurement_time = self._acquisition_time(acquisition_meta)
         with self._pipeline_lock:
             with self._lock:
                 self._try_channel_calibration(frame)
@@ -1225,7 +1296,7 @@ class PipelineVisionService:
         observed_ids = {int(track_id) for track_id, _ in result.tracking.matched_pairs}
         observed_ids.update(int(track_id) for track_id in result.tracking.new_track_ids)
         with self._lock:
-            sample_time = time.monotonic()
+            sample_time = measurement_time
             calibration_frame = self._ensure_pipeline().rectify_selected_channel(frame)
             if calibration_frame is None:
                 calibration_frame = frame
@@ -1270,7 +1341,7 @@ class PipelineVisionService:
         self._update_motion_measurements(
             result.tracking,
             observed_ids,
-            float(timestamp or result.timestamp),
+            measurement_time,
             len(control.crossed_track_ids),
             int(frame_id if frame_id is not None else result.frame_index),
         )
@@ -1299,8 +1370,8 @@ class PipelineVisionService:
         )
         diagnostics = self._diagnostics()
         resolved_frame_id = int(frame_id if frame_id is not None else result.frame_index)
-        frame_meta = self._frame_metadata.get(resolved_frame_id, {})
-        capture_monotonic = float(frame_meta.get("capture_monotonic", 0.0) or time.monotonic())
+        frame_meta = acquisition_meta
+        capture_monotonic = measurement_time
         with self._lock:
             for track_id, diameter_um in current_crossed_track_diameters.items():
                 self._calibration_crossing_events[int(track_id)] = (
@@ -1308,6 +1379,7 @@ class PipelineVisionService:
                     capture_monotonic,
                     resolved_frame_id,
                     int(control.period_id),
+                    control.crossed_track_sample_starts[int(track_id)],
                 )
             while len(self._calibration_crossing_events) > 4000:
                 self._calibration_crossing_events.pop(next(iter(self._calibration_crossing_events)))
@@ -1316,17 +1388,27 @@ class PipelineVisionService:
         crossed_track_capture_monotonic = {track_id:item[1] for track_id,item in calibration_events.items()}
         crossed_track_frame_ids = {track_id:item[2] for track_id,item in calibration_events.items()}
         frequency = self._line_counter.window(control.window_start_time, control.window_end_time)
+        calibrated = bool(self._calibration_metadata or self._channel_calibration_status == "calibrated")
+        geometry = self._ensure_pipeline().config.detector
+        quality_valid = bool(calibrated and frame_diameters and all(
+            np.isfinite(value) and value > 0 for value in (
+                scale, geometry.generation_channel_height_um,
+                geometry.generation_channel_width_um, geometry.generation_volume_correction,
+            )
+        ))
+        quality_reason = ("每滴一个有效等效直径" if quality_valid else
+                          "比例未标定：尺寸仅供预览" if not calibrated else "无有效尺寸数据或几何参数无效")
         return RecognitionSnapshot(
             frame_droplet_count=active_count,
             total_droplet_count=total_count,
             new_crossing_count=new_cross,
             avg_diameter=frame_avg_diameter,
             single_cell_rate=float(control.frame_single_cell_rate or 0.0),
-            valid_for_control=bool(result.metrics.control.valid_for_control and has_droplet),
+            valid_for_control=bool(result.metrics.control.valid_for_control and has_droplet and quality_valid),
             timestamp=float(timestamp or time.time()),
-            reason=control_reason,
+            reason=control_reason if quality_valid else quality_reason,
             droplet_count=total_count,
-            active_droplet_count=active_count,
+            active_droplet_count=control.current_frame_droplet_count,
             has_droplet=has_droplet,
             control_reason=control_reason,
             frame_png_base64=frame_b64,
@@ -1341,6 +1423,7 @@ class PipelineVisionService:
             frame_diameters=frame_diameters,
             crossed_track_diameters=crossed_track_diameters,
             crossed_track_capture_monotonic=crossed_track_capture_monotonic,
+            crossed_track_sample_starts={key: item[4] for key, item in calibration_events.items()},
             crossed_track_frame_ids=crossed_track_frame_ids,
             frame_diameter_sum=frame_diameter_sum,
             frame_avg_diameter=frame_avg_diameter,
@@ -1369,6 +1452,13 @@ class PipelineVisionService:
             measurement_window_start=control.window_start_time,
             measurement_window_end=control.window_end_time,
             measurement_sample_start=control.sample_start_time,
+            measurement_sample_end=control.sample_end_time,
+            processing_completed_monotonic=time.monotonic(),
+            current_frame_droplet_count=control.current_frame_droplet_count,
+            window_passage_count=control.window_passage_count,
+            valid_size_sample_count=control.sample_size if quality_valid else 0,
+            measurement_quality_valid=quality_valid,
+            measurement_quality_reason=quality_reason,
             pixel_to_micron=scale,
             scale_source=(
                 "generation_channel_width"
@@ -1413,7 +1503,7 @@ class PipelineVisionService:
         control = result.metrics.control
         completed_period = int(control.period_id)
         with self._lock:
-            if completed_period > self._last_gallery_period_id:
+            if not self._batch_gallery_period and completed_period > self._last_gallery_period_id:
                 period_frames = self._droplet_gallery_periods.pop(completed_period, [])
                 unique_valid_ids = {
                     int(track_id)
@@ -1435,7 +1525,7 @@ class PipelineVisionService:
             # The metrics transition publishes period N before processing the
             # current frame into period N+1, so the current sample belongs to
             # completed_period + 1.
-            target_period = completed_period + 1
+            target_period = self._batch_gallery_period or completed_period + 1
             period_frames = self._droplet_gallery_periods.setdefault(target_period, [])
             if len(period_frames) >= 300:
                 return
@@ -1554,6 +1644,17 @@ class PipelineVisionService:
                     "height": int(frame_h),
                 }
             )
+            if self._batch_gallery_period and completed_period == self._batch_gallery_period:
+                self._last_droplet_gallery = {
+                    "period_id": completed_period,
+                    "droplet_count": len({key for item in period_frames for key in item["valid_track_ids"]}),
+                    "droplets": [], "sample_frame_count": len(period_frames),
+                    "frames": list(period_frames), "reason": "ok",
+                }
+                self._last_gallery_period_id = completed_period
+                self._droplet_gallery_periods = {
+                    key: value for key, value in self._droplet_gallery_periods.items() if key > completed_period
+                }
 
     def get_last_control_period_droplets(self) -> dict[str, Any]:
         with self._lock:
@@ -1696,7 +1797,7 @@ class PipelineVisionService:
                 with self._lock:
                     frame_meta = dict(self._frame_metadata.get(int(frame_id), {}))
                 sequence_id = int(frame_meta.get("hardware_frame_id", 0) or frame_id)
-                measurement_time = float(frame_meta.get("capture_monotonic", timestamp))
+                measurement_time = self._acquisition_time(frame_meta)
                 self._line_counter.observe_frame(frame, sequence_id, measurement_time,
                                                  self._counting_wall_lines, line_ratio=self._counting_line_ratio)
             except Exception as exc:
@@ -1705,16 +1806,41 @@ class PipelineVisionService:
             self._submit_processing_frame(frame_id, timestamp, frame)
 
     def _process_loop(self) -> None:
+        previous_control_batch = False
         while not self._stop_event.is_set():
             try:
                 batch = self._frame_queue.get(timeout=0.05)
             except queue.Empty:
                 continue
+            request_id = 0
             try:
                 with self._lock:
+                    request_id = self._control_batch_assignments.pop(batch[-1][0], 0)
+                    if self._control_batch_active and request_id != self._control_batch_id:
+                        continue
+                    if request_id and not self._control_batch_active:
+                        continue
                     self._processing_busy = True
+                    if request_id:
+                        self._pinned_batch_metadata = self._queued_batch_metadata.pop(batch[-1][0], {})
+                with self._pipeline_lock:
+                    metrics = self._ensure_pipeline().metrics
+                    if request_id:
+                        self._batch_gallery_period = metrics.begin_frame_batch(len(batch))
+                        with self._lock:
+                            # Discard an unfinished continuous window or a
+                            # cancelled batch before recording this batch.
+                            self._droplet_gallery_periods.clear()
+                    elif previous_control_batch:
+                        metrics.cancel_frame_batch()
+                    previous_control_batch = bool(request_id)
                 batch_snapshot = None
                 for frame_id, timestamp, frame in batch:
+                    if self._stop_event.is_set() or (
+                        request_id and (not self._control_batch_active or request_id != self._control_batch_id)
+                    ):
+                        batch_snapshot = None
+                        break
                     processing_started = time.perf_counter()
                     batch_snapshot = self._snapshot_from_frame(
                         frame,
@@ -1723,27 +1849,37 @@ class PipelineVisionService:
                     )
                     with self._lock:
                         completed_at = time.monotonic()
-                        frame_meta = self._frame_metadata.get(int(frame_id), {})
+                        frame_meta = self._pinned_batch_metadata.get(
+                            int(frame_id), self._frame_metadata.get(int(frame_id), {})
+                        )
                         capture_monotonic = float(frame_meta.get("capture_monotonic", 0.0) or 0.0)
                         self._algorithm_processing_ms = max(0.0, (time.perf_counter() - processing_started) * 1000.0)
                         self._processing_times.append(completed_at)
                         self._processed_frame_count += 1
+                        if request_id:
+                            self._control_batch_processed += 1
                         self._recognition_latency_ms = (
                             max(0.0, (completed_at - capture_monotonic) * 1000.0)
                             if capture_monotonic > 0.0
                             else self._algorithm_processing_ms
                         )
                     # Candidate scoring contains Python loops. Yield briefly so
-                    # the preview producer and Tk main loop are not starved by
-                    # a five-frame analysis burst.
+                    # the preview producer and GUI are not starved by analysis.
                     time.sleep(0.002)
-                # A five-frame window is one analysis transaction. Publish only
+                # A complete batch is one analysis transaction. Publish only
                 # after all frames have updated the pipeline's accumulated data.
                 if batch_snapshot is not None:
                     with self._recognition_condition:
+                        if self._control_batch_active and request_id != self._control_batch_id:
+                            continue
+                        if request_id and not self._control_batch_active:
+                            continue
                         preview = self._latest_preview
                         self._latest = replace(
                             batch_snapshot,
+                            control_batch_id=request_id,
+                            batch_capture_frames=self._control_capture_frames if request_id else 0,
+                            batch_analysis_frames=len(batch) if request_id else 0,
                             frame_png_base64=(preview.frame_png_base64 if preview else None),
                             frame_width=(preview.width if preview else 0),
                             frame_height=(preview.height if preview else 0),
@@ -1754,9 +1890,23 @@ class PipelineVisionService:
                         self._recognition_condition.notify_all()
             except Exception as exc:
                 self._log(f"[VISION][WARN] processing frame failed: {exc}")
+                with self._recognition_condition:
+                    if request_id and (not self._control_batch_active or request_id != self._control_batch_id):
+                        continue
+                    self._latest = replace(self._snapshot_with_error(str(exc)), control_batch_id=request_id)
+                    self._recognition_condition.notify_all()
             finally:
                 with self._lock:
                     self._processing_busy = False
+                    self._pinned_batch_metadata.clear()
+                    self._batch_gallery_period = 0
+
+    @staticmethod
+    def _acquisition_time(metadata: dict[str, Any]) -> float:
+        value = metadata.get("capture_monotonic")
+        if value is None or not np.isfinite(float(value)) or not 0 < float(value) <= time.monotonic():
+            raise ValueError("missing or invalid monotonic acquisition time")
+        return float(value)
 
     def _publish_video_frame(self, frame, frame_id: int, timestamp: float) -> None:
         display_frame = self._ensure_pipeline().rectify_selected_channel(frame)
@@ -1832,9 +1982,37 @@ class PipelineVisionService:
         self._next_local_frame_time = max(due + interval, now)
 
     def _submit_processing_frame(self, frame_id: int, timestamp: float, frame) -> None:
+        with self._lock:
+            self._submit_processing_frame_locked(frame_id, timestamp, frame)
+
+    def _submit_processing_frame_locked(self, frame_id: int, timestamp: float, frame) -> None:
         now = time.monotonic()
+        if self._control_batch_active:
+            if not self._control_batch_pending:
+                return
+            try:
+                acquired = self._acquisition_time(self._frame_metadata.get(int(frame_id), {}))
+            except ValueError:
+                self._capture_batch.clear()
+                return
+            if acquired < self._control_batch_not_before:
+                return
+            if int(frame.nbytes) * self._control_capture_frames > 256 * 1024 * 1024:
+                self._control_batch_pending = False
+                self._latest = replace(
+                    self._snapshot_with_error("采集批次超过 256 MiB，请减少帧数或图像分辨率"),
+                    control_batch_id=self._control_batch_id,
+                )
+                self._recognition_condition.notify_all()
+                return
         if self._capture_batch and int(frame_id) != int(self._capture_batch[-1][0]) + 1:
             self._capture_batch = []
+        if self._control_batch_active and self._capture_batch:
+            previous_id = self._capture_batch[-1][0]
+            previous_hw = self._frame_metadata.get(previous_id, {}).get("hardware_frame_id", 0)
+            current_hw = self._frame_metadata.get(int(frame_id), {}).get("hardware_frame_id", 0)
+            if previous_hw and current_hw and int(current_hw) != int(previous_hw) + 1:
+                self._capture_batch.clear()
         if not self._capture_batch:
             if now < self._next_analysis_batch_time:
                 return
@@ -1848,10 +2026,18 @@ class PipelineVisionService:
                 return
             self._analysis_batch_started_at = now
         self._capture_batch.append((int(frame_id), float(timestamp), frame))
-        if len(self._capture_batch) < MOTION_WINDOW_FRAMES:
+        capture_count = self._control_capture_frames if self._control_batch_active else MOTION_WINDOW_FRAMES
+        if len(self._capture_batch) < capture_count:
             return
         item = self._capture_batch
         self._capture_batch = []
+        if self._control_batch_active:
+            item = item[-self._control_analysis_frames:]
+            self._control_batch_assignments[item[-1][0]] = self._control_batch_id
+            self._queued_batch_metadata[item[-1][0]] = {
+                entry[0]: dict(self._frame_metadata.get(entry[0], {})) for entry in item
+            }
+            self._control_batch_pending = False
         self._next_analysis_batch_time = self._analysis_batch_started_at + ANALYSIS_BATCH_INTERVAL_S
         try:
             self._frame_queue.put_nowait(item)
@@ -1901,7 +2087,16 @@ class PipelineVisionService:
                 time.sleep(0.03)
                 continue
             try:
-                snapshot = self._snapshot_from_frame(frame)
+                # Synchronous compatibility loop: stamp acquisition at read
+                # completion, before any recognition work.
+                acquired_at = time.monotonic()
+                with self._lock:
+                    self._capture_frame_id += 1
+                    frame_id = self._capture_frame_id
+                    self._frame_metadata[frame_id] = {"capture_monotonic": acquired_at}
+                    while len(self._frame_metadata) > 512:
+                        self._frame_metadata.pop(next(iter(self._frame_metadata)))
+                snapshot = self._snapshot_from_frame(frame, frame_id=frame_id, timestamp=time.time())
                 with self._lock:
                     self._latest = snapshot
             except Exception as exc:
@@ -1921,6 +2116,7 @@ class PipelineVisionService:
                 frame_diameters=list(self._latest.frame_diameters),
                 crossed_track_diameters=dict(self._latest.crossed_track_diameters),
                 crossed_track_capture_monotonic=dict(self._latest.crossed_track_capture_monotonic),
+                crossed_track_sample_starts=dict(self._latest.crossed_track_sample_starts),
                 crossed_track_frame_ids=dict(self._latest.crossed_track_frame_ids),
                 **self._diagnostics(),
             )

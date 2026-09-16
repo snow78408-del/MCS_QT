@@ -98,9 +98,14 @@ def test_parameter_page_uses_bounded_inputs_with_units() -> None:
     assert isinstance(page.interval, QSpinBox)
     assert page.target.suffix().strip() == "μm"
     assert page.interval.minimum() > 0
+    assert not page.target_feedforward.isChecked()
+    assert not page.disturbance_feedforward.isChecked()
+    page.target_feedforward.setChecked(True)
 
     page.submit()
     assert page_app.saved["target_diameter"] == page.target.value()
+    assert page_app.saved["target_feedforward_enabled"] is True
+    assert page_app.saved["disturbance_feedforward_enabled"] is False
     assert page_app.shown == "video"
     page.close()
 
@@ -219,6 +224,12 @@ def test_plant_calibration_dialog_tracks_progress_and_locks_configuration() -> N
     assert dialog.start_button.text()=="运行标定"
     assert dialog.response_limit.value()==30
     assert dialog.response_wait.value()==30.0
+    assert dialog.baseline_wait.value()==30.0
+    dialog.baseline_wait.setValue(5.0)
+    for edit in dialog.metadata.values():
+        edit.setText("test")
+    assert dialog._config().effective_baseline_wait_s==5.0
+    assert dialog._config().minimum_response_wait_s==30.0
     assert dialog.low_response_wait.value()==60.0
     assert dialog.stability_duration.value()==3.0
     assert dialog.repetitions.value()==1

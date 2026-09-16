@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import copy
+import json
 import math
 import threading
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from statistics import median
 from typing import Any, Callable
@@ -29,10 +30,12 @@ from ..pid_control import (
     save_plant_calibration_result,
 )
 from ..pump_hardware import ChannelParams, PumpHardwareService
+from ..pump_hardware.models import FlowUpdateResult
 from ..pump_hardware.invariants import effective_q1_q2_gap, q1_is_strictly_above_q2
 from .config import OrchestratorConfig
 from .drift import DriftSupervisor
 from .feedback_hold import FeedbackHold
+from .response_guard import ResponseGuard
 from .models import (
     ControlSnapshot,
     FrameSnapshot,
@@ -46,6 +49,15 @@ from .pid_database import PIDReplayData, PIDSessionRecorder, load_pid_replay
 from .safety import RunToken, SafetyState, SafetySupervisor
 from .state import SystemState
 from .vision_adapter import GenericVisionAdapter, PipelineVisionService, VisionAdapterProtocol
+from ..runtime_paths import ensure_user_subdir
+from ..pid_control.calibration_experiment import (
+    _write_json_atomic, CalibrationIdentificationError, CalibrationValidationError, require_combined_response,
+    save_failed_calibration,
+)
+
+
+class _FlowCommandRejected(ValueError):
+    """Validation rejection before any hardware command is dispatched."""
 
 
 class OrchestratorService:
@@ -103,6 +115,9 @@ class OrchestratorService:
         }
         self._pid_controller = DiameterPIDController(self.pid_config)
         self._feedback_hold = FeedbackHold()
+        self._response_guard = ResponseGuard()
+        self._response_guard_generation: int | None = None
+        self._command_sequence = 0
         self._control_step_lock = threading.Lock()
         self._plant_calibration: PlantCalibrationRecord | None = None
         self._plant_calibration_experiment: dict[str, Any] = {
@@ -440,6 +455,10 @@ class OrchestratorService:
         # An ad-hoc constructor flag is not sufficient authority for real
         # feedforward. Every configure call must present the versioned record.
         self.pid_config.feedforward_calibrated = False
+        self.pid_config.target_feedforward_calibrated = False
+        self.pid_config.feedforward_baseline_q1 = 0.0
+        self.pid_config.feedforward_baseline_q2 = 0.0
+        self.pid_config.feedforward_baseline_diameter_um = 0.0
         self.pid_config.log_sensitivity_calibrated = False
         self.pid_config.q1_log_diameter_sensitivity = 0.0
         self.pid_config.q2_log_diameter_sensitivity = 0.0
@@ -471,6 +490,10 @@ class OrchestratorService:
                 record.sensitivity_allocation_regularization
             )
             self.pid_config.log_sensitivity_calibrated = True
+            self.pid_config.target_feedforward_calibrated = True
+            self.pid_config.feedforward_baseline_q1 = float(record.baseline_q1)
+            self.pid_config.feedforward_baseline_q2 = float(record.baseline_q2)
+            self.pid_config.feedforward_baseline_diameter_um = float(record.baseline_diameter_um)
             self.pid_config.base_kp = float(record.controller_kp)
             self.pid_config.base_ki = float(record.controller_ki)
             self.pid_config.base_kd = 0.0
@@ -527,12 +550,13 @@ class OrchestratorService:
         if current_frame_id <= 0 or not crossed:
             return ()
         observed = time.monotonic()
-        fallback_capture = float(getattr(rec, "capture_monotonic", 0.0) or observed)
+        sample_starts = dict(getattr(rec, "crossed_track_sample_starts", {}) or {})
         period_id = int(getattr(rec, "control_period_id", 0) or 0)
         return tuple(
             PlantCalibrationObservation(
                 frame_id=int(frame_ids.get(track_id,current_frame_id)),
-                capture_monotonic=float(capture_times.get(track_id,fallback_capture)),
+                capture_monotonic=capture_times[track_id],
+                sample_start_monotonic=sample_starts[track_id],
                 observed_monotonic=observed,
                 diameter_um=diameter,
                 droplet_count=1,
@@ -556,6 +580,9 @@ class OrchestratorService:
                 ),
             )
             for track_id, diameter in sorted(crossed.items())
+            if track_id in capture_times and track_id in sample_starts
+            and math.isfinite(capture_times[track_id]) and math.isfinite(sample_starts[track_id])
+            and 0 < sample_starts[track_id] <= capture_times[track_id] <= observed
         )
 
     @staticmethod
@@ -669,7 +696,10 @@ class OrchestratorService:
         cutoff = eligible_after
         if confirmed_response_after is not None:
             cutoff = confirmed_response_after
-        eligible = [item for item in observations if cutoff is None or item.capture_monotonic >= cutoff]
+        eligible = [item for item in observations if cutoff is None or (
+            item.capture_monotonic >= cutoff and
+            (item.sample_start_monotonic if item.sample_start_monotonic is not None else item.capture_monotonic) >= cutoff
+        )]
         tail = OrchestratorService._calibration_time_tail(eligible, count, stability_duration_s)
         if not tail or tail[-1].capture_monotonic - tail[0].capture_monotonic < stability_duration_s:
             return None, []
@@ -686,6 +716,29 @@ class OrchestratorService:
         if low_response_after is not None and tail[-1].capture_monotonic < low_response_after:
             return None, []
         return "below_detection_threshold", tail
+
+    def _check_calibration_deadline(
+        self, *, deadline: float, phase: str,
+        observations: list[PlantCalibrationObservation],
+    ) -> None:
+        if time.monotonic() < deadline:
+            return
+        reason = f"{phase}工况持续不稳定或有效样本不足，已终止标定；原因待确认，请稳定后重测"
+        # Diagnostic data are explicitly incomplete, never a loadable calibration.
+        try:
+            audit_path = ensure_user_subdir("calibrations") / (
+                f"incomplete_{time.time_ns()}.measurements.json"
+            )
+            _write_json_atomic(audit_path, {
+                "status": "incomplete", "phase": phase, "reason": reason,
+                "observations": [item.to_dict() for item in observations],
+            })
+        except OSError as exc:
+            reason += f"；诊断记录保存失败：{exc}"
+        else:
+            reason += f"；诊断记录：{audit_path}"
+        self._update_plant_calibration_experiment(reason=reason, phase=phase)
+        raise RuntimeError(reason)
 
     def _collect_stable_calibration_baseline(
         self,
@@ -708,9 +761,11 @@ class OrchestratorService:
         collected = 0
         receipt = self._calibration_last_write
         origin = receipt[2] if receipt is not None and receipt[3:] == (generation, token.session_id) else time.monotonic()
-        eligible_after = origin + config.minimum_response_wait_s
+        eligible_after = origin + config.effective_baseline_wait_s
+        deadline = max(time.monotonic(), eligible_after) + self.runtime.calibration_unstable_timeout_s
         while True:
             self._require_calibration_lifecycle(generation, token)
+            self._check_calibration_deadline(deadline=deadline, phase="基线", observations=observations)
             self._safety.heartbeat(token, timeout_s=5.0)
             rec = self._read_recognition()
             if (
@@ -725,8 +780,12 @@ class OrchestratorService:
                     if new_droplets:
                         seen_droplet_ids.update(item.droplet_id for item in new_droplets)
                         last_valid_droplet = time.monotonic()
-                        new_droplets = tuple(item for item in new_droplets if item.capture_monotonic >= eligible_after)
+                        new_droplets = tuple(item for item in new_droplets if item.capture_monotonic >= eligible_after and
+                                             (item.sample_start_monotonic if item.sample_start_monotonic is not None else item.capture_monotonic) >= eligible_after)
                         collected += len(new_droplets)
+                        partial = getattr(self, "_calibration_partial_trial", None)
+                        if partial is not None:
+                            partial.setdefault("baseline_observations", []).extend(item.to_dict() for item in new_droplets)
                         observations.extend(new_droplets)
                         observations = self._calibration_time_tail(observations, required, config.stability_duration_s)
                         diameters = [item.diameter_um for item in observations]
@@ -841,7 +900,7 @@ class OrchestratorService:
             self._pump_state.last_update_reason = "plant calibration flow update succeeded"
             self._pump_state.last_error = ""
             self._refresh_pump_channels(communication_ok=True, error="")
-            self._calibration_last_write = (float(q1), float(q2), time.monotonic(), generation, token.session_id)
+            self._calibration_last_write = (float(q1), float(q2), float(result.readback_completed_monotonic), generation, token.session_id)
         return (
             float(q1_actual),
             float(q2_actual),
@@ -864,6 +923,8 @@ class OrchestratorService:
         commanded_q2: float,
         actuator_step: float | None = None,
     ) -> PlantCalibrationMeasurement:
+        self._calibration_partial_trial = {"trial_id": trial_id, "channel": channel,
+                                           "direction": direction, "actuator_step": actuator_step}
         self._update_plant_calibration_experiment(
             phase=f"{trial_id}：等待成滴及基线稳定",
             sample_mode="valid_droplet_count",
@@ -976,6 +1037,10 @@ class OrchestratorService:
                 )
             )
             update_completed = True
+            deadline = readback_completed + (
+                float(config.maximum_step_duration_s) if config.maximum_step_duration_s > 0
+                else config.low_response_wait_s + self.runtime.calibration_unstable_timeout_s
+            )
             onset: PlantCalibrationObservation | None = None
             stable_tail: list[PlantCalibrationObservation] = []
             response_classification = "detected_stable"
@@ -987,6 +1052,7 @@ class OrchestratorService:
                         (item for item in samples if item.capture_monotonic >= command_started),
                         key=lambda item: item.capture_monotonic,
                     )
+                self._check_calibration_deadline(deadline=deadline, phase=trial_id, observations=post_command)
                 self._update_plant_calibration_experiment(
                     response_valid_droplets=len(post_command),
                     response_required_droplets=int(config.stable_sample_count),
@@ -1094,6 +1160,18 @@ class OrchestratorService:
         finally:
             collector_stop.set()
             collector.join(timeout=1.0)
+            with samples_lock:
+                self._calibration_partial_trial = {
+                    **(self._calibration_partial_trial or {}),
+                    "trial_id": trial_id, "channel": channel,
+                    "baseline_used_for_fit": [item.to_dict() for item in baseline],
+                    "response_observations": [item.to_dict() for item in samples],
+                    "commanded_q1": commanded_q1, "commanded_q2": commanded_q2,
+                    "command_started_monotonic": command_started if update_completed else None,
+                    "readback_completed_monotonic": readback_completed if update_completed else None,
+                    "actual_q1": actual_q1 if update_completed else None,
+                    "actual_q2": actual_q2 if update_completed else None,
+                }
             if update_completed:
                 try:
                     self._require_calibration_lifecycle(generation, token)
@@ -1192,6 +1270,7 @@ class OrchestratorService:
             "measurement_count": 0,
         }
         self._calibration_last_write = None
+        self._calibration_partial_trial: dict[str, Any] | None = None
         token: RunToken | None = None
         adapter_started = False
         pump_start_attempted = False
@@ -1200,6 +1279,8 @@ class OrchestratorService:
         failure: Exception | None = None
         started_at = datetime.now(timezone.utc).isoformat()
         measurements: list[PlantCalibrationMeasurement] = []
+        attempt_history: list[dict[str, Any]] = []
+        requested_config = config
         try:
             token = self._safety.begin_session()
             self._run_token = token
@@ -1248,181 +1329,216 @@ class OrchestratorService:
                         token,
                     )
                 )
-            single_targets = (
-                ("q1", 1, baseline_q1 + config.q1_step, baseline_q2),
-                ("q1", -1, baseline_q1 - config.q1_step, baseline_q2),
-                ("q2", 1, baseline_q1, baseline_q2 + config.q2_step),
-                ("q2", -1, baseline_q1, baseline_q2 - config.q2_step),
-            )
-            for _channel, _direction, q1, q2 in single_targets:
-                self._validate_plant_calibration_target(q1, q2)
-
-            completed = 0
-            for repeat in range(int(config.repetitions)):
-                directions = (1, -1) if repeat % 2 == 0 else (-1, 1)
-                for channel in ("q1", "q2"):
-                    for direction in directions:
-                        q1 = baseline_q1 + (direction * config.q1_step if channel == "q1" else 0.0)
-                        q2 = baseline_q2 + (direction * config.q2_step if channel == "q2" else 0.0)
-                        trial_id = f"{channel}-r{repeat + 1}-{'plus' if direction > 0 else 'minus'}"
-                        self._update_plant_calibration_experiment(
-                            phase=f"measuring {trial_id}",
-                            current_trial=trial_id,
-                        )
-                        self._restore_plant_calibration_baseline(
-                            baseline_q1=baseline_q1,
-                            baseline_q2=baseline_q2,
-                            generation=generation,
-                            token=token,
-                            next_trial_id=trial_id,
-                        )
-                        measurement = self._run_plant_calibration_trial(
-                            config=config,
-                            generation=generation,
-                            token=token,
-                            trial_id=trial_id,
-                            channel=channel,
-                            direction=direction,
-                            baseline_q1=baseline_q1,
-                            baseline_q2=baseline_q2,
-                            commanded_q1=q1,
-                            commanded_q2=q2,
-                        )
-                        measurements.append(measurement)
-                        self._log(
-                            "[PLANT_CAL][MEASUREMENT] "
-                            f"trial={measurement.trial_id} channel={measurement.channel} "
-                            f"direction={measurement.direction:+d} "
-                            f"baseline={measurement.baseline_diameter_um:.6f}um "
-                            f"steady={measurement.steady_diameter_um:.6f}um "
-                            f"delta={measurement.diameter_change_um:+.6f}um "
-                            f"detected={measurement.response_detected} "
-                            f"classification={measurement.response_classification}"
-                        )
-                        completed += 1
-                        self._update_plant_calibration_experiment(
-                            completed_trials=completed,
-                            measurement_count=len(measurements),
-                        )
-
-            q1_sensitivity, q2_sensitivity = identify_channel_sensitivities(measurements)
-            q1_sign = 1.0 if q1_sensitivity > 0.0 else -1.0 if q1_sensitivity < 0.0 else 0.0
-            q2_sign = 1.0 if q2_sensitivity > 0.0 else -1.0 if q2_sensitivity < 0.0 else 0.0
-            base_step = min(float(config.q1_step), float(config.q2_step))
-            for direction in (-1, 1):
-                self._validate_plant_calibration_target(
-                    baseline_q1 + direction * q1_sign * float(config.q1_step),
-                    baseline_q2 + direction * q2_sign * float(config.q2_step),
+            for attempt in range(1, requested_config.maximum_attempts + 1):
+                self._require_calibration_lifecycle(generation, token)
+                config = replace(
+                    requested_config,
+                    baseline_wait_s=min(3600.0, requested_config.effective_baseline_wait_s * (1.5 ** (attempt - 1))),
+                    minimum_response_wait_s=min(3600.0, requested_config.minimum_response_wait_s * (1.5 ** (attempt - 1))),
+                    low_response_wait_s=min(7200.0, requested_config.low_response_wait_s * (1.5 ** (attempt - 1))),
+                    repetitions=min(5, requested_config.repetitions + attempt - 1),
                 )
+                measurements = []
+                result = None
+                self._calibration_partial_trial = None
+                self._update_plant_calibration_experiment(
+                    attempt=attempt, maximum_attempts=requested_config.maximum_attempts,
+                    status="running", completed_trials=0,
+                    total_trials=config.repetitions * 6 + config.validation_repetitions * 2,
+                    phase=f"第 {attempt} 轮：重新建模及独立验证",
+                    reason="重试延长观察并增加重复，不扩大流量阶跃或放宽验证标准" if attempt > 1 else "",
+                )
+                try:
+                    single_targets = (
+                        ("q1", 1, baseline_q1 + config.q1_step, baseline_q2),
+                        ("q1", -1, baseline_q1 - config.q1_step, baseline_q2),
+                        ("q2", 1, baseline_q1, baseline_q2 + config.q2_step),
+                        ("q2", -1, baseline_q1, baseline_q2 - config.q2_step),
+                    )
+                    for _channel, _direction, q1, q2 in single_targets:
+                        self._validate_plant_calibration_target(q1, q2)
 
-            for repeat in range(int(config.repetitions)):
-                directions = (1, -1) if repeat % 2 == 0 else (-1, 1)
-                for direction in directions:
-                    q1 = baseline_q1 + direction * q1_sign * float(config.q1_step)
-                    q2 = baseline_q2 + direction * q2_sign * float(config.q2_step)
-                    trial_id = f"combined-r{repeat + 1}-{'plus' if direction > 0 else 'minus'}"
-                    self._update_plant_calibration_experiment(
-                        phase=f"measuring {trial_id}",
-                        current_trial=trial_id,
-                    )
-                    self._restore_plant_calibration_baseline(
-                        baseline_q1=baseline_q1,
-                        baseline_q2=baseline_q2,
-                        generation=generation,
-                        token=token,
-                        next_trial_id=trial_id,
-                    )
-                    measurement = self._run_plant_calibration_trial(
+                    completed = 0
+                    for repeat in range(int(config.repetitions)):
+                        directions = (1, -1) if repeat % 2 == 0 else (-1, 1)
+                        for channel in ("q1", "q2"):
+                            for direction in directions:
+                                q1 = baseline_q1 + (direction * config.q1_step if channel == "q1" else 0.0)
+                                q2 = baseline_q2 + (direction * config.q2_step if channel == "q2" else 0.0)
+                                trial_id = f"{channel}-r{repeat + 1}-{'plus' if direction > 0 else 'minus'}"
+                                self._update_plant_calibration_experiment(
+                                    phase=f"measuring {trial_id}",
+                                    current_trial=trial_id,
+                                )
+                                self._restore_plant_calibration_baseline(
+                                    baseline_q1=baseline_q1,
+                                    baseline_q2=baseline_q2,
+                                    generation=generation,
+                                    token=token,
+                                    next_trial_id=trial_id,
+                                )
+                                measurement = self._run_plant_calibration_trial(
+                                    config=config,
+                                    generation=generation,
+                                    token=token,
+                                    trial_id=trial_id,
+                                    channel=channel,
+                                    direction=direction,
+                                    baseline_q1=baseline_q1,
+                                    baseline_q2=baseline_q2,
+                                    commanded_q1=q1,
+                                    commanded_q2=q2,
+                                )
+                                measurements.append(measurement)
+                                self._log(
+                                    "[PLANT_CAL][MEASUREMENT] "
+                                    f"trial={measurement.trial_id} channel={measurement.channel} "
+                                    f"direction={measurement.direction:+d} "
+                                    f"baseline={measurement.baseline_diameter_um:.6f}um "
+                                    f"steady={measurement.steady_diameter_um:.6f}um "
+                                    f"delta={measurement.diameter_change_um:+.6f}um "
+                                    f"detected={measurement.response_detected} "
+                                    f"classification={measurement.response_classification}"
+                                )
+                                completed += 1
+                                self._update_plant_calibration_experiment(
+                                    completed_trials=completed,
+                                    measurement_count=len(measurements),
+                                )
+
+                    q1_sensitivity, q2_sensitivity = identify_channel_sensitivities(measurements)
+                    q1_sign = 1.0 if q1_sensitivity > 0.0 else -1.0 if q1_sensitivity < 0.0 else 0.0
+                    q2_sign = 1.0 if q2_sensitivity > 0.0 else -1.0 if q2_sensitivity < 0.0 else 0.0
+                    base_step = min(float(config.q1_step), float(config.q2_step))
+                    for direction in (-1, 1):
+                        self._validate_plant_calibration_target(
+                            baseline_q1 + direction * q1_sign * float(config.q1_step),
+                            baseline_q2 + direction * q2_sign * float(config.q2_step),
+                        )
+
+                    for repeat in range(int(config.repetitions)):
+                        directions = (1, -1) if repeat % 2 == 0 else (-1, 1)
+                        for direction in directions:
+                            q1 = baseline_q1 + direction * q1_sign * float(config.q1_step)
+                            q2 = baseline_q2 + direction * q2_sign * float(config.q2_step)
+                            trial_id = f"combined-r{repeat + 1}-{'plus' if direction > 0 else 'minus'}"
+                            self._update_plant_calibration_experiment(
+                                phase=f"measuring {trial_id}",
+                                current_trial=trial_id,
+                            )
+                            self._restore_plant_calibration_baseline(
+                                baseline_q1=baseline_q1,
+                                baseline_q2=baseline_q2,
+                                generation=generation,
+                                token=token,
+                                next_trial_id=trial_id,
+                            )
+                            measurement = self._run_plant_calibration_trial(
+                                config=config,
+                                generation=generation,
+                                token=token,
+                                trial_id=trial_id,
+                                channel="combined",
+                                direction=direction,
+                                baseline_q1=baseline_q1,
+                                baseline_q2=baseline_q2,
+                                commanded_q1=q1,
+                                commanded_q2=q2,
+                                actuator_step=direction * base_step,
+                            )
+                            measurements.append(measurement)
+                            self._log(
+                                "[PLANT_CAL][MEASUREMENT] "
+                                f"trial={measurement.trial_id} channel={measurement.channel} "
+                                f"direction={measurement.direction:+d} "
+                                f"baseline={measurement.baseline_diameter_um:.6f}um "
+                                f"steady={measurement.steady_diameter_um:.6f}um "
+                                f"delta={measurement.diameter_change_um:+.6f}um "
+                                f"detected={measurement.response_detected} "
+                                f"classification={measurement.response_classification}"
+                            )
+                            completed += 1
+                            self._update_plant_calibration_experiment(
+                                completed_trials=completed,
+                                measurement_count=len(measurements),
+                            )
+
+                    validation_fraction = float(config.validation_step_fraction)
+                    validation_base_step = base_step * validation_fraction
+                    require_combined_response(measurements)
+                    for repeat in range(int(config.validation_repetitions)):
+                        directions = (1, -1) if repeat % 2 == 0 else (-1, 1)
+                        for direction in directions:
+                            q1 = (
+                                baseline_q1
+                                + direction * q1_sign * float(config.q1_step) * validation_fraction
+                            )
+                            q2 = (
+                                baseline_q2
+                                + direction * q2_sign * float(config.q2_step) * validation_fraction
+                            )
+                            self._validate_plant_calibration_target(q1, q2)
+                            trial_id = (
+                                f"validation-r{repeat + 1}-"
+                                f"{'plus' if direction > 0 else 'minus'}"
+                            )
+                            self._update_plant_calibration_experiment(
+                                phase=f"validating {trial_id}",
+                                current_trial=trial_id,
+                            )
+                            self._restore_plant_calibration_baseline(
+                                baseline_q1=baseline_q1,
+                                baseline_q2=baseline_q2,
+                                generation=generation,
+                                token=token,
+                                next_trial_id=trial_id,
+                            )
+                            measurement = self._run_plant_calibration_trial(
+                                config=config,
+                                generation=generation,
+                                token=token,
+                                trial_id=trial_id,
+                                channel="validation",
+                                direction=direction,
+                                baseline_q1=baseline_q1,
+                                baseline_q2=baseline_q2,
+                                commanded_q1=q1,
+                                commanded_q2=q2,
+                                actuator_step=direction * validation_base_step,
+                            )
+                            measurements.append(measurement)
+                            completed += 1
+                            self._update_plant_calibration_experiment(
+                                completed_trials=completed,
+                                measurement_count=len(measurements),
+                            )
+
+                    result = build_plant_calibration_result(
                         config=config,
-                        generation=generation,
-                        token=token,
-                        trial_id=trial_id,
-                        channel="combined",
-                        direction=direction,
-                        baseline_q1=baseline_q1,
-                        baseline_q2=baseline_q2,
-                        commanded_q1=q1,
-                        commanded_q2=q2,
-                        actuator_step=direction * base_step,
+                        measurements=measurements,
+                        session_id=token.session_id,
+                        started_at=started_at,
+                        q1_min=float(self.pid_config.q1_min),
+                        q1_max=float(self.pid_config.q1_max),
+                        q2_min=float(self.pid_config.q2_min),
+                        q2_max=float(self.pid_config.q2_max),
+                        total_flow_max=float(self.pid_config.total_flow_max),
+                        min_q1_q2_gap=float(self.pid_config.min_q1_q2_gap),
                     )
-                    measurements.append(measurement)
-                    self._log(
-                        "[PLANT_CAL][MEASUREMENT] "
-                        f"trial={measurement.trial_id} channel={measurement.channel} "
-                        f"direction={measurement.direction:+d} "
-                        f"baseline={measurement.baseline_diameter_um:.6f}um "
-                        f"steady={measurement.steady_diameter_um:.6f}um "
-                        f"delta={measurement.diameter_change_um:+.6f}um "
-                        f"detected={measurement.response_detected} "
-                        f"classification={measurement.response_classification}"
-                    )
-                    completed += 1
-                    self._update_plant_calibration_experiment(
-                        completed_trials=completed,
-                        measurement_count=len(measurements),
-                    )
-
-            validation_fraction = float(config.validation_step_fraction)
-            validation_base_step = base_step * validation_fraction
-            for repeat in range(int(config.validation_repetitions)):
-                directions = (1, -1) if repeat % 2 == 0 else (-1, 1)
-                for direction in directions:
-                    q1 = (
-                        baseline_q1
-                        + direction * q1_sign * float(config.q1_step) * validation_fraction
-                    )
-                    q2 = (
-                        baseline_q2
-                        + direction * q2_sign * float(config.q2_step) * validation_fraction
-                    )
-                    self._validate_plant_calibration_target(q1, q2)
-                    trial_id = (
-                        f"validation-r{repeat + 1}-"
-                        f"{'plus' if direction > 0 else 'minus'}"
-                    )
-                    self._update_plant_calibration_experiment(
-                        phase=f"validating {trial_id}",
-                        current_trial=trial_id,
-                    )
-                    self._restore_plant_calibration_baseline(
-                        baseline_q1=baseline_q1,
-                        baseline_q2=baseline_q2,
-                        generation=generation,
-                        token=token,
-                        next_trial_id=trial_id,
-                    )
-                    measurement = self._run_plant_calibration_trial(
-                        config=config,
-                        generation=generation,
-                        token=token,
-                        trial_id=trial_id,
-                        channel="validation",
-                        direction=direction,
-                        baseline_q1=baseline_q1,
-                        baseline_q2=baseline_q2,
-                        commanded_q1=q1,
-                        commanded_q2=q2,
-                        actuator_step=direction * validation_base_step,
-                    )
-                    measurements.append(measurement)
-                    completed += 1
-                    self._update_plant_calibration_experiment(
-                        completed_trials=completed,
-                        measurement_count=len(measurements),
-                    )
-
-            result = build_plant_calibration_result(
-                config=config,
-                measurements=measurements,
-                session_id=token.session_id,
-                started_at=started_at,
-                q1_min=float(self.pid_config.q1_min),
-                q1_max=float(self.pid_config.q1_max),
-                q2_min=float(self.pid_config.q2_min),
-                q2_max=float(self.pid_config.q2_max),
-                total_flow_max=float(self.pid_config.total_flow_max),
-                min_q1_q2_gap=float(self.pid_config.min_q1_q2_gap),
-            )
+                    result.require_accepted()
+                except CalibrationIdentificationError as exc:
+                    attempt_history.append({
+                        "attempt": attempt, "reason": str(exc), "config": config.to_dict(),
+                        "measurements": [item.to_dict() for item in measurements],
+                        "candidate_record": result.record.to_dict() if result is not None else None,
+                    })
+                    if attempt == requested_config.maximum_attempts:
+                        result = None
+                        raise
+                    self._require_calibration_lifecycle(generation, token)
+                    continue
+                result = replace(result, attempt_history=tuple(attempt_history))
+                break
         except Exception as exc:
             failure = exc
         finally:
@@ -1455,7 +1571,7 @@ class OrchestratorService:
                 if failure is None and result is not None:
                     self._update_plant_calibration_experiment(
                         status="completed",
-                        phase="completed; awaiting save",
+                        phase="独立验证通过，标定成功；等待保存应用",
                         reason="",
                         record=result.record.to_dict(),
                     )
@@ -1465,27 +1581,53 @@ class OrchestratorService:
                     )
                 else:
                     reason = str(failure or "plant calibration did not produce a result")
+                    insufficient = isinstance(failure, CalibrationIdentificationError) and stopped
+                    validation_failed = isinstance(failure, CalibrationValidationError) and stopped
                     self._update_plant_calibration_experiment(
-                        status="failed",
-                        phase="failed",
+                        status="validation_failed" if validation_failed else "insufficient_response" if insufficient else "failed",
+                        phase="已达重试上限，独立验证未通过" if validation_failed else "响应不足，需要重测" if insufficient else "failed",
                         reason=reason,
                     )
-                    self._set_state(SystemState.ERROR, error=reason)
+                    if insufficient:
+                        self._set_state(SystemState.STOPPED, message=reason)
+                    else:
+                        self._set_state(SystemState.ERROR, error=reason)
             elif failure is not None:
                 self._update_plant_calibration_experiment(
                     status="cancelled",
                     phase="cancelled by pause or stop",
                     reason=str(failure),
                 )
+
+        try:
+            if failure is not None:
+                # Archive after safety cleanup: disk I/O must not delay stopping.
+                reason = str(failure)
+                try:
+                    path = ensure_user_subdir("calibrations") / f"incomplete_{time.time_ns()}.measurements.json"
+                    partial = self._calibration_partial_trial
+                    if partial and any(item.trial_id == partial["trial_id"] for item in measurements):
+                        partial = None
+                    saved_path = save_failed_calibration(
+                        path, config=config, measurements=measurements, reason=reason,
+                        session_id=token.session_id if token is not None else "",
+                        started_at=started_at, partial_trial=partial, attempt_history=attempt_history,
+                    )
+                except OSError as exc:
+                    reason += f"\n测量记录保存失败：{exc}"
+                else:
+                    reason += f"\n测量数据已保存：{saved_path}\n此文件仅用于诊断，不能作为闭环标定加载。"
+                    self._update_plant_calibration_experiment(measurements_path=saved_path)
+                self._update_plant_calibration_experiment(reason=reason)
+                failure.args = (reason,)
+                raise failure
+            if result is None:
+                raise RuntimeError("plant calibration was cancelled before completion")
+            return result
+        finally:
             with self._lock:
                 self._plant_calibration_in_progress = False
                 self._start_in_progress = False
-
-        if failure is not None:
-            raise failure
-        if result is None:
-            raise RuntimeError("plant calibration was cancelled before completion")
-        return result
 
     def save_plant_calibration_experiment(
         self,
@@ -1542,6 +1684,8 @@ class OrchestratorService:
             system_config.pump_parity = "N"
 
         self._apply_plant_calibration(plant_calibration)
+        self.pid_config.target_feedforward_enabled = system_config.target_feedforward_enabled
+        self.pid_config.disturbance_feedforward_enabled = system_config.disturbance_feedforward_enabled
         self._require_valid_phase_flows(system_config.initial_q1, system_config.initial_q2)
 
         with self._lock:
@@ -2054,9 +2198,45 @@ class OrchestratorService:
         )
         raise RuntimeError("start superseded by a lifecycle transition")
 
-    def _update_flow_with_lifecycle_guard(self, q1: float, q2: float, generation: int):
+    def _update_flow_with_lifecycle_guard(self, q1: float, q2: float, generation: int) -> FlowUpdateResult | None:
+        with self._lock:
+            self._command_sequence += 1
+            command_id = self._command_sequence
+            rec = self._recognition
+            basis = {
+                "command_id": command_id, "generation": generation,
+                "session_id": getattr(self._run_token, "session_id", ""),
+                "owner": self._state.name, "q1_requested": q1, "q2_requested": q2,
+                "basis_command_id": self._feedback_hold.command_id,
+                "frame_id": getattr(rec, "frame_id", 0),
+                "period_id": getattr(rec, "control_period_id", 0),
+                "window_start": getattr(rec, "measurement_window_start", None),
+                "window_end": getattr(rec, "measurement_window_end", None),
+                "sample_start": getattr(rec, "measurement_sample_start", None),
+                "sample_end": getattr(rec, "measurement_sample_end", None),
+                "reason": f"{self._state.name} flow update requested",
+            }
+        self._log_command_event(command_id, "proposed", **{k: v for k, v in basis.items() if k != "command_id"})
+        try:
+            result = self._execute_flow_with_lifecycle_guard(q1, q2, generation, command_id)
+        except Exception as exc:
+            self._log_command_event(command_id, "rejected" if isinstance(exc, _FlowCommandRejected) else "error", reason=str(exc))
+            raise
+        self._log_command_event(command_id, "cancelled" if result is None else ("verified" if result.ok else "failed"))
+        return result
+
+    def _log_command_event(self, command_id: int, status: str, **details: Any) -> None:
+        self._log("[PUMP][COMMAND] " + json.dumps({
+            **details, "command_id": command_id, "status": status,
+            "timestamp": time.time(), "monotonic": time.monotonic(),
+        }, ensure_ascii=False))
+
+    def _execute_flow_with_lifecycle_guard(self, q1: float, q2: float, generation: int, command_id: int) -> FlowUpdateResult | None:
         """Run a flow update without letting lifecycle changes trigger retries."""
-        self._require_valid_phase_flows(q1, q2)
+        try:
+            self._require_valid_phase_flows(q1, q2)
+        except ValueError as exc:
+            raise _FlowCommandRejected(str(exc)) from exc
         with self._lock:
             if (
                 generation != self._lifecycle_generation
@@ -2088,7 +2268,27 @@ class OrchestratorService:
             token, timeout_s=transaction_watchdog_s
         ):
             raise RuntimeError("pump update rejected by safety supervisor")
+        self._log_command_event(command_id, "dispatching")
+        dispatched_at = time.monotonic()
         update_res = self.pump_service.update_flow_while_running(float(q1), float(q2))
+        completed_at = time.monotonic()
+        update_res.command_id = command_id
+        if not getattr(update_res, "command_started_monotonic", 0.0):
+            update_res.command_started_monotonic = dispatched_at
+        if not getattr(update_res, "readback_completed_monotonic", 0.0):
+            update_res.readback_completed_monotonic = completed_at
+        self._log_command_event(
+            command_id, "transaction_result", ok=update_res.ok,
+            dispatched_monotonic=dispatched_at,
+            q1_readback=self._flow_from_channel_params(getattr(update_res, "verified_q1", None)),
+            q2_readback=self._flow_from_channel_params(getattr(update_res, "verified_q2", None)),
+            completed_monotonic=completed_at,
+            reason=getattr(update_res, "reason", None),
+            q1_error=getattr(update_res, "q1_error", None), q2_error=getattr(update_res, "q2_error", None),
+            rolled_back=getattr(update_res, "rolled_back", False),
+            rollback_error=getattr(update_res, "rollback_error", None),
+            safe_stop_verified=getattr(update_res, "safe_stop_verified", False),
+        )
         with self._lock:
             current = (
                 generation == self._lifecycle_generation
@@ -2106,12 +2306,11 @@ class OrchestratorService:
         if update_res.ok and self._state != SystemState.CALIBRATING:
             # Use receipt of the completed, verified transaction, never its
             # start or a device acknowledgement, as the conservative origin.
-            completed_at = time.monotonic()
             wait_s, source = self._post_command_wait()
             with self._lock:
                 if generation != self._lifecycle_generation or self._stop_event.is_set() or self._pause_event.is_set():
                     return None
-                self._feedback_hold.record(completed_at, wait_s, source)
+                self._feedback_hold.record(completed_at, wait_s, source, command_id=command_id)
             self._log(
                 f"[PID][POST_COMMAND] command_id={self._feedback_hold.command_id} "
                 f"completed_monotonic={completed_at:.6f} "
@@ -2215,6 +2414,8 @@ class OrchestratorService:
                 self._message = "local video mode: skip pump initialization and PID output"
 
             self._pid_controller.reset()
+            self._response_guard = ResponseGuard()
+            self._response_guard_generation = None
             self._log(
                 "[PID][INIT] "
                 f"mode={self.pid_config.control_mode} "
@@ -3006,6 +3207,55 @@ class OrchestratorService:
                 self._control_condition.wait(timeout=timeout)
         return self.get_snapshot()
 
+    def configure_control_batch(self, capture_frames: int, analysis_frames: int) -> None:
+        """Apply the new sizes to the next complete PID batch, never mid-batch."""
+        from .models import validate_control_batch
+
+        validate_control_batch(capture_frames, analysis_frames)
+        if not callable(getattr(self.vision_service, "request_control_batch", None)):
+            raise RuntimeError("当前视觉服务不支持按帧批次控制")
+        with self._lock:
+            if self._cfg is not None:
+                self._cfg = replace(
+                    self._cfg, control_batch_enabled=True,
+                    control_capture_frames=capture_frames, control_analysis_frames=analysis_frames,
+                )
+
+    def _run_frame_control_cycle(self, token: RunToken, generation: int, interval_s: float) -> None:
+        cfg = self._cfg
+        request = getattr(self.vision_service, "request_control_batch", None)
+        wait = getattr(self.vision_service, "wait_for_control_batch", None)
+        if cfg is None or not callable(request) or not callable(wait):
+            raise RuntimeError("当前视觉服务不支持按帧批次控制")
+        request_id = request(cfg.control_capture_frames, cfg.control_analysis_frames)
+        started = time.monotonic()
+        self._log(f"[CONTROL][BATCH] id={request_id} capture={cfg.control_capture_frames} analyze={cfg.control_analysis_frames}")
+        while not self._stop_event.is_set() and not self._pause_event.is_set():
+            with self._lock:
+                if generation != self._lifecycle_generation or self._state != SystemState.RUNNING:
+                    return
+            if not self._safety.heartbeat(token, timeout_s=self._control_heartbeat_timeout_s(interval_s)):
+                raise RuntimeError("frame batch lost its safety run token")
+            rec = wait(request_id, timeout=0.1)
+            if rec.control_batch_id == request_id:
+                with self._lock:
+                    if (generation != self._lifecycle_generation or self._state != SystemState.RUNNING
+                            or self._stop_event.is_set() or self._pause_event.is_set()):
+                        return
+                # The adapter holds this completed batch until the next request.
+                # The normal path still owns quality checks, PID and pump writes.
+                try:
+                    self.run_control_step()
+                except RuntimeError:
+                    with self._lock:
+                        if (generation != self._lifecycle_generation
+                                and self._state in {SystemState.PAUSED, SystemState.STOPPING, SystemState.STOPPED}):
+                            return
+                    raise
+                return
+            if time.monotonic() - started > 120.0:
+                raise RuntimeError("采集/分析批次超过 120 秒未完成")
+
     def _control_loop(self) -> None:
         token = self._run_token
         with self._lock:
@@ -3016,6 +3266,7 @@ class OrchestratorService:
             / 1000.0,
         )
         next_deadline = time.monotonic() + interval_s
+        next_batch_at = time.monotonic()
         self._log(f"[CONTROL][SCHEDULE] interval_ms={interval_s * 1000.0:.3f}")
         try:
             # Vision events can wake the loop early, but PID execution remains
@@ -3033,6 +3284,18 @@ class OrchestratorService:
                     timeout_s=heartbeat_timeout,
                 ):
                     raise RuntimeError("control loop lost its safety run token")
+
+                if getattr(self._cfg, "control_batch_enabled", False) and self._state == SystemState.RUNNING:
+                    # A complete new batch follows each decision/transaction.
+                    # Physical response waiting and the hardware rate limit remain.
+                    ready_at = max(next_batch_at, self._feedback_hold.ready_after)
+                    if time.monotonic() < ready_at:
+                        self._stop_event.wait(min(0.1, ready_at - time.monotonic()))
+                        continue
+                    batch_started = time.monotonic()
+                    self._run_frame_control_cycle(token, generation, interval_s)
+                    next_batch_at = max(time.monotonic(), batch_started + interval_s)
+                    continue
 
                 waiter = getattr(self.vision_adapter, "wait_for_recognition_snapshot", None)
                 remaining_s = max(0.0, next_deadline - time.monotonic())
@@ -3090,6 +3353,9 @@ class OrchestratorService:
             if token is not None and self._safety.permits(token):
                 self._run_token = None
                 self._safety.trip("control thread exited unexpectedly")
+            cancel_batch = getattr(self.vision_service, "cancel_control_batch", None)
+            if callable(cancel_batch):
+                cancel_batch()
 
     def run_control_step(self) -> None:
         step_lock = getattr(self, "_control_step_lock", None)
@@ -3101,6 +3367,23 @@ class OrchestratorService:
             self._run_control_step()
         finally:
             step_lock.release()
+
+    def _stop_for_response_guard(self, reason: str) -> None:
+        self._pump_control_enabled = False
+        self._run_token = None
+        self._stop_event.set()
+        safety = getattr(self, "_safety", None)
+        if safety is not None:
+            safety.trip(reason)
+        stopped = self._safety_stop_pump()
+        if stopped and safety is not None:
+            safety.confirm_stopped()
+        self._update_control_snapshot(ControlSnapshot(
+            diameter_error=0.0, adjustment=0.0,
+            q1_command=self._pump_state.q1, q2_command=self._pump_state.q2,
+            freeze_feedback=True, suggested_stop=True, reason=reason, timestamp=time.time(),
+        ))
+        self._set_state(SystemState.ERROR, error=reason + ("" if stopped else "; pump stop is not verified"))
 
     def _run_control_step(self) -> None:
         token = getattr(self, "_run_token", None)
@@ -3140,11 +3423,12 @@ class OrchestratorService:
             )
         now = time.time()
         monotonic_now = time.monotonic()
+        measurement_time = getattr(rec, "measurement_sample_end", None)
+        feedback_time = measurement_time if measurement_time is not None and math.isfinite(measurement_time) else monotonic_now
         if self._last_control_ts is None:
             dt = (self._cfg.control_interval_ms if self._cfg else self.runtime.default_control_interval_ms) / 1000.0
         else:
-            dt = max(1e-3, monotonic_now - self._last_control_ts)
-        self._last_control_ts = monotonic_now
+            dt = max(1e-3, feedback_time - self._last_control_ts)
 
         if not self._is_realtime_mode():
             ctrl = ControlSnapshot(
@@ -3222,7 +3506,20 @@ class OrchestratorService:
             error="",
         )
 
+        guard = self._response_guard
+        if self._state == SystemState.RUNNING:
+            if self._response_guard_generation not in (None, generation):
+                # A pause invalidates previous stable evidence, not retry limits.
+                guard.invalid_since = None
+                guard.invalidate(monotonic_now)
+            self._response_guard_generation = generation
+            if guard.timed_out(monotonic_now, self.runtime.response_guard_timeout_s):
+                self._stop_for_response_guard("工况长时间未恢复稳定，安全停止；原因待确认")
+                return
+
         if not rec.valid_for_control:
+            if self._state == SystemState.RUNNING:
+                guard.invalidate(monotonic_now)
             reason = rec.reason or rec.control_reason or "recognition result invalid"
             self._reject_optimization_window_if_due(
                 reason, monotonic_now, int(rec.control_period_id or 0)
@@ -3261,6 +3558,8 @@ class OrchestratorService:
             control_interval_ms * 1.5,
         )
         if rec.timestamp <= 0.0 or recognition_age_ms > recognition_age_limit_ms:
+            if self._state == SystemState.RUNNING:
+                guard.invalidate(monotonic_now)
             self._reject_optimization_window_if_due(
                 "recognition result stale", monotonic_now, int(rec.control_period_id or 0)
             )
@@ -3367,8 +3666,11 @@ class OrchestratorService:
             getattr(rec, "measurement_window_end", None),
         )
         source_start = getattr(rec, "measurement_sample_start", None)
+        source_end = getattr(rec, "measurement_sample_end", None)
         if hold.command_id and not hold_reason and (
             source_start is None or not math.isfinite(source_start) or source_start < hold.ready_after
+            or source_end is None or not math.isfinite(source_end) or source_end < source_start
+            or source_end >= rec.measurement_window_end
         ):
             hold_reason = "尺寸轨迹含等待期内的测量或来源时间缺失，等待全新样本"
         if hold_reason:
@@ -3380,6 +3682,28 @@ class OrchestratorService:
                 basis_command_id=hold.command_id, feedback_ready_after=hold.ready_after,
             ))
             self._log(f"[PID][HOLD] {hold_reason}")
+            return
+        decision = guard.observe(
+            now=monotonic_now, start=source_start, end=source_end,
+            diameter=float(current_avg_diameter), std=rec.frame_diameter_std,
+            tolerance=max(self.runtime.response_guard_tolerance_um, 2.0 * float(rec.pixel_to_micron or control_config.pixel_to_micron)),
+            recovery_s=self.runtime.response_guard_recovery_s,
+            timeout_s=self.runtime.response_guard_timeout_s,
+            error=target_diameter_um - float(current_avg_diameter),
+            deadband=float(self.pid_config.diameter_deadband),
+            max_attempts=self.runtime.response_guard_max_attempts,
+        )
+        if decision.stop:
+            self._stop_for_response_guard(decision.reason)
+            return
+        if decision.reason:
+            self._update_control_snapshot(ControlSnapshot(
+                diameter_error=target_diameter_um - float(current_avg_diameter),
+                adjustment=0.0, q1_command=self._pump_state.q1, q2_command=self._pump_state.q2,
+                freeze_feedback=True, suggested_stop=False, reason=decision.reason, timestamp=now,
+                frame_id=int(rec.frame_id), control_period_id=int(rec.control_period_id),
+                basis_command_id=hold.command_id, feedback_ready_after=hold.ready_after,
+            ))
             return
         self._log(
             f"[PID][BASIS] session_id={rec.session_id} generation={rec.run_generation} "
@@ -3454,7 +3778,28 @@ class OrchestratorService:
         candidate_controller = copy.deepcopy(
             self._pid_controller, {id(self._pid_controller.config): self._pid_controller.config}
         )
+        if decision.recovering:
+            candidate_controller.set_operating_point(ps.q1, ps.q2)
+            pid_input.integration_dt = 0.0
+        retrying = guard.unresponsive_commands > 0
+        if retrying or decision.recovering:
+            # Bound retries inside the allocator, so anti-windup sees the same
+            # limits as the command. Never clip a command after PID calculation.
+            candidate_controller.config = copy.copy(candidate_controller.config)
+            candidate_controller.config.max_flow_change_per_cycle = min(
+                candidate_controller.config.max_flow_change_per_cycle,
+                self.runtime.response_guard_retry_step,
+            )
+            candidate_controller.config.control_mode = "CLASSIC_PID"
         cmd = candidate_controller.update_input(pid_input)
+        candidate_controller.config = self.pid_config
+        requested_flow_change = abs(float(cmd.q1) - ps.q1) + abs(float(cmd.q2) - ps.q2)
+        if retrying and guard.cumulative_change + requested_flow_change > self.runtime.response_guard_retry_budget:
+            cmd.freeze_feedback = True
+            cmd.reason = "稳定但未检测到响应，累计调节预算已用尽；暂停自动追调"
+        if not cmd.suggested_stop and not cmd.freeze_feedback and requested_flow_change <= 1e-9:
+            cmd.freeze_feedback = True
+            cmd.reason = "控制输出未变化，保持当前流量，不重复下发"
         operating_point = self._pid_controller.operating_point
         if int(rec.frame_id) > 0:
             self._last_control_frame_id = int(rec.frame_id)
@@ -3473,6 +3818,12 @@ class OrchestratorService:
             d_term=float(cmd.d_term),
             pid_output=float(cmd.pid_output),
             feedforward_output=float(cmd.feedforward_output),
+            target_feedforward_output=float(cmd.target_feedforward_output),
+            target_feedforward_active=bool(cmd.target_feedforward_active),
+            target_feedforward_reason=str(cmd.target_feedforward_reason),
+            disturbance_feedforward_output=float(cmd.disturbance_feedforward_output),
+            disturbance_feedforward_active=bool(cmd.disturbance_feedforward_active),
+            disturbance_feedforward_reason=str(cmd.disturbance_feedforward_reason),
             final_output=float(cmd.final_output),
             kp=float(cmd.kp),
             ki=float(cmd.ki),
@@ -3527,15 +3878,6 @@ class OrchestratorService:
             )
             return
 
-        try:
-            self._require_valid_phase_flows(cmd.q1, cmd.q2)
-        except ValueError as exc:
-            ctrl.freeze_feedback = True
-            ctrl.reason = f"PID command rejected: {exc}; keep current infusion"
-            self._log(f"[PID][SAFETY][REJECT] {ctrl.reason}")
-            self._update_control_snapshot(ctrl)
-            return
-
         self._log(
             "[PID][UPDATE] "
             f"mode={cmd.control_mode} adaptive_enabled={cmd.adaptive_enabled} "
@@ -3547,6 +3889,7 @@ class OrchestratorService:
             f"adaptive_reason={cmd.adaptive_reason} "
             f"feedforward_active={cmd.feedforward_active} "
             f"feedforward_output={cmd.feedforward_output:.6f} "
+            f"target_ff={cmd.target_feedforward_output:.6f} disturbance_ff={cmd.disturbance_feedforward_output:.6f} "
             f"feedforward_reason={cmd.feedforward_reason}"
         )
         # Revalidate immediately before hardware I/O. The safety token binds
@@ -3571,9 +3914,16 @@ class OrchestratorService:
                 self._log(f"[PID][TARGET][RACE] {ctrl.reason}")
                 self._update_control_snapshot(ctrl)
                 return
-        update_res = self._update_flow_with_lifecycle_guard(cmd.q1, cmd.q2, generation)
+        try:
+            update_res = self._update_flow_with_lifecycle_guard(cmd.q1, cmd.q2, generation)
+        except _FlowCommandRejected as exc:
+            ctrl.freeze_feedback = True
+            ctrl.reason = f"PID command rejected: {exc}; keep current infusion"
+            self._update_control_snapshot(ctrl)
+            return
         if update_res is None:
             return
+        ctrl.command_id = getattr(update_res, "command_id", 0)
 
         if not update_res.ok:
             self._pump_state.last_update_ok = False
@@ -3614,6 +3964,13 @@ class OrchestratorService:
                 ):
                     return
                 self._pid_controller = candidate_controller
+                self._last_control_ts = feedback_time
+                verified_q1 = self._flow_from_channel_params(update_res.verified_q1)
+                verified_q2 = self._flow_from_channel_params(update_res.verified_q2)
+                verified_change = abs((float(cmd.q1) if verified_q1 is None else verified_q1) - ps.q1) + abs(
+                    (float(cmd.q2) if verified_q2 is None else verified_q2) - ps.q2
+                )
+                guard.record_command(float(current_avg_diameter), verified_change)
             ctrl.command_id = self._feedback_hold.command_id
             ctrl.command_completed_monotonic = self._feedback_hold.completed_at
             ctrl.feedback_ready_after = self._feedback_hold.ready_after
@@ -3937,10 +4294,14 @@ class OrchestratorService:
         q1_actual = float(self._pump_state.q1_actual if self._pump_state.q1_actual is not None else best.q1)
         q2_actual = float(self._pump_state.q2_actual if self._pump_state.q2_actual is not None else best.q2)
         self._pid_controller.set_operating_point(q1_actual, q2_actual)
+        self._response_guard = ResponseGuard()
+        self._response_guard.invalidate(monotonic_now)
         self._get_drift_supervisor().reset()
         self._last_control_frame_id = int(rec.frame_id or 0)
         self._last_control_period_id = int(rec.control_period_id or 0)
-        self._last_control_ts = monotonic_now
+        # Operating-point transfer resets PID history; do not mix the host
+        # handover time with the next window's acquisition-time derivative.
+        self._last_control_ts = None
         self._set_state(SystemState.RUNNING, message="BO optimum accepted; PID control enabled")
         self._update_control_snapshot(
             self._optimization_snapshot(now, q1_actual, q2_actual, "bumpless transfer complete; PID enabled")

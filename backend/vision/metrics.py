@@ -55,6 +55,10 @@ class ControlMetrics:
     window_start_time: float | None = None
     window_end_time: float | None = None
     sample_start_time: float | None = None
+    sample_end_time: float | None = None
+    crossed_track_sample_starts: dict[int, float] = field(default_factory=dict)
+    current_frame_droplet_count: int = 0
+    window_passage_count: int = 0
 
 
 @dataclass
@@ -100,6 +104,7 @@ class _TrackState:
     last_coord: float
     counted: bool = False
     diameters: list[float] = field(default_factory=list)
+    sample_times: list[float] = field(default_factory=list)
 
 
 class MetricsCalculator:
@@ -108,10 +113,14 @@ class MetricsCalculator:
         self._log = logger or (lambda _msg: None)
         self._diameter_history: Deque[float] = deque(maxlen=max(1, config.rolling_window))
         self._period_start: float | None = None
+        self._frame_batch_remaining = 0
         self._completed_bounds: tuple[float | None, float | None] = (None, None)
         self._track_measurement_start: dict[int, float] = {}
         self._period_sample_starts: dict[int, float] = {}
         self._completed_sample_start: float | None = None
+        self._period_sample_ends: dict[int, float] = {}
+        self._completed_sample_end: float | None = None
+        self._last_update_time: float | None = None
         # One locked median diameter per droplet that actually crossed the
         # count line in the current control period.
         self._period_diameters: dict[int, float] = {}
@@ -139,6 +148,7 @@ class MetricsCalculator:
         track: DropletTrack,
         line_y: float,
         diameter: float | None,
+        timestamp: float,
     ) -> tuple[bool, float | None]:
         axis = str(self._config.flow_axis).strip().lower()
         axis_index = 1 if axis == "y" else 0
@@ -150,6 +160,7 @@ class MetricsCalculator:
                 last_coord=cur_coord,
                 counted=False,
                 diameters=[float(diameter)] if diameter is not None else [],
+                sample_times=[timestamp] if diameter is not None else [],
             )
             return False, None
 
@@ -157,9 +168,11 @@ class MetricsCalculator:
         state.last_coord = cur_coord
         if diameter is not None and np.isfinite(diameter) and float(diameter) > 0.0:
             state.diameters.append(float(diameter))
+            state.sample_times.append(timestamp)
             keep = max(1, int(self._config.diameter_samples_per_track))
             if len(state.diameters) > keep:
                 del state.diameters[:-keep]
+                del state.sample_times[:-keep]
         if state.counted:
             return False, None
 
@@ -196,6 +209,11 @@ class MetricsCalculator:
         frame_width: int | None = None,
         timestamp: float | None = None,
     ) -> MetricsResult:
+        now = time.monotonic() if timestamp is None else float(timestamp)
+        if not np.isfinite(now) or (self._last_update_time is not None and now <= self._last_update_time):
+            raise ValueError("size acquisition time must be finite and strictly increasing")
+        self._last_update_time = now
+        timestamp = now
         axis = str(self._config.flow_axis).strip().lower()
         line_extent = frame_height if axis == "y" else int(frame_width or frame_height)
         line_y = float(max(1, line_extent) * float(self._config.count_line_ratio))
@@ -213,12 +231,14 @@ class MetricsCalculator:
         ]
         valid_track_ids = {int(track.id) for track in valid_tracks}
         frame_droplet_count = len(valid_tracks)
+        current_frame_droplet_count = frame_droplet_count
 
         frame_diameters: list[float] = []
         crossed_track_diameters: dict[int, float] = {}
         crossed_track_bead_counts: dict[int, int] = {}
         crossed_track_ids: list[int] = []
         new_crossing_count = 0
+        valid_size_track_ids: set[int] = set()
 
         frame_bead_counts: dict[int, int] = {}
         for droplet in beads.droplets:
@@ -237,13 +257,14 @@ class MetricsCalculator:
                 if diameter_valid
                 else 0.0
             )
-            diameter = observed_radius * 2.0 if observed_radius > 0.0 else None
+            diameter = observed_radius * 2.0 if np.isfinite(observed_radius) and observed_radius > 0.0 else None
             if diameter is not None:
                 frame_diameters.append(diameter)
+                valid_size_track_ids.add(int(track.id))
                 self._track_measurement_start.setdefault(
                     int(track.id), float(timestamp) if timestamp is not None else time.monotonic()
                 )
-            crossed, locked_diameter = self._update_crossing_count(track, line_y, diameter)
+            crossed, locked_diameter = self._update_crossing_count(track, line_y, diameter, now)
             if crossed:
                 new_crossing_count += 1
                 crossed_track_ids.append(int(track.id))
@@ -251,6 +272,9 @@ class MetricsCalculator:
                     track_id = int(track.id)
                     crossed_track_diameters[track_id] = locked_diameter
                     crossed_track_bead_counts[track_id] = self._track_bead_max.get(track_id, 0)
+
+        sample_starts = {key: self._track_state[key].sample_times[0] for key in crossed_track_diameters}
+        sample_ends = {key: self._track_state[key].sample_times[-1] for key in crossed_track_diameters}
 
         for track_id in tracking.removed_track_ids:
             key = int(track_id)
@@ -289,14 +313,11 @@ class MetricsCalculator:
             crossed_track_bead_counts=crossed_track_bead_counts,
             frame_crossing_count=new_crossing_count,
             timestamp=timestamp,
-            crossed_track_sample_starts={
-                key: self._track_measurement_start[key] for key in crossed_track_diameters
-                if key in self._track_measurement_start
-            },
+            crossed_track_sample_starts=sample_starts,
+            crossed_track_sample_ends=sample_ends,
         )
-        # Use the robust sample set for feedback. Detector false positives and
-        # partial circles otherwise inflate CV and can keep PID frozen forever.
-        # Raw track/count statistics remain available through the period count.
+        # Quality is decided per image/track. A genuine large droplet must not
+        # disappear merely because it differs from the population or target.
         raw_frame_diameters = [float(value) for value in window_diameters]
         raw_mean = float(np.mean(raw_frame_diameters)) if raw_frame_diameters else None
         raw_std = float(np.std(raw_frame_diameters, ddof=0)) if raw_frame_diameters else None
@@ -307,7 +328,7 @@ class MetricsCalculator:
         )
         frame_diameters = self._robust_diameter_samples(raw_frame_diameters)
         filtering_rule = (
-            f"MAD x {float(self._config.robust_mad_multiplier):g}"
+            "finite_positive_only"
             if len(frame_diameters) != len(raw_frame_diameters)
             else "none"
         )
@@ -402,7 +423,7 @@ class MetricsCalculator:
             filtering_rule=filtering_rule,
             crossed_track_ids=list(crossed_track_ids),
             crossed_track_diameters=dict(crossed_track_diameters),
-            valid_track_ids=sorted(valid_track_ids),
+            valid_track_ids=sorted(valid_size_track_ids),
         )
 
         control = ControlMetrics(
@@ -410,6 +431,10 @@ class MetricsCalculator:
             window_start_time=self._completed_bounds[0],
             window_end_time=self._completed_bounds[1],
             sample_start_time=self._completed_sample_start,
+            sample_end_time=self._completed_sample_end,
+            crossed_track_sample_starts=sample_starts,
+            current_frame_droplet_count=current_frame_droplet_count,
+            window_passage_count=new_crossing_count,
             average_diameter=average_diameter,
             current_active_droplets=frame_droplet_count,
             sample_size=sample_size,
@@ -433,7 +458,7 @@ class MetricsCalculator:
             filtering_rule=filtering_rule,
             crossed_track_ids=list(crossed_track_ids),
             crossed_track_diameters=dict(crossed_track_diameters),
-            valid_track_ids=sorted(valid_track_ids),
+            valid_track_ids=sorted(valid_size_track_ids),
         )
 
         return MetricsResult(control=control, analysis=analysis)
@@ -446,11 +471,14 @@ class MetricsCalculator:
         frame_crossing_count: int = 0,
         timestamp: float | None = None,
         crossed_track_sample_starts: dict[int, float] | None = None,
+        crossed_track_sample_ends: dict[int, float] | None = None,
     ) -> tuple[list[float], int, int, int, int]:
         now = float(timestamp) if timestamp is not None else time.monotonic()
         period_s = max(0.001, float(self._config.realtime_window_ms) / 1000.0)
         if self._period_start is None or now < self._period_start:
             self._period_sample_starts.clear()
+            self._period_sample_ends.clear()
+            self._completed_sample_end = None
             self._completed_sample_start = None
             self._completed_bounds = (None, None)
             self._completed_period = ([], 0, 0, 0, self._completed_period_id)
@@ -459,7 +487,7 @@ class MetricsCalculator:
             self._period_bead_max.clear()
             self._period_crossing_count = 0
 
-        if now >= self._period_start + period_s:
+        if self._frame_batch_remaining == 0 and now >= self._period_start + period_s:
             elapsed_periods = max(1, int((now - self._period_start) // period_s))
             window_end = self._period_start + elapsed_periods * period_s
             self._completed_bounds = (window_end - period_s, window_end)
@@ -467,6 +495,7 @@ class MetricsCalculator:
             # has no size samples. Never relabel an older batch as fresh data.
             if elapsed_periods > 1:
                 self._period_sample_starts.clear()
+                self._period_sample_ends.clear()
                 self._period_diameters.clear()
                 self._period_bead_max.clear()
                 self._period_crossing_count = 0
@@ -476,6 +505,11 @@ class MetricsCalculator:
                 if self._period_diameters.keys() <= self._period_sample_starts.keys() else None
             )
             self._period_sample_starts.clear()
+            self._completed_sample_end = (
+                max(self._period_sample_ends.values(), default=None)
+                if self._period_diameters.keys() <= self._period_sample_ends.keys() else None
+            )
+            self._period_sample_ends.clear()
             completed_single = sum(
                 1 for track_id in self._period_diameters if self._period_bead_max.get(track_id, 0) == 1
             )
@@ -495,34 +529,61 @@ class MetricsCalculator:
         for track_id, diameter in crossed_track_diameters.items():
             self._period_diameters[int(track_id)] = float(diameter)
         self._period_sample_starts.update(crossed_track_sample_starts or {})
+        self._period_sample_ends.update(crossed_track_sample_ends or {})
         for track_id, bead_count in crossed_track_bead_counts.items():
             key = int(track_id)
             self._period_bead_max[key] = max(self._period_bead_max.get(key, 0), int(bead_count))
         self._period_crossing_count += max(0, int(frame_crossing_count))
+        if self._frame_batch_remaining > 0:
+            self._frame_batch_remaining -= 1
+            if self._frame_batch_remaining == 0:
+                self._completed_period_id += 1
+                self._completed_bounds = (self._period_start, now)
+                self._completed_sample_start = (
+                    min(self._period_sample_starts.values(), default=None)
+                    if self._period_diameters.keys() <= self._period_sample_starts.keys() else None
+                )
+                self._completed_sample_end = (
+                    max(self._period_sample_ends.values(), default=None)
+                    if self._period_diameters.keys() <= self._period_sample_ends.keys() else None
+                )
+                self._completed_period = (
+                    list(self._period_diameters.values()),
+                    sum(self._period_bead_max.get(key, 0) == 1 for key in self._period_diameters),
+                    len(self._period_diameters), self._period_crossing_count,
+                    self._completed_period_id,
+                )
         return self._completed_period
 
+    def begin_frame_batch(self, frame_count: int) -> int:
+        """Start a frame-counted window without recounting existing tracks."""
+        if frame_count < 1:
+            raise ValueError("frame batch must contain at least one frame")
+        self.cancel_frame_batch()
+        self._frame_batch_remaining = frame_count
+        # A new command must never reuse pre-command diameter observations.
+        for state in self._track_state.values():
+            state.diameters.clear()
+            state.sample_times.clear()
+        return self._completed_period_id + 1
+
+    def cancel_frame_batch(self) -> None:
+        self._frame_batch_remaining = 0
+        self._period_start = None
+        self._period_diameters.clear()
+        self._period_bead_max.clear()
+        self._period_sample_starts.clear()
+        self._period_sample_ends.clear()
+        self._period_crossing_count = 0
+
     def _robust_diameter_samples(self, values: list[float]) -> list[float]:
-        samples = np.asarray(
-            [float(value) for value in values if np.isfinite(value) and float(value) > 0.0],
-            dtype=np.float32,
-        )
-        if samples.size < 5:
-            return samples.astype(float).tolist()
-
-        median = float(np.median(samples))
-        deviations = np.abs(samples - median)
-        mad = float(np.median(deviations))
-        if mad <= 1e-6:
-            return samples.astype(float).tolist()
-
-        robust_sigma = 1.4826 * mad
-        limit = max(1.0, float(self._config.robust_mad_multiplier) * robust_sigma)
-        filtered = samples[deviations <= limit]
-        if filtered.size < int(self._config.min_samples_for_control):
-            return samples.astype(float).tolist()
-        return filtered.astype(float).tolist()
+        return [float(value) for value in values if np.isfinite(value) and float(value) > 0.0]
 
     def reset(self) -> None:
+        self._frame_batch_remaining = 0
+        self._last_update_time = None
+        self._period_sample_ends.clear()
+        self._completed_sample_end = None
         self._track_measurement_start.clear()
         self._period_sample_starts.clear()
         self._completed_sample_start = None

@@ -78,6 +78,7 @@ def test_schema_v1_profile_without_capsule_outline_field_is_migrated_in_memory(t
     path = tmp_path / "vision_tuning_parameters.json"
     detector = vars(DetectorConfig()).copy()
     detector.pop("generation_min_capsule_outline_ratio")
+    detector.pop("generation_min_raw_outline_contrast")
     payload = {
         "schema_version": VISION_TUNING_SCHEMA_VERSION,
         "detector": detector,
@@ -92,3 +93,5 @@ def test_schema_v1_profile_without_capsule_outline_field_is_migrated_in_memory(t
         result.detector.generation_min_capsule_outline_ratio
         == DetectorConfig().generation_min_capsule_outline_ratio
     )
+    assert result.detector.generation_min_raw_outline_contrast == 12.0
+    assert json.loads(path.read_text(encoding="utf-8")) == payload

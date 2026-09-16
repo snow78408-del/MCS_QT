@@ -50,6 +50,7 @@ class VisionPipeline:
         self.metrics = MetricsCalculator(config.metrics, logger=self._log)
         self.tracker: BaseTracker = self._build_tracker(config)
         self._frame_index = 0
+        self._last_capture_time: float | None = None
 
     def configure_expected_diameter(self, diameter_um: float, pixel_to_micron: float) -> None:
         self.detector.configure_expected_diameter(diameter_um, pixel_to_micron)
@@ -82,6 +83,7 @@ class VisionPipeline:
         return NearestTracker(config.tracker)
 
     def reset(self) -> None:
+        self._last_capture_time = None
         self.channel_region_detector.reset()
         self.detector.reset_adaptive_size()
         self.tracker.reset()
@@ -89,6 +91,10 @@ class VisionPipeline:
         self._frame_index = 0
 
     def process_frame(self, frame: np.ndarray, *, timestamp: float | None = None) -> VisionResult:
+        if timestamp is not None:
+            if not np.isfinite(timestamp) or (self._last_capture_time is not None and timestamp <= self._last_capture_time):
+                raise ValueError("frame acquisition time must be finite and strictly increasing")
+            self._last_capture_time = timestamp
         self._frame_index += 1
         channel_region = self._update_channel_region(frame)
         roi_frame, roi_offset = self._apply_roi(frame)

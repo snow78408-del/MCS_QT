@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+import json
 
 from backend.orchestrator.feedback_hold import FeedbackHold
 from backend.orchestrator.models import RecognitionSnapshot, SystemConfig
@@ -63,6 +64,7 @@ def make_service(monkeypatch):
         droplet_count=3, active_droplet_count=3, has_droplet=True, control_reason="",
         measurement_window_start=90, measurement_window_end=100,
         measurement_sample_start=90,
+        measurement_sample_end=99,
     )
     service._read_recognition = lambda: rec
     return service, clock, writes, rec
@@ -94,6 +96,7 @@ def test_wait_origin_is_verified_completion_and_holds_do_not_integrate(monkeypat
     rec.frame_id = rec.control_period_id = 4
     rec.measurement_window_start, rec.measurement_window_end = 120, 130
     rec.measurement_sample_start = 120
+    rec.measurement_sample_end = 129
     service.run_control_step()
     assert len(writes) == 2
     assert service._control.basis_command_id == 1
@@ -200,3 +203,68 @@ def test_integration_horizon_does_not_change_derivative_time_base() -> None:
         pump_communication_ok=True, droplet_count=3,
     ))
     assert second.d_term == pytest.approx(.01 * 1 / 100)
+
+
+def test_short_validated_response_does_not_gain_an_extra_fixed_wait(monkeypatch) -> None:
+    service, _, _, _ = make_service(monkeypatch)
+    service._plant_calibration = SimpleNamespace(
+        authorized_for_pi=True, conservative_response_delay_ms=100,
+        response_time_constant_ms=100, response_time_constant_uncertainty_ms=0,
+    )
+    assert service._post_command_wait()[0] == .4
+
+
+@pytest.mark.parametrize("outcome", ["failed", "cancelled", "error", "verified", "rejected"])
+def test_command_attempts_are_identified_even_without_success(monkeypatch, outcome) -> None:
+    service, _, _, rec = make_service(monkeypatch)
+    logs = []
+    service._log = logs.append
+    service._recognition = rec
+    def update(*_):
+        if outcome == "error":
+            raise TimeoutError("serial reply timed out")
+        if outcome == "cancelled":
+            service._stop_event.set()
+        return FlowUpdateResult(ok=outcome != "failed", q1_ok=True, q2_ok=outcome != "failed",
+                                still_running=False, rolled_back=outcome == "failed",
+                                safe_stop_verified=outcome == "failed")
+    service.pump_service.update_flow_while_running = update
+    if outcome == "rejected":
+        service._require_valid_phase_flows = lambda *_: (_ for _ in ()).throw(ValueError("invalid flow"))
+    if outcome in {"error", "rejected"}:
+        with pytest.raises((TimeoutError, ValueError)):
+            service._update_flow_with_lifecycle_guard(50, 20, service._lifecycle_generation)
+    else:
+        service._update_flow_with_lifecycle_guard(50, 20, service._lifecycle_generation)
+    events = [json.loads(line.split("[PUMP][COMMAND] ", 1)[1]) for line in logs if line.startswith("[PUMP][COMMAND]")]
+    assert {event["command_id"] for event in events} == {1}
+    assert events[0]["status"] == "proposed"
+    assert events[0]["sample_end"] == 99
+    assert events[-1]["status"] == outcome
+    assert service._feedback_hold.command_id == (1 if outcome == "verified" else 0)
+    if outcome == "failed":
+        assert next(e for e in events if e["status"] == "transaction_result")["rolled_back"]
+
+
+def test_hold_does_not_advance_derivative_clock(monkeypatch) -> None:
+    service, clock, _, rec = make_service(monkeypatch)
+    service.run_control_step()
+    assert service._last_control_ts == 99
+    clock[0] = rec.capture_monotonic = 110
+    rec.frame_id = rec.control_period_id = 2
+    rec.measurement_sample_end = 109
+    service.run_control_step()
+    assert service._last_control_ts == 99
+
+
+def test_hardware_value_error_is_not_treated_as_pre_dispatch_rejection(monkeypatch):
+    service, _, _, _ = make_service(monkeypatch)
+    logs = []
+    service._log = logs.append
+    def fail(*_):
+        raise ValueError("malformed device reply")
+    service.pump_service.update_flow_while_running = fail
+    with pytest.raises(ValueError, match="device reply"):
+        service.run_control_step()
+    assert any('"status": "error"' in line for line in logs)
+    assert service._feedback_hold.command_id == 0

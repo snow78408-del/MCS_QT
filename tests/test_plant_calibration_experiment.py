@@ -36,7 +36,7 @@ def _config() -> PlantCalibrationExperimentConfig:
         syringe_profile="10ml-glass",
         q1_step=2.0,
         q2_step=1.0,
-        repetitions=2,
+        repetitions=2, maximum_attempts=1, require_mpc_validation=False,
     )
 
 
@@ -215,6 +215,15 @@ def test_full_response_fit_and_independent_validation_authorize_predictive_model
     assert result.record.aqueous_phase == "water"
     assert result.record.flow_measurement_kind == "device_parameter_readback"
     assert result.record.baseline_generation_frequency_hz == 0.0
+    service = OrchestratorService()
+    service._apply_plant_calibration(result.record)
+    assert service.pid_config.target_feedforward_calibrated
+    assert service.pid_config.feedforward_baseline_q1 == result.record.baseline_q1
+    assert service.pid_config.feedforward_baseline_diameter_um == result.record.baseline_diameter_um
+    assert not service.pid_config.feedforward_calibrated
+    service._apply_plant_calibration(None)
+    assert not service.pid_config.target_feedforward_calibrated
+    assert service.pid_config.feedforward_baseline_diameter_um == 0
 
 
 def test_paired_steps_cancel_baseline_drift_that_flips_individual_responses() -> None:
@@ -243,7 +252,7 @@ def test_paired_steps_cancel_baseline_drift_that_flips_individual_responses() ->
 def test_calibration_save_keeps_loadable_record_and_separate_raw_audit() -> None:
     result = build_plant_calibration_result(
         config=_config(),
-        measurements=_measurements(),
+        measurements=_measurements() + [_measurement("validation-plus", "validation", 1, 2.1), _measurement("validation-minus", "validation", -1, -2.1)],
         session_id="session-12345678",
         started_at="2026-08-30T10:00:00+00:00",
         q1_min=15.0,
@@ -263,8 +272,8 @@ def test_calibration_save_keeps_loadable_record_and_separate_raw_audit() -> None
         loaded = load_plant_calibration(saved["path"])
         audit = json.loads(audit_path.read_text(encoding="utf-8"))
         assert loaded.calibration_id == result.record.calibration_id
-        assert saved["measurement_count"] == 12
-        assert len(audit["measurements"]) == 12
+        assert saved["measurement_count"] == 14
+        assert len(audit["measurements"]) == 14
         assert audit["record"]["measurement_source"] == "generation_zone_volume_step_response"
     finally:
         record_path.unlink(missing_ok=True)
@@ -348,6 +357,7 @@ def test_calibration_uses_unique_crossing_droplets_not_repeated_frame_average() 
         has_droplet=True,control_reason="ok",frame_id=18,capture_monotonic=12.0,
         crossed_track_diameters={7:60.0,8:62.0},
         crossed_track_capture_monotonic={7:11.8,8:11.9},
+        crossed_track_sample_starts={7:11.6,8:11.7},
         crossed_track_frame_ids={7:16,8:17},
     )
 
@@ -357,6 +367,8 @@ def test_calibration_uses_unique_crossing_droplets_not_repeated_frame_average() 
     assert [item.diameter_um for item in observations]==[60.0,62.0]
     assert [item.capture_monotonic for item in observations]==[11.8,11.9]
     assert all(item.droplet_count==1 for item in observations)
+    snapshot.crossed_track_sample_starts.clear()
+    assert OrchestratorService._plant_calibration_observations(snapshot) == ()
 
 
 def test_calibration_observation_keeps_the_live_scale_provenance() -> None:
@@ -367,6 +379,7 @@ def test_calibration_observation_keeps_the_live_scale_provenance() -> None:
         has_droplet=True,control_reason="ok",
         frame_id=2,capture_monotonic=2.0,pixel_to_micron=0.69,
         scale_source="channel_430um",crossed_track_diameters={9:61.0},
+        crossed_track_capture_monotonic={9:2.0},crossed_track_sample_starts={9:1.8},
     )
 
     observation=OrchestratorService._plant_calibration_observations(snapshot)[0]
@@ -385,6 +398,8 @@ def test_calibration_stability_uses_droplet_median_drift_not_raw_range() -> None
                 timestamp=float(index),reason="ok",droplet_count=index,active_droplet_count=1,
                 has_droplet=True,control_reason="ok",frame_id=index,capture_monotonic=float(index),
                 crossed_track_diameters={index:value},
+                crossed_track_capture_monotonic={index:float(index)},
+                crossed_track_sample_starts={index:float(index)-.1},
             )
         )[0]
         for index,value in enumerate(values,start=1)
@@ -500,7 +515,9 @@ def test_stable_sub_threshold_tail_is_a_valid_low_response() -> None:
     assert len(tail) == 5
 
 
-def test_orchestrator_runs_calibration_under_exclusive_state_and_stops_pump() -> None:
+@pytest.mark.parametrize("no_response", [False, True, "retry", "validation_retry"])
+def test_orchestrator_runs_calibration_under_exclusive_state_and_stops_pump(no_response, monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("backend.orchestrator.service.ensure_user_subdir", lambda _: tmp_path)
     class PumpStub:
         def __init__(self) -> None:
             self.runtime_config = SimpleNamespace(min_q1_q2_gap=1.0)
@@ -572,21 +589,45 @@ def test_orchestrator_runs_calibration_under_exclusive_state_and_stops_pump() ->
             change = direction * 1.5
         else:
             change = float(kwargs["actuator_step"]) * 3.5
-        return _measurement(
+        if no_response == "validation_retry" and channel == "validation" and kwargs["config"].repetitions == 2:
+            change *= 10
+        measurement = _measurement(
             kwargs["trial_id"],
             channel,
             direction,
             change,
         )
+        if (no_response is True or (no_response == "retry" and kwargs["config"].repetitions == 2)) and channel == "combined":
+            measurement = replace(measurement, response_detected=False, response_classification="below_detection_threshold")
+        return measurement
 
     service._run_plant_calibration_trial = fake_trial
     try:
-        result = service.run_plant_calibration_experiment(_config())
+        if no_response is True:
+            from backend.pid_control.calibration_experiment import CalibrationIdentificationError
+            with pytest.raises(CalibrationIdentificationError, match="本次响应不足"):
+                service.run_plant_calibration_experiment(_config())
+            assert service._state == SystemState.STOPPED
+            assert service.get_snapshot().plant_calibration_experiment["status"] == "insufficient_response"
+            assert "stop" in pump.calls
+            assert not any("validation" in str(entry) for entry in calibration_sequence)
+            archive = json.loads(next(tmp_path.glob("*.measurements.json")).read_text(encoding="utf-8"))
+            assert len(archive["measurements"]) == 12
+            assert not archive["loadable_calibration"]
+            assert not service._plant_calibration_in_progress
+            return
+        result = service.run_plant_calibration_experiment(replace(_config(), maximum_attempts=2) if no_response in {"retry", "validation_retry"} else _config())
 
         assert result.record.diameter_sensitivity_um_per_output == pytest.approx(3.5)
         assert service._state == SystemState.STOPPED
         assert service.get_snapshot().plant_calibration_experiment["status"] == "completed"
-        assert len(calibration_sequence) == 28
+        assert len(calibration_sequence) == (64 if no_response == "retry" else 68 if no_response == "validation_retry" else 28)
+        if no_response in {"retry", "validation_retry"}:
+            assert len(result.attempt_history) == 1
+            assert len(result.attempt_history[0]["measurements"]) == (12 if no_response == "retry" else 14)
+            assert result.config.repetitions == 3
+            assert result.config.minimum_response_wait_s == 45
+            assert result.config.q1_step == _config().q1_step
         assert result.record.validated_for_pi
         for index in range(0, len(calibration_sequence), 2):
             baseline_entry = calibration_sequence[index]

@@ -15,6 +15,25 @@ import numpy as np
 from .calibration import PlantCalibrationRecord
 
 
+class CalibrationIdentificationError(ValueError):
+    """Completed observations do not identify usable dynamics; not a pump fault."""
+
+
+class CalibrationValidationError(CalibrationIdentificationError):
+    """A candidate exists but is not a deployable calibration."""
+
+
+def require_combined_response(measurements: Iterable[PlantCalibrationMeasurement]) -> None:
+    combined = [item for item in measurements if item.channel == "combined"]
+    if not any(item.response_detected for item in combined):
+        changes = "、".join(f"{item.diameter_change_um:+.3f}" for item in combined)
+        raise CalibrationIdentificationError(
+            "本次响应不足，无法完成动力学辨识：组合阶跃均未检测到可信响应起点，"
+            f"不能估计响应延迟。直径变化：{changes or '无组合观测'} μm。"
+            "稳定无响应不等于故障或零增益；请检查观察时长、测量分辨率及工况后重新标定。"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class PlantCalibrationExperimentConfig:
     """Operator-approved settings for a bounded visual step experiment."""
@@ -34,8 +53,8 @@ class PlantCalibrationExperimentConfig:
     # number of valid droplets before a stable response may be classified;
     # an unstable response keeps collecting beyond this count.
     response_observation_limit: int = 30
-    # Kept for schema compatibility. Zero means there is no experiment
-    # duration limit; progress is driven by valid droplet events.
+    # Zero uses the orchestrator's finite observation + instability deadline.
+    # A positive value explicitly bounds the post-transaction response phase.
     maximum_step_duration_s: float = 0.0
     # This is a sensor-liveness safety watchdog, not an experiment deadline.
     vision_liveness_timeout_s: float = 120.0
@@ -61,8 +80,24 @@ class PlantCalibrationExperimentConfig:
     minimum_response_wait_s: float = 30.0
     low_response_wait_s: float = 60.0
     stability_duration_s: float = 3.0
+    baseline_wait_s: float | None = None
+    maximum_attempts: int = 3
+    require_mpc_validation: bool = True
+
+    @property
+    def effective_baseline_wait_s(self) -> float:
+        # Older callers used the response horizon for both phases.
+        return self.minimum_response_wait_s if self.baseline_wait_s is None else self.baseline_wait_s
 
     def __post_init__(self) -> None:
+        if isinstance(self.maximum_attempts, bool) or not isinstance(self.maximum_attempts, int) or not 1 <= self.maximum_attempts <= 5:
+            raise ValueError("maximum_attempts must be an integer in [1, 5]")
+        if not isinstance(self.require_mpc_validation, bool):
+            raise ValueError("require_mpc_validation must be boolean")
+        if self.baseline_wait_s is not None and (
+            not math.isfinite(float(self.baseline_wait_s)) or self.baseline_wait_s < 0.0
+        ):
+            raise ValueError("baseline_wait_s must be finite and nonnegative")
         for name in (
             "plant_id",
             "chip_id",
@@ -148,6 +183,7 @@ class PlantCalibrationObservation:
     volume_correction_factor: float = 1.0
     generation_frequency_hz: float = 0.0
     diameter_cv: float = 0.0
+    sample_start_monotonic: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -204,6 +240,31 @@ class PlantCalibrationExperimentResult:
     started_at: str
     completed_at: str
     session_id: str
+    attempt_history: tuple[dict[str, Any], ...] = ()
+
+    @property
+    def accepted(self) -> bool:
+        return bool(self.record.validated_for_pi
+                    and self.record.validation_sample_count > 0
+                    and self.record.validation_mae_um <= self.config.validation_mae_limit_um
+                    and self.record.validation_nrmse <= self.config.validation_nrmse_limit and (
+            self.record.validated_for_mpc or not self.config.require_mpc_validation
+        ))
+
+    def require_accepted(self) -> None:
+        PlantCalibrationRecord.from_mapping(self.record.to_dict())
+        if not self.accepted:
+            raise CalibrationValidationError(
+                f"标定尚未成功：PI {'通过' if self.record.validated_for_pi else '未通过'}，"
+                f"MPC {'通过' if self.record.validated_for_mpc else '未通过'}；"
+                f"验证 MAE={self.record.validation_mae_um:.3f}/{self.config.validation_mae_limit_um:g} μm，"
+                f"NRMSE={self.record.validation_nrmse:.3f}/{self.config.validation_nrmse_limit:g}。"
+                "只能保留诊断数据，不能导出或应用正式标定。"
+            )
+
+    @property
+    def diagnostics(self) -> dict[str, Any]:
+        return calibration_diagnostics(self.measurements, self.record)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -215,6 +276,8 @@ class PlantCalibrationExperimentResult:
             "started_at": self.started_at,
             "completed_at": self.completed_at,
             "session_id": self.session_id,
+            "diagnostics": self.diagnostics,
+            "attempt_history": list(self.attempt_history),
         }
 
 
@@ -252,6 +315,7 @@ def _fit_fopdt(measurements: Iterable[PlantCalibrationMeasurement]) -> _FOPDTFit
     absolute-error grid search. This avoids deriving dynamics from a single
     threshold-crossing droplet.
     """
+    measurements = tuple(measurements)
     trials = [
         item
         for item in measurements
@@ -274,9 +338,11 @@ def _fit_fopdt(measurements: Iterable[PlantCalibrationMeasurement]) -> _FOPDTFit
         )
 
     points: list[tuple[float, float, float, float]] = []
+    trial_slices: list[slice] = []
     positive_gaps_ms: list[float] = []
     trial_tau_estimates: list[float] = []
     for item in trials:
+        trial_start = len(points)
         ordered = sorted(item.response_observations, key=lambda obs: obs.capture_monotonic)
         previous_time: float | None = None
         for observation in ordered:
@@ -296,6 +362,7 @@ def _fit_fopdt(measurements: Iterable[PlantCalibrationMeasurement]) -> _FOPDTFit
             if previous_time is not None and elapsed_ms > previous_time:
                 positive_gaps_ms.append(elapsed_ms - previous_time)
             previous_time = elapsed_ms
+        trial_slices.append(slice(trial_start, len(points)))
         target = float(item.baseline_diameter_um) + 0.6321205588 * float(item.diameter_change_um)
         direction = 1.0 if item.diameter_change_um >= 0.0 else -1.0
         reached = next(
@@ -340,8 +407,9 @@ def _fit_fopdt(measurements: Iterable[PlantCalibrationMeasurement]) -> _FOPDTFit
             response_fraction = 1.0 - np.exp(-active_time / float(time_constant))
             predicted = baselines + amplitudes * response_fraction
             normalized = np.abs(predicted - observed) / scales
-            # Median loss is insensitive to occasional segmentation outliers.
-            loss = float(np.median(normalized))
+            # Robust within a trial, equal weight across trials. A densely
+            # sampled long curve must not drown out a shorter contrary trial.
+            loss = float(np.mean([np.median(normalized[part]) for part in trial_slices]))
             if loss < best_loss:
                 best_loss = loss
                 best_delay = float(delay)
@@ -405,6 +473,66 @@ def _validation_metrics(
     )
 
 
+def calibration_diagnostics(
+    measurements: Iterable[PlantCalibrationMeasurement],
+    record: PlantCalibrationRecord | None = None,
+) -> dict[str, Any]:
+    """Audit every trial; never filter held-out data according to fit residuals."""
+    items = tuple(measurements)
+    channels: dict[str, Any] = {}
+    for channel in ("q1", "q2", "combined", "validation"):
+        selected = [item for item in items if item.channel == channel]
+        baselines = [item.baseline_diameter_um for item in selected]
+        channels[channel] = {
+            "trial_count": len(selected),
+            "detected_count": sum(item.response_detected for item in selected),
+            "baseline_span_um": max(baselines) - min(baselines) if baselines else None,
+            "repeated_direction_changes_um": {
+                str(direction): [item.diameter_change_um for item in selected if item.direction == direction]
+                for direction in (1, -1)
+            },
+        }
+    trials = []
+    for item in items:
+        entry: dict[str, Any] = {
+            "trial_id": item.trial_id, "channel": item.channel,
+            "response_classification": item.response_classification,
+            "baseline_diameter_um": item.baseline_diameter_um,
+            "observed_change_um": item.diameter_change_um,
+            "response_delay_ms": item.response_delay_ms if item.response_detected else None,
+            "observation_duration_s": item.response_stable_monotonic - item.command_started_monotonic,
+        }
+        if item.channel == "validation" and record is not None:
+            mae, nrmse, count = _validation_metrics(
+                [item], delay_ms=record.response_delay_median_ms,
+                time_constant_ms=record.response_time_constant_ms,
+                steady_gain_um_per_output=record.diameter_sensitivity_um_per_output,
+            )
+            entry.update(predicted_change_um=record.diameter_sensitivity_um_per_output * float(item.actuator_step or 0),
+                         mae_um=mae, nrmse=nrmse, sample_count=count)
+        trials.append(entry)
+    return {"channels": channels, "trials": trials,
+            "note": "未响应不等于零增益；基线跨度是跨轮变化，不能单独判定气泡或测量错误。NRMSE按预测响应幅度归一化。"}
+
+
+def save_failed_calibration(
+    path: str | Path, *, config: PlantCalibrationExperimentConfig,
+    measurements: Iterable[PlantCalibrationMeasurement], reason: str,
+    session_id: str, started_at: str, partial_trial: dict[str, Any] | None = None,
+    attempt_history: Iterable[dict[str, Any]] = (),
+) -> str:
+    items = tuple(measurements)
+    _write_json_atomic(Path(path), {
+        "status": "incomplete", "loadable_calibration": False,
+        "reason": reason, "session_id": session_id, "started_at": started_at,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "config": config.to_dict(), "measurements": [item.to_dict() for item in items],
+        "partial_trial": partial_trial, "diagnostics": calibration_diagnostics(items),
+        "attempt_history": list(attempt_history),
+    })
+    return str(Path(path).resolve())
+
+
 def _direction_consistency(values: list[float], expected_sign: float) -> float:
     if not values:
         return 0.0
@@ -424,7 +552,7 @@ def _paired_central_sensitivities(
     *,
     input_value: Callable[[PlantCalibrationMeasurement], float],
 ) -> list[float]:
-    """Cancel baseline drift by comparing the +/- trials of each repetition."""
+    """Compare local changes, so between-trial baseline shifts are not gain."""
     items = list(measurements)
     positive = [item for item in items if int(item.direction) > 0]
     negative = [item for item in items if int(item.direction) < 0]
@@ -433,7 +561,7 @@ def _paired_central_sensitivities(
         input_span = float(input_value(plus)) - float(input_value(minus))
         if abs(input_span) <= 1e-9:
             continue
-        output_span = float(plus.steady_diameter_um) - float(minus.steady_diameter_um)
+        output_span = float(plus.diameter_change_um) - float(minus.diameter_change_um)
         values.append(output_span / input_span)
     return values
 
@@ -457,8 +585,8 @@ def identify_channel_sensitivities(
     q1_items = [item for item in items if item.channel == "q1"]
     q2_items = [item for item in items if item.channel == "q2"]
     paired = {
-        "q1": _paired_central_sensitivities(q1_items, input_value=lambda item: item.actual_q1),
-        "q2": _paired_central_sensitivities(q2_items, input_value=lambda item: item.actual_q2),
+        "q1": _paired_central_sensitivities(q1_items, input_value=lambda item: item.actual_q1 - item.baseline_q1),
+        "q2": _paired_central_sensitivities(q2_items, input_value=lambda item: item.actual_q2 - item.baseline_q2),
     }
     channel_items = {"q1": q1_items, "q2": q2_items}
     sensitivities: dict[str, list[float]] = {}
@@ -470,17 +598,19 @@ def identify_channel_sensitivities(
         # observation.  It must not be turned into an actuator direction by
         # taking the sign of sub-resolution noise.
         if not any(item.response_detected for item in channel_items[name]):
+            # Zero disables allocation for this record; it is not evidence of
+            # zero physical gain. Preserve every low-response measurement.
             identified[name] = 0.0
         else:
             identified[name] = _finite_median(values, name=f"{name.upper()} sensitivity")
     q1 = identified["q1"]
     q2 = identified["q2"]
     if abs(q1) > 1e-9 and _direction_consistency(sensitivities["q1"], q1) < 0.75:
-        raise ValueError("Q1 step responses do not have a consistent direction")
+        raise CalibrationIdentificationError("Q1 step responses do not have a consistent direction")
     if abs(q2) > 1e-9 and _direction_consistency(sensitivities["q2"], q2) < 0.75:
-        raise ValueError("Q2 step responses do not have a consistent direction")
+        raise CalibrationIdentificationError("Q2 step responses do not have a consistent direction")
     if abs(q1) <= 1e-9 and abs(q2) <= 1e-9:
-        raise ValueError("Q1 and Q2 responses are both below the visual detection threshold")
+        raise CalibrationIdentificationError("本次 Q1、Q2 均未辨识出有效响应；保留低响应观测，不能据此计算控制方向和增益")
     return q1, q2
 
 
@@ -501,11 +631,14 @@ def identify_channel_log_sensitivities(
             q_minus = minus.actual_q1 if channel == "q1" else minus.actual_q2
             if min(q_plus, q_minus, plus.steady_diameter_um, minus.steady_diameter_um) <= 0.0:
                 raise ValueError(f"{channel.upper()} log-sensitivity inputs must be positive")
-            input_span = math.log(float(q_plus) / float(q_minus))
+            base_plus = plus.baseline_q1 if channel == "q1" else plus.baseline_q2
+            base_minus = minus.baseline_q1 if channel == "q1" else minus.baseline_q2
+            input_span = math.log(float(q_plus) / float(base_plus)) - math.log(float(q_minus) / float(base_minus))
             if abs(input_span) <= 1e-12:
                 raise ValueError(f"{channel.upper()} calibration has zero log-flow span")
             values.append(
-                math.log(float(plus.steady_diameter_um) / float(minus.steady_diameter_um))
+                (math.log(float(plus.steady_diameter_um) / float(plus.baseline_diameter_um))
+                 - math.log(float(minus.steady_diameter_um) / float(minus.baseline_diameter_um)))
                 / input_span
             )
         all_values[channel] = values
@@ -517,7 +650,7 @@ def identify_channel_log_sensitivities(
             abs(identified[channel]) > 1e-12
             and _direction_consistency(values, identified[channel]) < 0.75
         ):
-            raise ValueError(f"{channel.upper()} log step responses do not have a consistent direction")
+            raise CalibrationIdentificationError(f"{channel.upper()} log step responses do not have a consistent direction")
     if abs(identified["q1"]) <= 1e-12 and abs(identified["q2"]) <= 1e-12:
         raise ValueError("Q1 and Q2 log responses are both below the visual detection threshold")
     return identified["q1"], identified["q2"]
@@ -534,10 +667,13 @@ def _channel_log_sensitivity_uncertainty(
     for plus, minus in zip(positives, negatives):
         q_plus = plus.actual_q1 if channel == "q1" else plus.actual_q2
         q_minus = minus.actual_q1 if channel == "q1" else minus.actual_q2
-        input_span = math.log(float(q_plus) / float(q_minus))
+        base_plus = plus.baseline_q1 if channel == "q1" else plus.baseline_q2
+        base_minus = minus.baseline_q1 if channel == "q1" else minus.baseline_q2
+        input_span = math.log(float(q_plus) / float(base_plus)) - math.log(float(q_minus) / float(base_minus))
         if abs(input_span) > 1e-12:
             values.append(
-                math.log(float(plus.steady_diameter_um) / float(minus.steady_diameter_um))
+                (math.log(float(plus.steady_diameter_um) / float(plus.baseline_diameter_um))
+                 - math.log(float(minus.steady_diameter_um) / float(minus.baseline_diameter_um)))
                 / input_span
             )
     return _robust_uncertainty(values)
@@ -588,6 +724,8 @@ def build_plant_calibration_result(
     min_q1_q2_gap: float,
 ) -> PlantCalibrationExperimentResult:
     items = tuple(measurements)
+    model_items = tuple(item for item in items if item.channel != "validation")
+    require_combined_response(model_items)
     q1_sensitivity, q2_sensitivity = identify_channel_sensitivities(items)
     q1_log_sensitivity, q2_log_sensitivity = identify_channel_log_sensitivities(items)
     combined = [item for item in items if item.channel == "combined"]
@@ -611,13 +749,13 @@ def build_plant_calibration_result(
         name="combined actuator sensitivity",
     )
     if plant_sensitivity <= 1e-9:
-        raise ValueError("combined actuator direction is inconsistent with the identified pump signs")
+        raise CalibrationIdentificationError("combined actuator direction is inconsistent with the identified pump signs")
     if _direction_consistency(combined_sensitivities, plant_sensitivity) < 0.75:
-        raise ValueError("combined step responses do not have a consistent direction")
+        raise CalibrationIdentificationError("combined step responses do not have a consistent direction")
 
     delays = [float(item.response_delay_ms) for item in combined if item.response_detected]
     if not delays:
-        raise ValueError("combined calibration produced no detectable response onset for delay identification")
+        require_combined_response(items)
     onset_delay_median = _finite_median(delays, name="response delay")
     fopdt_fit = _fit_fopdt(items)
     delay_median = max(1.0, (
@@ -632,10 +770,10 @@ def build_plant_calibration_result(
         abs(delay_median - onset_delay_median),
         0.0,
     )
-    baseline_q1 = _finite_median((item.baseline_q1 for item in items), name="baseline Q1")
-    baseline_q2 = _finite_median((item.baseline_q2 for item in items), name="baseline Q2")
+    baseline_q1 = _finite_median((item.baseline_q1 for item in model_items), name="baseline Q1")
+    baseline_q2 = _finite_median((item.baseline_q2 for item in model_items), name="baseline Q2")
     baseline_diameter = _finite_median(
-        (item.baseline_diameter_um for item in items), name="baseline diameter"
+        (item.baseline_diameter_um for item in model_items), name="baseline diameter"
     )
     allocation_denominator = (
         q1_log_sensitivity * q1_log_sensitivity
@@ -655,8 +793,8 @@ def build_plant_calibration_result(
         4.0 * (closed_loop_ms + delay_median),
     )
     controller_ki = controller_kp / max(0.001, integral_time_ms / 1000.0)
-    observed_q1 = [value for item in items for value in (item.baseline_q1, item.actual_q1)]
-    observed_q2 = [value for item in items for value in (item.baseline_q2, item.actual_q2)]
+    observed_q1 = [value for item in model_items for value in (item.baseline_q1, item.actual_q1)]
+    observed_q2 = [value for item in model_items for value in (item.baseline_q2, item.actual_q2)]
     identified_q1_min = max(float(q1_min), min(observed_q1))
     identified_q1_max = min(float(q1_max), max(observed_q1))
     identified_q2_min = max(float(q2_min), min(observed_q2))
@@ -665,7 +803,7 @@ def build_plant_calibration_result(
         float(total_flow_max),
         max(
             float(item.actual_q1) + float(item.actual_q2)
-            for item in items
+            for item in model_items
         ),
     )
     validation_mae, validation_nrmse, validation_sample_count = _validation_metrics(
@@ -697,7 +835,7 @@ def build_plant_calibration_result(
     ]
     baseline_observations = [
         observation
-        for item in items
+        for item in model_items
         for observation in item.baseline_observations
     ]
     baseline_frequency_values = [
@@ -821,17 +959,30 @@ def save_plant_calibration_result(
     result: PlantCalibrationExperimentResult,
     calibration_path: str | Path,
 ) -> dict[str, Any]:
+    result.require_accepted()
     path = Path(calibration_path).expanduser()
     if not path.suffix:
         path = path.with_suffix(".json")
     audit_path = path.with_name(f"{path.stem}.measurements.json")
+    training_path = path.with_name(f"{path.stem}.mpc-training.json")
     # Publish the loadable record last. If the audit write fails, callers never
     # see a calibration file that has lost its supporting measurements.
     _write_json_atomic(audit_path, result.to_dict())
+    if result.record.validated_for_mpc:
+        _write_json_atomic(training_path, {
+            "schema_version": 1, "calibration_id": result.record.calibration_id,
+            "purpose": "MPC model training and held-out validation; not controller deployment authorization",
+            "units": {"flow": "uL/min", "diameter": "um", "time": "host monotonic seconds"},
+            "flow_measurement_kind": result.record.flow_measurement_kind,
+            "record": result.record.to_dict(), "experiment_config": result.config.to_dict(),
+            "training_trials": [item.to_dict() for item in result.measurements if item.channel != "validation"],
+            "validation_trials": [item.to_dict() for item in result.measurements if item.channel == "validation"],
+        })
     _write_json_atomic(path, result.record.to_dict())
     return {
         "path": str(path.resolve()),
         "measurements_path": str(audit_path.resolve()),
         "record": result.record.to_dict(),
         "measurement_count": len(result.measurements),
+        "mpc_training_path": str(training_path.resolve()) if result.record.validated_for_mpc else None,
     }

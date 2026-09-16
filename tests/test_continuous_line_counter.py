@@ -44,6 +44,19 @@ def test_constant_background_warmup_and_history_expiry_are_invalid() -> None:
     assert not counter.window(.28, .4).valid
 
 
+def test_low_contrast_texture_does_not_self_calibrate_as_droplet_phases() -> None:
+    counter = ContinuousLineCounter(warmup_frames=8)
+    for i in range(100):
+        counter.observe_score(8 if i % 4 in (1, 2) else 2, i, i * .01)
+    assert not counter.passage_times()
+    assert not counter.window(.5, .9).valid
+    # A later visible phase sequence can calibrate without a restart or delay.
+    for i in range(100, 140):
+        counter.observe_score(30 if i % 4 in (1, 2) else 2, i, i * .01)
+    assert counter.passage_times()
+    assert counter.window(1.2, 1.35).valid
+
+
 def test_reset_and_time_reversal_discard_old_events() -> None:
     counter = calibrated_counter()
     counter.observe_score(30, 9, .09)
