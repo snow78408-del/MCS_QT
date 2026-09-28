@@ -1682,7 +1682,7 @@ class OrchestratorService:
         if not getattr(system_config, "pump_baudrate", None):
             system_config.pump_baudrate = 1200
         if not getattr(system_config, "pump_parity", ""):
-            system_config.pump_parity = "N"
+            system_config.pump_parity = "E"
 
         self._apply_plant_calibration(plant_calibration)
         self.pid_config.target_feedforward_enabled = system_config.target_feedforward_enabled
@@ -1967,9 +1967,9 @@ class OrchestratorService:
         serial_cfg.port = str(cfg.pump_port).strip()
         serial_cfg.address = int(cfg.pump_address)
         serial_cfg.baudrate = int(cfg.pump_baudrate)
-        serial_cfg.parity = str(cfg.pump_parity or "N").strip().upper()
+        serial_cfg.parity = str(cfg.pump_parity or "E").strip().upper()
         if serial_cfg.parity not in {"E", "N"}:
-            serial_cfg.parity = "N"
+            serial_cfg.parity = "E"
 
     def _require_valid_phase_flows(self, q1: float, q2: float) -> None:
         q1_f = float(q1)
@@ -2013,7 +2013,7 @@ class OrchestratorService:
         serial_cfg.port = str(port or "").strip().upper()
         serial_cfg.address = int(address)
         serial_cfg.baudrate = int(baudrate)
-        serial_cfg.parity = str(parity or "N").strip().upper()
+        serial_cfg.parity = str(parity or "E").strip().upper()
         if not serial_cfg.port:
             raise ValueError("泵串口号不能为空")
         if serial_cfg.parity not in {"E", "N"}:
@@ -2035,9 +2035,17 @@ class OrchestratorService:
             self.pump_service.disconnect()
             state = self.pump_service.connect_and_probe()
             connected = bool(state.comm_established)
+            connected_parity = str(
+                getattr(getattr(self.pump_service, "client", None), "connected_parity", serial_cfg.parity)
+            )
             record("连接与通信探测", connected, str(state.failed or "通信正常"))
             if not connected:
-                return {"ok": False, "steps": steps}
+                return {
+                    "ok": False,
+                    "recognized_as_pump": False,
+                    "connected_parity": connected_parity,
+                    "steps": steps,
+                }
 
             write_result = self._apply_init_flow_rates(float(q1), float(q2))
             write_ok = bool(write_result and write_result.ok)
@@ -2046,7 +2054,12 @@ class OrchestratorService:
             )
             record("下发泵机参数", write_ok, write_detail)
             if not write_ok:
-                return {"ok": False, "steps": steps}
+                return {
+                    "ok": False,
+                    "recognized_as_pump": True,
+                    "connected_parity": connected_parity,
+                    "steps": steps,
+                }
 
             # A connected start command can have taken effect even when its
             # verification reply is lost. Always protectively stop it unless
@@ -2060,7 +2073,12 @@ class OrchestratorService:
                 "CH1/CH2 已启动并确认" if infusion_started else (start_result.reason or start_result.error),
             )
             if not infusion_started:
-                return {"ok": False, "steps": steps}
+                return {
+                    "ok": False,
+                    "recognized_as_pump": True,
+                    "connected_parity": connected_parity,
+                    "steps": steps,
+                }
 
             stop_result = self.pump_service.stop_system_and_verify()
             stop_ok = bool(stop_result.ok)
@@ -2071,7 +2089,12 @@ class OrchestratorService:
                 stop_ok,
                 "灌注已停止并确认" if stop_ok else (stop_result.reason or stop_result.error),
             )
-            return {"ok": bool(stop_ok), "steps": steps}
+            return {
+                "ok": bool(stop_ok),
+                "recognized_as_pump": True,
+                "connected_parity": connected_parity,
+                "steps": steps,
+            }
         finally:
             if start_attempted and not stop_verified:
                 try:

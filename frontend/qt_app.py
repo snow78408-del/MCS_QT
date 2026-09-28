@@ -1297,7 +1297,7 @@ class PumpPage(Page):
         self.ports=QComboBox(); form.addRow("发现的串口",self.ports)
         scan=QPushButton("扫描串口设备"); set_button_role(scan,"secondary"); scan.clicked.connect(self.scan_ports); form.addRow("",scan)
         self.address=self.number_field(form,"泵地址",cfg.get("pump_address",1),1,31,integer=True); self.baud=self.number_field(form,"波特率",cfg.get("pump_baudrate",1200),1,2000000,integer=True,suffix="baud")
-        self.parity=QComboBox(); self.parity.addItems(["N","E"]); self.parity.setCurrentText(str(cfg.get("pump_parity","N"))); form.addRow("校验位",self.parity)
+        self.parity=QComboBox(); self.parity.addItems(["E","N"]); self.parity.setCurrentText(str(cfg.get("pump_parity","E"))); form.addRow("校验位",self.parity)
         self.q1=self.number_field(form,"写入 Q1",cfg.get("initial_q1",50),DEFAULT_BO_Q1_RANGE[0],DEFAULT_BO_Q1_RANGE[1],decimals=2,suffix="μL/min"); self.q2=self.number_field(form,"写入 Q2",cfg.get("initial_q2",20),DEFAULT_BO_Q2_RANGE[0],DEFAULT_BO_Q2_RANGE[1],decimals=2,suffix="μL/min")
         actions=QWidget(); row=QHBoxLayout(actions); row.setContentsMargins(0,0,0,0)
         read=QPushButton("连接并读取全部数据"); set_button_role(read,"secondary"); read.clicked.connect(self.read_pump); write=QPushButton("写入 Q1/Q2 并回读校验"); set_button_role(write,"warning"); write.clicked.connect(self.write_pump); row.addWidget(read); row.addWidget(write); form.addRow("",actions)
@@ -1371,7 +1371,7 @@ class PumpPage(Page):
         if action=="写入":self.app.device_verification["pump_write"]=bool(recognized and (result or {}).get("ok",False))
         elif not recognized:self.app.device_verification["pump_write"]=False
         self.result.setPlainText(f"{action}完成；泵机协议识别: {'成功' if recognized else '失败'}\n"+json.dumps(result,ensure_ascii=False,indent=2,default=str))
-        if recognized: self.app.save(pump_port=values["port"],pump_address=values["address"],pump_baudrate=values["baudrate"],pump_parity=values["parity"],initial_q1=values["q1"],initial_q2=values["q2"])
+        if recognized: self.app.save(pump_port=values["port"],pump_address=values["address"],pump_baudrate=values["baudrate"],pump_parity=str((result or {}).get("connected_parity") or values["parity"]),initial_q1=values["q1"],initial_q2=values["q2"])
         else: self.app.error("未识别到泵机","串口可以打开，但设备没有返回有效泵协议数据。请检查地址、波特率和线缆。")
 
 
@@ -1419,7 +1419,7 @@ class InitPage(Page):
         else:self.roi_card.set_status("warning","仅保存配置",f"{roi_state} · 闭环前需要版本化标定")
         port=str(cfg.get("pump_port","") or "").strip().upper()
         pump_verified=bool(verification.get("pump",False))
-        if port and pump_verified:self.pump_card.set_status("ok","本次已验证",f"{port} · 地址 {int(cfg.get('pump_address',1))} · {int(cfg.get('pump_baudrate',1200))} baud · {cfg.get('pump_parity','N')}")
+        if port and pump_verified:self.pump_card.set_status("ok","本次已验证",f"{port} · 地址 {int(cfg.get('pump_address',1))} · {int(cfg.get('pump_baudrate',1200))} baud · {cfg.get('pump_parity','E')}")
         elif port:self.pump_card.set_status("warning","仅保存配置",f"{port} 尚未在本次启动中完成泵协议读取与回读校验")
         elif is_file:self.pump_card.set_status("idle","本地模式","本地视频预览允许不连接泵机")
         else:self.pump_card.set_status("error","未验证","请返回泵机页面完成协议识别与回读校验")
@@ -1453,7 +1453,7 @@ class InitPage(Page):
             elif not verification.get("camera",False): raise ValueError("相机尚未在本次启动中成功测试取帧")
             if cfg.get("video_source_type")!="file" and (not port or not verification.get("pump",False)): raise ValueError("泵机尚未在本次启动中完成协议识别与回读校验")
         except ValueError as exc: return self.app.error("初始化参数错误",str(exc))
-        self.app.save(initial_q1=q1,initial_q2=q2,pump_port=port,pump_address=address,pump_baudrate=baud,pump_parity=str(cfg.get("pump_parity","N")))
+        self.app.save(initial_q1=q1,initial_q2=q2,pump_port=port,pump_address=address,pump_baudrate=baud,pump_parity=str(cfg.get("pump_parity","E")))
         self.status.setText("初始化中…"); self.app.task(self.app.configure_prepare_initialize,self.done,self.failed,self.button)
 
     def done(self,_=None): self.status.setText("初始化完成"); self.app.show_page("monitor")
@@ -2546,7 +2546,7 @@ class FrontendApp(QMainWindow):
     def build_system_config(self):
         cfg=self.frontend_config; required=("target_diameter","pixel_to_micron","video_source_type","video_source","initial_q1","initial_q2","control_interval_ms"); missing=[k for k in required if k not in cfg]
         if missing: raise ValueError(f"缺少配置字段: {', '.join(missing)}")
-        return SystemConfig(target_diameter=float(cfg["target_diameter"]),pixel_to_micron=float(cfg["pixel_to_micron"]),video_source_type=str(cfg["video_source_type"]),video_source=str(cfg["video_source"]),initial_q1=float(cfg["initial_q1"]),initial_q2=float(cfg["initial_q2"]),control_interval_ms=int(cfg["control_interval_ms"]),target_feedforward_enabled=bool(cfg.get("target_feedforward_enabled",False)),disturbance_feedforward_enabled=bool(cfg.get("disturbance_feedforward_enabled",False)),control_batch_enabled=bool(cfg.get("control_batch_enabled",False)),control_capture_frames=int(cfg.get("control_capture_frames",5)),control_analysis_frames=int(cfg.get("control_analysis_frames",5)),pump_port=str(cfg.get("pump_port","")),pump_address=int(cfg.get("pump_address",1)),pump_baudrate=int(cfg.get("pump_baudrate",1200)),pump_parity=str(cfg.get("pump_parity","N")),mvs_sdk_path=str(cfg.get("mvs_sdk_path","")),camera_backend=str(cfg.get("camera_backend","")),camera_parameters=dict(cfg.get("camera_parameters",{}) or {}),recognition_roi=dict(cfg.get("recognition_roi",{}) or {}),calibration=dict(cfg.get("calibration",{}) or {}),plant_calibration=dict(cfg.get("plant_calibration",{}) or {}))
+        return SystemConfig(target_diameter=float(cfg["target_diameter"]),pixel_to_micron=float(cfg["pixel_to_micron"]),video_source_type=str(cfg["video_source_type"]),video_source=str(cfg["video_source"]),initial_q1=float(cfg["initial_q1"]),initial_q2=float(cfg["initial_q2"]),control_interval_ms=int(cfg["control_interval_ms"]),target_feedforward_enabled=bool(cfg.get("target_feedforward_enabled",False)),disturbance_feedforward_enabled=bool(cfg.get("disturbance_feedforward_enabled",False)),control_batch_enabled=bool(cfg.get("control_batch_enabled",False)),control_capture_frames=int(cfg.get("control_capture_frames",5)),control_analysis_frames=int(cfg.get("control_analysis_frames",5)),pump_port=str(cfg.get("pump_port","")),pump_address=int(cfg.get("pump_address",1)),pump_baudrate=int(cfg.get("pump_baudrate",1200)),pump_parity=str(cfg.get("pump_parity","E")),mvs_sdk_path=str(cfg.get("mvs_sdk_path","")),camera_backend=str(cfg.get("camera_backend","")),camera_parameters=dict(cfg.get("camera_parameters",{}) or {}),recognition_roi=dict(cfg.get("recognition_roi",{}) or {}),calibration=dict(cfg.get("calibration",{}) or {}),plant_calibration=dict(cfg.get("plant_calibration",{}) or {}))
     def configure_prepare_initialize(self):
         cfg=self.build_system_config(); self.orchestrator.configure(cfg); self.orchestrator.prepare_video(); self.orchestrator.initialize_system()
     def task(self,task,on_success=None,on_error=None,disable=None):

@@ -56,6 +56,35 @@ def test_legacy_settings_migrate_and_backup_recovers(tmp_path) -> None:
     assert store.load() == {"target_diameter": 60.0}
 
 
+def test_saved_serial_settings_migrate_to_current_ts_pump_protocol(tmp_path) -> None:
+    path = tmp_path / "settings.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "settings": {
+                    "pump_port": "COM3",
+                    "pump_address": 1,
+                    "pump_baudrate": 9600,
+                    "pump_parity": "N",
+                    "initial_q1": 50.0,
+                    "initial_q2": 20.0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    settings = FrontendSettingsStore(path).load()
+
+    assert settings["pump_port"] == "COM3"
+    assert settings["pump_address"] == 1
+    assert settings["pump_baudrate"] == 1200
+    assert settings["pump_parity"] == "E"
+    assert settings["initial_q1"] == 50.0
+    assert settings["initial_q2"] == 20.0
+
+
 def test_old_observation_width_is_preserved_as_history_not_current_geometry(tmp_path) -> None:
     path = tmp_path / "settings.json"
     path.write_text(

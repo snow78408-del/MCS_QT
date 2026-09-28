@@ -11,7 +11,7 @@ class PumpTestPage(ttk.Frame):
         self.port_var = tk.StringVar(value="")
         self.address_var = tk.StringVar(value="1")
         self.baud_var = tk.StringVar(value="1200")
-        self.parity_var = tk.StringVar(value="N")
+        self.parity_var = tk.StringVar(value="E")
         self.q1_var = tk.StringVar(value="50")
         self.q2_var = tk.StringVar(value="20")
         self.status_var = tk.StringVar(value="等待测试")
@@ -65,7 +65,7 @@ class PumpTestPage(ttk.Frame):
         self.port_var.set(configured_port)
         self.address_var.set(str(cfg.get("pump_address", self.address_var.get()) or "1"))
         self.baud_var.set(str(cfg.get("pump_baudrate", self.baud_var.get()) or "1200"))
-        self.parity_var.set(str(cfg.get("pump_parity", self.parity_var.get()) or "N").upper())
+        self.parity_var.set(str(cfg.get("pump_parity", self.parity_var.get()) or "E").upper())
         self.q1_var.set(str(cfg.get("initial_q1", self.q1_var.get()) or "50"))
         self.q2_var.set(str(cfg.get("initial_q2", self.q2_var.get()) or "20"))
 

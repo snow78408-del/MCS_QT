@@ -68,7 +68,8 @@ class PumpHardwareService:
     _DEFAULT_REPEAT_COUNT = 10
     _DEFAULT_INTERVAL_VALUE = 50
     _MIN_INFUSE_TIME_VALUE = 10
-    _MAX_PARAM_VALUE = 65535
+    # TS 规约中除分配次数外的两字节参数范围是 1..9999。
+    _MAX_PARAM_VALUE = 9999
 
     def __init__(
         self,
@@ -292,11 +293,10 @@ class PumpHardwareService:
         )
 
     def connect_and_probe(self) -> PumpConnectionState:
-        preferred = str(self.serial_config.parity or "N").strip().upper()
-        candidates: list[str] = []
-        for parity in (preferred, "E", "N"):
-            if parity in {"E", "N"} and parity not in candidates:
-                candidates.append(parity)
+        preferred = str(self.serial_config.parity or "E").strip().upper()
+        candidates = [preferred]
+        if self.serial_config.allow_parity_fallback_n and preferred != "N":
+            candidates.append("N")
 
         best_state = PumpConnectionState(serial_connected=False, comm_established=False, fully_ready=False)
         for parity in candidates:
@@ -467,24 +467,15 @@ class PumpHardwareService:
             return self._fail(f"WSS 写入后 RSS 回读失败: {rd.error}")
 
         got: SystemSetup = rd.parsed_reply
-        def _effective_enable(s: SystemSetup) -> int:
-            return (int(s.enable_mask) | int(s.copy_mask)) & 0x0F
-
         mismatch = []
-        if bin(int(setup.enable_mask) & 0x0F).count("1") >= 2:
-            # 多通道设备上，RSS 有时把位分散在 enable/copy 中返回。
-            exp = int(setup.enable_mask) & 0x0F
-            got_eff = _effective_enable(got)
-            if got_eff != exp:
-                mismatch.append(
-                    f"enable_mask expect=0x{exp:02X}, got_enable=0x{int(got.enable_mask) & 0x0F:02X}, "
-                    f"got_copy=0x{int(got.copy_mask) & 0x0F:02X}, effective=0x{got_eff:02X}"
-                )
-        else:
-            if got.enable_mask != setup.enable_mask:
-                mismatch.append(f"enable_mask expect=0x{setup.enable_mask:02X}, got=0x{got.enable_mask:02X}")
-            if got.copy_mask != setup.copy_mask:
-                mismatch.append(f"copy_mask expect=0x{setup.copy_mask:02X}, got=0x{got.copy_mask:02X}")
+        if got.enable_mask != setup.enable_mask:
+            mismatch.append(
+                f"enable_mask expect=0x{setup.enable_mask:02X}, got=0x{got.enable_mask:02X}"
+            )
+        if got.copy_mask != setup.copy_mask:
+            mismatch.append(
+                f"copy_mask expect=0x{setup.copy_mask:02X}, got=0x{got.copy_mask:02X}"
+            )
         if got.delay_values != setup.delay_values:
             mismatch.append(f"delay_values expect={setup.delay_values}, got={got.delay_values}")
         if got.delay_units != setup.delay_units:
@@ -493,34 +484,6 @@ class PumpHardwareService:
         if not mismatch:
             self.log("[WSS][OK] 写后读回校验通过")
             return self._ok(parsed=got, raw=rd.raw_reply, verified=True, reason="WSS 校验通过")
-
-        if self.runtime_config.wss_swap_fallback:
-            self.log("[WSS][WARN] 主顺序校验失败，尝试 fallback(enable->copy)")
-            try:
-                payload = bytearray(protocol.CMD_WSS)
-                payload.append(setup.copy_mask & 0xFF)
-                payload.append(setup.enable_mask & 0xFF)
-                for v in setup.delay_values:
-                    vv = int(v) & 0xFFFF
-                    payload.extend(((vv >> 8) & 0xFF, vv & 0xFF))
-                for u in setup.delay_units:
-                    payload.append(int(u) & 0xFF)
-
-                rep = self._send(bytes(payload), expect_cmd="WSS", allow_no_reply=True)
-                _ = rep.raw_frame if rep is not None else None
-                rd2 = self.read_rss()
-                if rd2.ok and rd2.parsed_reply is not None:
-                    got2: SystemSetup = rd2.parsed_reply
-                    if (
-                        got2.enable_mask == setup.enable_mask
-                        and got2.copy_mask == setup.copy_mask
-                        and got2.delay_values == setup.delay_values
-                        and got2.delay_units == setup.delay_units
-                    ):
-                        self.log("[WSS][OK] fallback 顺序校验通过")
-                        return self._ok(parsed=got2, raw=rd2.raw_reply, verified=True, reason="WSS fallback 校验通过")
-            except Exception as e:
-                self.log(f"[WSS][WARN] fallback 执行异常: {e}")
 
         reason = "; ".join(mismatch)
         self.log(f"[WSS][FAIL] 回读不一致: {reason}")
@@ -559,10 +522,6 @@ class PumpHardwareService:
         wr = self.write_wsp(params)
         if not wr.ok:
             return wr
-
-        commit = self.commit_channel_params(channel)
-        if not commit.ok:
-            self.log(f"[WSP][WARN][CH{channel}] 参数提交触发失败: {commit.reason or commit.error}")
 
         retries = max(1, int(self.runtime_config.wsp_verify_read_retry))
         for idx in range(retries):
@@ -628,31 +587,6 @@ class PumpHardwareService:
 
         return self._fail("WSP 校验失败：未知错误")
 
-    def commit_channel_params(self, channel: int) -> PumpOperationResult:
-        if not (1 <= int(channel) <= 4):
-            return self._fail(f"非法通道: {channel}")
-        rss = self.read_rss()
-        if not rss.ok or rss.parsed_reply is None:
-            return self._fail(f"参数提交前读取 RSS 失败: {rss.error or rss.reason}")
-
-        setup: SystemSetup = rss.parsed_reply
-        bit = 1 << (int(channel) - 1)
-        req = SystemSetup(
-            enable_mask=int(setup.enable_mask) & 0x0F,
-            copy_mask=(int(setup.copy_mask) | bit) & 0x0F,
-            delay_values=list(setup.delay_values),
-            delay_units=list(setup.delay_units),
-        )
-        res = self.write_wss(req)
-        if res.ok:
-            self.log(
-                f"[WSP][COMMIT][CH{channel}] copy=0x{req.copy_mask:02X}, "
-                f"enable=0x{req.enable_mask:02X}"
-            )
-            time.sleep(float(self.runtime_config.wsp_verify_retry_interval))
-            return res
-        return res
-
     def write_wse(self, sys_runstate: int, q_runstate: int = 0x00) -> PumpOperationResult:
         pdu = protocol.pdu_wse(sys_runstate=sys_runstate, q_runstate=q_runstate)
         try:
@@ -685,109 +619,29 @@ class PumpHardwareService:
             return self._fail(f"enable_channels 前读取 RSS 失败: {rss.error}")
         setup: SystemSetup = rss.parsed_reply
         enable = int(mask) & 0x0F
-        copy_mask = enable if enable else 0
         req = SystemSetup(
             enable_mask=enable,
-            copy_mask=copy_mask & 0x0F,
+            # copy_mask 是“运行时其它通道拷贝哪一通道的参数”，
+            # 不是通道使能位。Q1/Q2 独立控制时必须关闭拷贝。
+            copy_mask=0,
             delay_values=list(setup.delay_values),
             delay_units=list(setup.delay_units),
         )
         return self.write_wss(req)
 
     def enable_channels_and_verify(self, mask: int) -> PumpOperationResult:
-        def _effective(enable_mask: int, copy_mask: int) -> int:
-            return (int(enable_mask) | int(copy_mask)) & 0x0F
-
         rss = self.read_rss_with_retry()
         if not rss.ok:
             return self._fail(f"enable_channels_and_verify 前读取 RSS 失败: {rss.error}")
         setup: SystemSetup = rss.parsed_reply
         enable = int(mask) & 0x0F
-        copy_mask = enable if enable else 0
         req = SystemSetup(
             enable_mask=enable,
-            copy_mask=copy_mask & 0x0F,
+            copy_mask=0,
             delay_values=list(setup.delay_values),
             delay_units=list(setup.delay_units),
         )
-        first = self.write_wss_and_verify(req)
-        if first.ok:
-            return first
-
-        # 某些设备在多通道使能时需要“逐位收敛”，例如先 0x01 再到 0x03。
-        if bin(enable).count("1") < 2:
-            return first
-
-        rd = self.read_rss()
-        if not rd.ok or rd.parsed_reply is None:
-            return first
-        cur_setup: SystemSetup = rd.parsed_reply
-        cur_enable = _effective(cur_setup.enable_mask, cur_setup.copy_mask)
-        if cur_enable == enable:
-            self.log("[WSS][OK] 多通道收敛前已满足目标使能")
-            return self._ok(parsed=cur_setup, raw=rd.raw_reply, verified=True, reason="WSS 多通道收敛校验通过")
-
-        missing = enable & (~cur_enable & 0x0F)
-        for bit_idx in range(4):
-            bit = 1 << bit_idx
-            if (missing & bit) == 0:
-                continue
-            target_enable = ((cur_enable & enable) | bit) & 0x0F
-            step = SystemSetup(
-                enable_mask=target_enable,
-                # 使用目标掩码覆盖 copy，避免 0x01/0x02 互相覆盖。
-                copy_mask=target_enable & 0x0F,
-                delay_values=list(cur_setup.delay_values),
-                delay_units=list(cur_setup.delay_units),
-            )
-            step_res = self.write_wss_and_verify(step)
-            if not step_res.ok:
-                self.log(f"[WSS][WARN] 多通道收敛步骤失败: bit=0x{bit:02X}, reason={step_res.reason or step_res.error}")
-
-            rd2 = self.read_rss()
-            if rd2.ok and rd2.parsed_reply is not None:
-                cur_setup = rd2.parsed_reply
-                cur_enable = _effective(cur_setup.enable_mask, cur_setup.copy_mask)
-                if cur_enable == enable:
-                    self.log("[WSS][OK] 多通道收敛校验通过")
-                    return self._ok(
-                        parsed=cur_setup,
-                        raw=rd2.raw_reply,
-                        verified=True,
-                        reason="WSS 多通道收敛校验通过",
-                    )
-
-        final_rd = self.read_rss()
-        if final_rd.ok and final_rd.parsed_reply is not None:
-            final_setup: SystemSetup = final_rd.parsed_reply
-            final_enable = _effective(final_setup.enable_mask, final_setup.copy_mask)
-            if final_enable == enable:
-                self.log("[WSS][OK] 多通道收敛最终校验通过")
-                return self._ok(
-                    parsed=final_setup,
-                    raw=final_rd.raw_reply,
-                    verified=True,
-                    reason="WSS 多通道收敛最终校验通过",
-                )
-            self.log(
-                f"[WSS][FAIL] 多通道收敛后仍未满足: expect=0x{enable:02X}, "
-                f"got_enable=0x{int(final_setup.enable_mask) & 0x0F:02X}, "
-                f"got_copy=0x{int(final_setup.copy_mask) & 0x0F:02X}, "
-                f"effective=0x{final_enable:02X}"
-            )
-            return self._fail(
-                "WSS 多通道收敛失败",
-                parsed=final_setup,
-                raw=final_rd.raw_reply,
-                reason=(
-                    f"enable_mask expect=0x{enable:02X}, "
-                    f"got_enable=0x{int(final_setup.enable_mask) & 0x0F:02X}, "
-                    f"got_copy=0x{int(final_setup.copy_mask) & 0x0F:02X}, "
-                    f"effective=0x{final_enable:02X}"
-                ),
-            )
-
-        return first
+        return self.write_wss_and_verify(req)
 
     def stop_system(self) -> PumpOperationResult:
         return self.write_wse(sys_runstate=0x00, q_runstate=0x00)
@@ -808,7 +662,7 @@ class PumpHardwareService:
         setup: SystemSetup = rss.parsed_reply
         req = SystemSetup(
             enable_mask=target,
-            copy_mask=target,
+            copy_mask=0,
             delay_values=list(setup.delay_values),
             delay_units=list(setup.delay_units),
         )
@@ -838,8 +692,7 @@ class PumpHardwareService:
         rd = self.read_rss()
         if rd.ok and rd.parsed_reply is not None:
             got: SystemSetup = rd.parsed_reply
-            effective = (int(got.enable_mask) | int(got.copy_mask)) & 0x0F
-            if (effective & target) == target:
+            if (int(got.enable_mask) & 0x0F) == target and int(got.copy_mask) == 0:
                 self.log(
                     f"[PUMP][PARAM_WRITE][READY] mask=0x{target:02X} "
                     f"enable=0x{int(got.enable_mask) & 0x0F:02X} copy=0x{int(got.copy_mask) & 0x0F:02X}"
@@ -847,7 +700,7 @@ class PumpHardwareService:
                 return self._ok(
                     parsed=got,
                     raw=rd.raw_reply,
-                    verified=bool(res.ok),
+                    verified=True,
                     reason="参数写入前通道已进入可写状态",
                 )
 
@@ -860,8 +713,7 @@ class PumpHardwareService:
         if not rs.ok:
             return self._fail(f"系统启动前 RSS 读取失败: {rs.error}")
         setup: SystemSetup = rs.parsed_reply
-        effective_enable = (int(setup.enable_mask) | int(setup.copy_mask)) & 0x0F
-        run_mask = (effective_enable & 0x0F) << 1
+        run_mask = (int(setup.enable_mask) & 0x0F) << 1
         target_sys = (0x01 | run_mask) if run_mask else 0x00
         return self.write_wse(sys_runstate=target_sys, q_runstate=0x00)
 
@@ -870,8 +722,7 @@ class PumpHardwareService:
         if not rs.ok:
             return self._fail(f"系统启动前 RSS 读取失败: {rs.error}")
         setup: SystemSetup = rs.parsed_reply
-        effective_enable = (int(setup.enable_mask) | int(setup.copy_mask)) & 0x0F
-        run_mask = (effective_enable & 0x0F) << 1
+        run_mask = (int(setup.enable_mask) & 0x0F) << 1
         target_sys = (0x01 | run_mask) if run_mask else 0x00
         wr = self.write_wse(sys_runstate=target_sys, q_runstate=0x00)
         if not wr.ok:
@@ -1375,7 +1226,7 @@ class PumpHardwareService:
         if desired_enable_mask != current_enable_mask:
             adjust_setup = SystemSetup(
                 enable_mask=desired_enable_mask,
-                copy_mask=desired_enable_mask if desired_enable_mask else 0,
+                copy_mask=0,
                 delay_values=list(setup.delay_values),
                 delay_units=list(setup.delay_units),
             )

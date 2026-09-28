@@ -7,7 +7,7 @@ from .invariants import STRICT_Q1_Q2_GAP_UL_MIN
 
 
 DEFAULT_BAUDRATE = 1200
-DEFAULT_PARITY = "N"
+DEFAULT_PARITY = "E"
 DEFAULT_BYTESIZE = 8
 DEFAULT_STOPBITS = 1
 
@@ -20,7 +20,8 @@ class SerialConfig:
     timeout: float = 0.25
     write_timeout: float = 0.8
     address: int = 1
-    allow_parity_fallback_n: bool = True
+    # TS 通信规约是 1200/8/E/1。只在显式兼容旧设备时才尝试 N。
+    allow_parity_fallback_n: bool = False
 
     def __post_init__(self) -> None:
         if not 1 <= int(self.address) <= 0x1F:
@@ -52,7 +53,6 @@ class PumpHardwareConfig:
     inter_channel_update_delay: float = 0.18
     q2_update_max_attempts: int = 2
     q2_update_retry_interval: float = 0.25
-    wss_swap_fallback: bool = True
     # CH1 is oil and CH2 is water in this system.
     min_q1_q2_gap: float = STRICT_Q1_Q2_GAP_UL_MIN
 

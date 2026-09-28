@@ -14,7 +14,7 @@ class InitPage(ttk.Frame):
         self.port_var = tk.StringVar(value="")
         self.addr_var = tk.StringVar(value="1")
         self.baud_var = tk.StringVar(value="1200")
-        self.parity_var = tk.StringVar(value="N")
+        self.parity_var = tk.StringVar(value="E")
         self.status_var = tk.StringVar(value="未初始化")
         self._build()
 
@@ -23,7 +23,7 @@ class InitPage(ttk.Frame):
         self.q2_var.set(str(self.app.frontend_config.get("initial_q2", self.q2_var.get()) or "20"))
         self.addr_var.set(str(self.app.frontend_config.get("pump_address", self.addr_var.get()) or "1"))
         self.baud_var.set(str(self.app.frontend_config.get("pump_baudrate", self.baud_var.get()) or "1200"))
-        self.parity_var.set(str(self.app.frontend_config.get("pump_parity", self.parity_var.get()) or "N").upper())
+        self.parity_var.set(str(self.app.frontend_config.get("pump_parity", self.parity_var.get()) or "E").upper())
 
         configured_port = str(self.app.frontend_config.get("pump_port", "") or "").strip().upper()
         detected_ports = self._detect_ports()

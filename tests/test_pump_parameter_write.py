@@ -39,7 +39,7 @@ def test_prepare_parameter_write_does_not_repeat_rss_after_verified_wss(monkeypa
     service = PumpHardwareService()
     setup = SystemSetup(
         enable_mask=0x03,
-        copy_mask=0x03,
+        copy_mask=0x00,
         delay_values=[0, 0, 0, 0],
         delay_units=[0, 0, 0, 0],
     )
@@ -84,8 +84,8 @@ def test_prepare_parameter_write_can_recover_with_one_rss_read(monkeypatch):
         delay_units=[0, 0, 0, 0],
     )
     accepted = SystemSetup(
-        enable_mask=0x00,
-        copy_mask=0x03,
+        enable_mask=0x03,
+        copy_mask=0x00,
         delay_values=[0, 0, 0, 0],
         delay_units=[0, 0, 0, 0],
     )
@@ -112,6 +112,63 @@ def test_prepare_parameter_write_can_recover_with_one_rss_read(monkeypatch):
 
     assert result.ok
     assert result.parsed_reply is accepted
+
+
+def test_enabling_q1_q2_keeps_protocol_copy_mask_disabled(monkeypatch):
+    service = PumpHardwareService()
+    setup = SystemSetup(
+        enable_mask=0x01,
+        copy_mask=0x01,
+        delay_values=[0, 0, 0, 0],
+        delay_units=[0, 0, 0, 0],
+    )
+    requested = []
+    monkeypatch.setattr(
+        service,
+        "read_rss_with_retry",
+        lambda: PumpOperationResult(ok=True, parsed_reply=setup, verified=True),
+    )
+
+    def write_and_verify(value):
+        requested.append(value)
+        return PumpOperationResult(ok=True, parsed_reply=value, verified=True)
+
+    monkeypatch.setattr(service, "write_wss_and_verify", write_and_verify)
+
+    result = service.enable_channels_and_verify(0x03)
+
+    assert result.ok
+    assert requested[0].enable_mask == 0x03
+    assert requested[0].copy_mask == 0x00
+
+
+def test_wsp_verification_does_not_use_wss_copy_mask_as_commit(monkeypatch):
+    service = PumpHardwareService()
+    params = service._default_channel_params_for_q(1, 50.0)
+    monkeypatch.setattr(
+        service,
+        "write_wsp",
+        lambda value: PumpOperationResult(ok=True, parsed_reply=value),
+    )
+    monkeypatch.setattr(
+        service,
+        "read_rsp",
+        lambda channel: PumpOperationResult(
+            ok=True,
+            parsed_reply=params,
+            verified=True,
+        ),
+    )
+    monkeypatch.setattr(
+        service,
+        "read_rss",
+        lambda: pytest.fail("WSP/RSP verification must not trigger a WSS commit"),
+    )
+
+    result = service.write_wsp_and_verify(1, params)
+
+    assert result.ok
+    assert result.verified
 
 
 def test_rss_retry_recovers_after_transient_timeouts(monkeypatch):

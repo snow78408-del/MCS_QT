@@ -133,18 +133,37 @@ def pdu_rsp(channel: int) -> bytes:
     return CMD_RSP + bytes([channel & 0xFF])
 
 
-def pdu_wss(copy_mask: int, enable_mask: int, delay_values: list[int], delay_units: list[int]) -> bytes:
+def _require_range(name: str, value: int, minimum: int, maximum: int) -> int:
+    parsed = int(value)
+    if not minimum <= parsed <= maximum:
+        raise ValueError(f"{name} 超范围: {parsed}, 期望 [{minimum}, {maximum}]")
+    return parsed
+
+
+def pdu_wss(
+    *,
+    enable_mask: int,
+    copy_mask: int,
+    delay_values: list[int],
+    delay_units: list[int],
+) -> bytes:
     if len(delay_values) != 4 or len(delay_units) != 4:
         raise ValueError("delay_values / delay_units 必须为长度 4")
-    # TS protocol order: enable_mask -> copy_mask -> 4x delay_value -> 4x delay_unit.
+    enable_mask = _require_range("enable_mask", enable_mask, 0, 0x0F)
+    copy_mask = _require_range("copy_mask", copy_mask, 0, 0x0F)
+    if copy_mask and copy_mask & (copy_mask - 1):
+        raise ValueError("copy_mask 最多只能选中一个通道")
+
+    # TS 规约 4.4：enable -> copy -> 逐通道 [delay_value(2), delay_unit(1)]。
+    # 不能先写完 4 个 value 再写 4 个 unit，否则 CH2 起字段全部错位。
     payload = bytearray(CMD_WSS)
-    payload.append(enable_mask & 0xFF)
-    payload.append(copy_mask & 0xFF)
-    for v in delay_values:
-        vv = int(v) & 0xFFFF
+    payload.append(enable_mask)
+    payload.append(copy_mask)
+    for index, (value, unit) in enumerate(zip(delay_values, delay_units), start=1):
+        vv = _require_range(f"delay_values[{index}]", value, 0, 9999)
+        uu = _require_range(f"delay_units[{index}]", unit, 0, 2)
         payload.extend(((vv >> 8) & 0xFF, vv & 0xFF))
-    for u in delay_units:
-        payload.append(int(u) & 0xFF)
+        payload.append(uu)
     return bytes(payload)
 
 
@@ -161,8 +180,19 @@ def pdu_wsp(
     repeat_count: int,
     interval_value: int,
 ) -> bytes:
-    if not (1 <= int(channel) <= 4):
-        raise ValueError(f"通道号非法: {channel}")
+    channel = _require_range("channel", channel, 1, 4)
+    mode = _require_range("mode", mode, 1, 5)
+    syringe_code = _require_range("syringe_code", syringe_code, 0x11, 0x88)
+    if not (1 <= (syringe_code >> 4) <= 8 and 1 <= (syringe_code & 0x0F) <= 8):
+        raise ValueError(f"syringe_code 高低半字节必须都在 [1, 8]: 0x{syringe_code:02X}")
+    dispense_value = _require_range("dispense_value", dispense_value, 1, 9999)
+    dispense_unit = _require_range("dispense_unit", dispense_unit, 1, 5)
+    infuse_time_value = _require_range("infuse_time_value", infuse_time_value, 1, 9999)
+    infuse_time_unit = _require_range("infuse_time_unit", infuse_time_unit, 1, 3)
+    withdraw_time_value = _require_range("withdraw_time_value", withdraw_time_value, 1, 9999)
+    withdraw_time_unit = _require_range("withdraw_time_unit", withdraw_time_unit, 1, 3)
+    repeat_count = _require_range("repeat_count", repeat_count, 1, 999)
+    interval_value = _require_range("interval_value", interval_value, 1, 9999)
     payload = bytearray(CMD_WSP)
     payload.extend(
         [
@@ -188,22 +218,23 @@ def pdu_wsp(
 
 
 def pdu_wse(sys_runstate: int, q_runstate: int) -> bytes:
-    return CMD_WSE + bytes([sys_runstate & 0xFF, q_runstate & 0xFF])
+    sys_runstate = _require_range("sys_runstate", sys_runstate, 0, 0x1F)
+    q_runstate = _require_range("q_runstate", q_runstate, 0, 0xFF)
+    return CMD_WSE + bytes([sys_runstate, q_runstate])
 
 
 def parse_rss_pdu(pdu: bytes) -> SystemSetup:
     if len(pdu) != 17 or pdu[:3] != CMD_RSS:
         raise ValueError("RSS PDU 非法")
-    # TS protocol order: enable_mask -> copy_mask -> 4x delay_value -> 4x delay_unit.
+    # TS 规约 4.5：enable -> copy -> 逐通道 [delay_value(2), delay_unit(1)]。
     enable_mask = pdu[3]
     copy_mask = pdu[4]
-    delay_values = [
-        (pdu[5] << 8) | pdu[6],
-        (pdu[7] << 8) | pdu[8],
-        (pdu[9] << 8) | pdu[10],
-        (pdu[11] << 8) | pdu[12],
-    ]
-    delay_units = [pdu[13], pdu[14], pdu[15], pdu[16]]
+    delay_values: list[int] = []
+    delay_units: list[int] = []
+    for channel_index in range(4):
+        offset = 5 + channel_index * 3
+        delay_values.append((pdu[offset] << 8) | pdu[offset + 1])
+        delay_units.append(pdu[offset + 2])
     return SystemSetup(
         enable_mask=enable_mask,
         copy_mask=copy_mask,

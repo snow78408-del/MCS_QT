@@ -56,12 +56,28 @@ class FrontendSettingsStore:
             return None
         if "schema_version" not in payload:
             # Legacy schema stored settings directly at the JSON root.
-            return FrontendSettingsStore._reconcile_generation_geometry(dict(payload))
+            settings = FrontendSettingsStore._reconcile_generation_geometry(dict(payload))
+            return FrontendSettingsStore._reconcile_ts_pump_protocol(settings)
         version = payload.get("schema_version")
         settings = payload.get("settings")
         if version in {1, 2, SETTINGS_SCHEMA_VERSION} and isinstance(settings, dict):
-            return FrontendSettingsStore._reconcile_generation_geometry(dict(settings))
+            migrated = FrontendSettingsStore._reconcile_generation_geometry(dict(settings))
+            return FrontendSettingsStore._reconcile_ts_pump_protocol(migrated)
         return None
+
+    @staticmethod
+    def _reconcile_ts_pump_protocol(settings: dict[str, object]) -> dict[str, object]:
+        """Migrate saved serial settings to the currently installed TS pump.
+
+        Preserve the selected port, address and flow targets.  The attached TS
+        controller has a fixed 1200/8/E/1 host protocol, so legacy N-parity or
+        non-1200 values must not silently survive a hardware replacement.
+        """
+        if "pump_baudrate" in settings:
+            settings["pump_baudrate"] = 1200
+        if "pump_parity" in settings:
+            settings["pump_parity"] = "E"
+        return settings
 
     @staticmethod
     def _positive_number(value: object) -> float | None:

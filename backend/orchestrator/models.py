@@ -20,7 +20,7 @@ class SystemConfig:
     pump_port: str = ""
     pump_address: int = 1
     pump_baudrate: int = 1200
-    pump_parity: str = "N"
+    pump_parity: str = "E"
     mvs_sdk_path: str = ""
     camera_backend: str = ""
     camera_parameters: dict[str, float | int | str] = field(default_factory=dict)
