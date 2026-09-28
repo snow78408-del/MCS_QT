@@ -37,6 +37,7 @@ def _config() -> PlantCalibrationExperimentConfig:
         q1_step=2.0,
         q2_step=1.0,
         repetitions=2, maximum_attempts=1, require_mpc_validation=False,
+        identification_model="legacy_local_linear",
     )
 
 
@@ -278,6 +279,7 @@ def test_calibration_save_keeps_loadable_record_and_separate_raw_audit() -> None
     finally:
         record_path.unlink(missing_ok=True)
         audit_path.unlink(missing_ok=True)
+        record_path.with_name(f"{record_path.stem}.mpc-training.json").unlink(missing_ok=True)
 
 
 def test_calibration_config_rejects_missing_physical_identity() -> None:
@@ -515,7 +517,7 @@ def test_stable_sub_threshold_tail_is_a_valid_low_response() -> None:
     assert len(tail) == 5
 
 
-@pytest.mark.parametrize("no_response", [False, True, "retry", "validation_retry"])
+@pytest.mark.parametrize("no_response", [False, True, "retry", "validation_retry", "nonlinear"])
 def test_orchestrator_runs_calibration_under_exclusive_state_and_stops_pump(no_response, monkeypatch, tmp_path) -> None:
     monkeypatch.setattr("backend.orchestrator.service.ensure_user_subdir", lambda _: tmp_path)
     class PumpStub:
@@ -581,6 +583,13 @@ def test_orchestrator_runs_calibration_under_exclusive_state_and_stops_pump(no_r
 
     def fake_trial(**kwargs):
         calibration_sequence.append(("trial", str(kwargs["trial_id"])))
+        if no_response == "nonlinear":
+            from test_nonlinear_calibration import nonlinear_measurements
+
+            candidates = nonlinear_measurements()
+            candidate = next(item for item in candidates
+                             if item.channel == kwargs["channel"] and item.direction == kwargs["direction"])
+            return replace(candidate, trial_id=kwargs["trial_id"])
         channel = kwargs["channel"]
         direction = int(kwargs["direction"])
         if channel == "q1":
@@ -603,31 +612,49 @@ def test_orchestrator_runs_calibration_under_exclusive_state_and_stops_pump(no_r
 
     service._run_plant_calibration_trial = fake_trial
     try:
-        if no_response is True:
+        if no_response and no_response != "nonlinear":
             from backend.pid_control.calibration_experiment import CalibrationIdentificationError
-            with pytest.raises(CalibrationIdentificationError, match="本次响应不足"):
-                service.run_plant_calibration_experiment(_config())
+            validation_failed = no_response == "validation_retry"
+            config = replace(_config(), maximum_attempts=3)
+            with pytest.raises(CalibrationIdentificationError, match="标定尚未成功" if validation_failed else "本次响应不足"):
+                service.run_plant_calibration_experiment(config)
             assert service._state == SystemState.STOPPED
-            assert service.get_snapshot().plant_calibration_experiment["status"] == "insufficient_response"
-            assert "stop" in pump.calls
-            assert not any("validation" in str(entry) for entry in calibration_sequence)
+            snapshot = service.get_snapshot().plant_calibration_experiment
+            assert snapshot["status"] == ("validation_failed" if validation_failed else "insufficient_response")
+            assert snapshot["maximum_attempts"] == 1
+            assert snapshot["total_trials"] == 14
+            assert pump.calls.count("stop") == 1
+            assert vision.calls[-1] == "stop"
+            assert len(calibration_sequence) == (28 if validation_failed else 24)
+            if not validation_failed:
+                assert not any("validation" in str(entry) for entry in calibration_sequence)
             archive = json.loads(next(tmp_path.glob("*.measurements.json")).read_text(encoding="utf-8"))
-            assert len(archive["measurements"]) == 12
+            assert len(archive["measurements"]) == (14 if validation_failed else 12)
+            assert archive["config"]["repetitions"] == config.repetitions
+            assert archive["config"]["minimum_response_wait_s"] == config.minimum_response_wait_s
+            assert not archive["attempt_history"]
             assert not archive["loadable_calibration"]
             assert not service._plant_calibration_in_progress
             return
-        result = service.run_plant_calibration_experiment(replace(_config(), maximum_attempts=2) if no_response in {"retry", "validation_retry"} else _config())
+        result = service.run_plant_calibration_experiment(replace(
+            _config(), maximum_attempts=3,
+            identification_model="quadratic_response" if no_response == "nonlinear" else "legacy_local_linear",
+        ))
 
-        assert result.record.diameter_sensitivity_um_per_output == pytest.approx(3.5)
+        if no_response == "nonlinear":
+            assert result.record.nonlinear_model
+            assert len(result.measurements) == 14
+            assert not any(item.response_detected for item in result.measurements)
+        else:
+            assert result.record.diameter_sensitivity_um_per_output == pytest.approx(3.5)
         assert service._state == SystemState.STOPPED
         assert service.get_snapshot().plant_calibration_experiment["status"] == "completed"
-        assert len(calibration_sequence) == (64 if no_response == "retry" else 68 if no_response == "validation_retry" else 28)
-        if no_response in {"retry", "validation_retry"}:
-            assert len(result.attempt_history) == 1
-            assert len(result.attempt_history[0]["measurements"]) == (12 if no_response == "retry" else 14)
-            assert result.config.repetitions == 3
-            assert result.config.minimum_response_wait_s == 45
-            assert result.config.q1_step == _config().q1_step
+        assert len(calibration_sequence) == 28
+        assert not result.attempt_history
+        assert result.config.maximum_attempts == 1
+        assert result.config.repetitions == _config().repetitions
+        assert result.config.minimum_response_wait_s == _config().minimum_response_wait_s
+        assert result.config.q1_step == _config().q1_step
         assert result.record.validated_for_pi
         for index in range(0, len(calibration_sequence), 2):
             baseline_entry = calibration_sequence[index]

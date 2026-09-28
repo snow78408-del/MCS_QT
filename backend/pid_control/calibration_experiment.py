@@ -12,7 +12,7 @@ from typing import Any, Callable, Iterable
 
 import numpy as np
 
-from .calibration import PlantCalibrationRecord
+from .calibration import PlantCalibrationRecord, build_calibration_record
 
 
 class CalibrationIdentificationError(ValueError):
@@ -81,8 +81,9 @@ class PlantCalibrationExperimentConfig:
     low_response_wait_s: float = 60.0
     stability_duration_s: float = 3.0
     baseline_wait_s: float | None = None
-    maximum_attempts: int = 3
-    require_mpc_validation: bool = True
+    maximum_attempts: int = 1
+    require_mpc_validation: bool = False
+    identification_model: str = "quadratic_response"
 
     @property
     def effective_baseline_wait_s(self) -> float:
@@ -90,6 +91,8 @@ class PlantCalibrationExperimentConfig:
         return self.minimum_response_wait_s if self.baseline_wait_s is None else self.baseline_wait_s
 
     def __post_init__(self) -> None:
+        if self.identification_model not in {"quadratic_response", "legacy_local_linear"}:
+            raise ValueError("unsupported calibration identification_model")
         if isinstance(self.maximum_attempts, bool) or not isinstance(self.maximum_attempts, int) or not 1 <= self.maximum_attempts <= 5:
             raise ValueError("maximum_attempts must be an integer in [1, 5]")
         if not isinstance(self.require_mpc_validation, bool):
@@ -254,12 +257,19 @@ class PlantCalibrationExperimentResult:
     def require_accepted(self) -> None:
         PlantCalibrationRecord.from_mapping(self.record.to_dict())
         if not self.accepted:
+            fit_detail = ""
+            if self.record.nonlinear_model is not None:
+                fit_detail = (
+                    f"非线性训练 NRMSE={self.record.nonlinear_model['training_nrmse']:.3f}，"
+                    f"动态拟合 NRMSE={self.record.model_fit_nrmse:.3f}，"
+                    f"各项上限={self.config.validation_nrmse_limit:g}。"
+                )
             raise CalibrationValidationError(
                 f"标定尚未成功：PI {'通过' if self.record.validated_for_pi else '未通过'}，"
                 f"MPC {'通过' if self.record.validated_for_mpc else '未通过'}；"
                 f"验证 MAE={self.record.validation_mae_um:.3f}/{self.config.validation_mae_limit_um:g} μm，"
                 f"NRMSE={self.record.validation_nrmse:.3f}/{self.config.validation_nrmse_limit:g}。"
-                "只能保留诊断数据，不能导出或应用正式标定。"
+                f"{fit_detail}保留 MPC 建模数据，但不能应用正式 PID 标定。"
             )
 
     @property
@@ -307,7 +317,7 @@ class _FOPDTFit:
     method: str
 
 
-def _fit_fopdt(measurements: Iterable[PlantCalibrationMeasurement]) -> _FOPDTFit:
+def _fit_fopdt(measurements: Iterable[PlantCalibrationMeasurement], *, nonlinear: bool = False) -> _FOPDTFit:
     """Fit one FOPDT shape to all identified-direction response curves.
 
     Each trial retains its own measured baseline and steady-state amplitude;
@@ -319,12 +329,13 @@ def _fit_fopdt(measurements: Iterable[PlantCalibrationMeasurement]) -> _FOPDTFit
     trials = [
         item
         for item in measurements
-        if item.channel == "combined"
-        and item.response_detected
+        if (item.channel != "validation" if nonlinear else item.channel == "combined" and item.response_detected)
         and abs(float(item.diameter_change_um)) > 1e-9
         and len(item.response_observations) >= 3
     ]
     if not trials:
+        if nonlinear:
+            raise CalibrationIdentificationError("已完成采集，但动态曲线不足；保留 MPC 建模数据，不能据此整定 PID")
         items = list(measurements)
         delays = [item.response_delay_ms for item in items if item.channel == "combined" and item.response_detected]
         return _FOPDTFit(
@@ -391,7 +402,7 @@ def _fit_fopdt(measurements: Iterable[PlantCalibrationMeasurement]) -> _FOPDTFit
         (item.response_delay_ms for item in trials),
         name="response delay",
     )
-    delay_high = min(maximum_elapsed * 0.8, max(observed_delay * 2.0, 1.0))
+    delay_high = maximum_elapsed * 0.8 if nonlinear else min(maximum_elapsed * 0.8, max(observed_delay * 2.0, 1.0))
     delay_candidates = np.linspace(0.0, max(1.0, delay_high), 61)
     sampling_ms = float(median(positive_gaps_ms)) if positive_gaps_ms else maximum_elapsed / 20.0
     tau_low = max(1.0, sampling_ms * 0.25)
@@ -438,13 +449,15 @@ def _validation_metrics(
     delay_ms: float,
     time_constant_ms: float,
     steady_gain_um_per_output: float,
+    predict_change: Callable[[PlantCalibrationMeasurement], float] | None = None,
 ) -> tuple[float, float, int]:
     residuals: list[float] = []
     scales: list[float] = []
     for item in measurements:
         if item.channel != "validation":
             continue
-        predicted_change = steady_gain_um_per_output * float(item.actuator_step or 0.0)
+        predicted_change = (predict_change(item) if predict_change is not None
+                            else steady_gain_um_per_output * float(item.actuator_step or 0.0))
         observations = tuple(item.response_observations)
         if observations:
             for observation in observations:
@@ -503,12 +516,18 @@ def calibration_diagnostics(
             "observation_duration_s": item.response_stable_monotonic - item.command_started_monotonic,
         }
         if item.channel == "validation" and record is not None:
+            predictor = None
+            if record.nonlinear_model is not None:
+                from .nonlinear_calibration import predict_change
+
+                predictor = lambda trial: predict_change(record.nonlinear_model, trial)
             mae, nrmse, count = _validation_metrics(
                 [item], delay_ms=record.response_delay_median_ms,
                 time_constant_ms=record.response_time_constant_ms,
                 steady_gain_um_per_output=record.diameter_sensitivity_um_per_output,
+                predict_change=predictor,
             )
-            entry.update(predicted_change_um=record.diameter_sensitivity_um_per_output * float(item.actuator_step or 0),
+            entry.update(predicted_change_um=(predictor(item) if predictor else record.diameter_sensitivity_um_per_output * float(item.actuator_step or 0)),
                          mae_um=mae, nrmse=nrmse, sample_count=count)
         trials.append(entry)
     return {"channels": channels, "trials": trials,
@@ -522,6 +541,29 @@ def save_failed_calibration(
     attempt_history: Iterable[dict[str, Any]] = (),
 ) -> str:
     items = tuple(measurements)
+    training_path = Path(path).with_name(f"{Path(path).stem}.mpc-training.json")
+    model = None
+    model_reason = ""
+    if config.identification_model == "quadratic_response":
+        from .nonlinear_calibration import fit_response_surface
+
+        try:
+            model = fit_response_surface(items)
+        except (ValueError, np.linalg.LinAlgError) as exc:
+            model_reason = str(exc)
+    _write_json_atomic(training_path, {
+        "schema_version": 1, "session_id": session_id,
+        "purpose": "MPC model building data; incomplete or unqualified experiments do not authorize control",
+        "loadable_calibration": False, "validated_for_mpc": False,
+        "complete_collection": len(items) == config.repetitions * 6 + config.validation_repetitions * 2 and partial_trial is None,
+        "reason": reason, "experiment_config": config.to_dict(),
+        "units": {"flow": "uL/min", "diameter": "um", "time": "host monotonic seconds"},
+        "flow_measurement_kind": "device_parameter_readback",
+        "nonlinear_model": model, "model_reason": model_reason,
+        "training_trials": [item.to_dict() for item in items if item.channel != "validation"],
+        "validation_trials": [item.to_dict() for item in items if item.channel == "validation"],
+        "partial_trial": partial_trial,
+    })
     _write_json_atomic(Path(path), {
         "status": "incomplete", "loadable_calibration": False,
         "reason": reason, "session_id": session_id, "started_at": started_at,
@@ -529,6 +571,7 @@ def save_failed_calibration(
         "config": config.to_dict(), "measurements": [item.to_dict() for item in items],
         "partial_trial": partial_trial, "diagnostics": calibration_diagnostics(items),
         "attempt_history": list(attempt_history),
+        "mpc_training_path": str(training_path.resolve()),
     })
     return str(Path(path).resolve())
 
@@ -723,6 +766,14 @@ def build_plant_calibration_result(
     total_flow_max: float,
     min_q1_q2_gap: float,
 ) -> PlantCalibrationExperimentResult:
+    if config.identification_model == "quadratic_response":
+        from .nonlinear_calibration import build_nonlinear_calibration
+
+        return build_nonlinear_calibration(
+            config=config, measurements=measurements, session_id=session_id, started_at=started_at,
+            q1_min=q1_min, q1_max=q1_max, q2_min=q2_min, q2_max=q2_max,
+            total_flow_max=total_flow_max, min_q1_q2_gap=min_q1_q2_gap,
+        )
     items = tuple(measurements)
     model_items = tuple(item for item in items if item.channel != "validation")
     require_combined_response(model_items)
@@ -848,18 +899,12 @@ def build_plant_calibration_result(
         for observation in baseline_observations
         if float(observation.diameter_cv) >= 0.0
     ]
-    completed_at = datetime.now(timezone.utc).isoformat()
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    calibration_id = f"plant-cal-{stamp}-{str(session_id)[:8] or uuid.uuid4().hex[:8]}"
-    record = PlantCalibrationRecord(
-        schema_version=3,
-        calibration_id=calibration_id,
-        created_at=completed_at,
-        plant_id=str(config.plant_id).strip(),
-        chip_id=str(config.chip_id).strip(),
-        fluid_id=str(config.fluid_id).strip(),
-        pump_model=str(config.pump_model).strip(),
-        syringe_profile=str(config.syringe_profile).strip(),
+    completed_at_dt = datetime.now(timezone.utc)
+    record = build_calibration_record(
+        config=config,
+        session_id=str(session_id),
+        completed_at=completed_at_dt,
+        measurement_source="generation_zone_volume_step_response",
         response_delay_median_ms=delay_median,
         response_delay_uncertainty_ms=delay_uncertainty,
         diameter_sensitivity_um_per_output=plant_sensitivity,
@@ -873,35 +918,14 @@ def build_plant_calibration_result(
         q2_max=identified_q2_max,
         total_flow_max=identified_total_flow_max,
         min_q1_q2_gap=float(min_q1_q2_gap),
-        measurement_source="generation_zone_volume_step_response",
-        measurement_region="generation",
-        channel_height_um=float(config.channel_height_um),
-        channel_width_um=float(config.channel_width_um),
-        volume_correction_factor=float(config.volume_correction_factor),
         baseline_q1=baseline_q1,
         baseline_q2=baseline_q2,
         baseline_diameter_um=baseline_diameter,
         q1_log_diameter_sensitivity=q1_log_sensitivity,
         q2_log_diameter_sensitivity=q2_log_sensitivity,
-        sensitivity_allocation_regularization=float(
-            config.sensitivity_allocation_regularization
-        ),
         response_time_constant_ms=response_time_constant_ms,
         controller_kp=controller_kp,
         controller_ki=controller_ki,
-        controller_kd=0.0,
-        continuous_phase_oil=str(config.continuous_phase_oil).strip(),
-        surfactant_name=str(config.surfactant_name).strip(),
-        surfactant_concentration_percent=float(config.surfactant_concentration_percent),
-        surfactant_concentration_basis=str(config.surfactant_concentration_basis),
-        aqueous_phase=str(config.aqueous_phase).strip(),
-        temperature_c=float(config.temperature_c),
-        q1_response_delay_ms=(
-            0.0 if not q1_delays else _finite_median(q1_delays, name="Q1 response delay")
-        ),
-        q2_response_delay_ms=(
-            0.0 if not q2_delays else _finite_median(q2_delays, name="Q2 response delay")
-        ),
         response_time_constant_uncertainty_ms=float(
             fopdt_fit.time_constant_uncertainty_ms
         ),
@@ -915,6 +939,12 @@ def build_plant_calibration_result(
         validation_sample_count=validation_sample_count,
         validated_for_pi=validated_for_pi,
         validated_for_mpc=validated_for_mpc,
+        q1_response_delay_ms=(
+            0.0 if not q1_delays else _finite_median(q1_delays, name="Q1 response delay")
+        ),
+        q2_response_delay_ms=(
+            0.0 if not q2_delays else _finite_median(q2_delays, name="Q2 response delay")
+        ),
         baseline_generation_frequency_hz=(
             0.0
             if not baseline_frequency_values
@@ -925,8 +955,8 @@ def build_plant_calibration_result(
             if not baseline_cv_values
             else _finite_median(baseline_cv_values, name="diameter CV")
         ),
-        flow_measurement_kind="device_parameter_readback",
     )
+    completed_at = completed_at_dt.isoformat()
     return PlantCalibrationExperimentResult(
         record=record,
         config=config,
@@ -968,21 +998,21 @@ def save_plant_calibration_result(
     # Publish the loadable record last. If the audit write fails, callers never
     # see a calibration file that has lost its supporting measurements.
     _write_json_atomic(audit_path, result.to_dict())
-    if result.record.validated_for_mpc:
-        _write_json_atomic(training_path, {
-            "schema_version": 1, "calibration_id": result.record.calibration_id,
-            "purpose": "MPC model training and held-out validation; not controller deployment authorization",
-            "units": {"flow": "uL/min", "diameter": "um", "time": "host monotonic seconds"},
-            "flow_measurement_kind": result.record.flow_measurement_kind,
-            "record": result.record.to_dict(), "experiment_config": result.config.to_dict(),
-            "training_trials": [item.to_dict() for item in result.measurements if item.channel != "validation"],
-            "validation_trials": [item.to_dict() for item in result.measurements if item.channel == "validation"],
-        })
+    _write_json_atomic(training_path, {
+        "schema_version": 1, "calibration_id": result.record.calibration_id,
+        "purpose": "MPC model training and held-out validation; not controller deployment authorization",
+        "validated_for_mpc": result.record.validated_for_mpc,
+        "units": {"flow": "uL/min", "diameter": "um", "time": "host monotonic seconds"},
+        "flow_measurement_kind": result.record.flow_measurement_kind,
+        "record": result.record.to_dict(), "experiment_config": result.config.to_dict(),
+        "training_trials": [item.to_dict() for item in result.measurements if item.channel != "validation"],
+        "validation_trials": [item.to_dict() for item in result.measurements if item.channel == "validation"],
+    })
     _write_json_atomic(path, result.record.to_dict())
     return {
         "path": str(path.resolve()),
         "measurements_path": str(audit_path.resolve()),
         "record": result.record.to_dict(),
         "measurement_count": len(result.measurements),
-        "mpc_training_path": str(training_path.resolve()) if result.record.validated_for_mpc else None,
+        "mpc_training_path": str(training_path.resolve()),
     }

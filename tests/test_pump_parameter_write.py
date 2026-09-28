@@ -188,6 +188,11 @@ def test_running_update_retries_only_q2_after_transient_failure(monkeypatch):
     )
     calls = []
 
+    monkeypatch.setattr(service, "stop_system_and_verify",
+                        lambda: (calls.append("stop") or PumpOperationResult(ok=True, verified=True)))
+    monkeypatch.setattr(service, "start_infusion_and_verify",
+                        lambda channels: (calls.append("start") or PumpOperationResult(ok=True, verified=True)))
+
     def write_and_verify(channel, params):
         calls.append(channel)
         if channel == 2 and calls.count(2) == 1:
@@ -200,7 +205,123 @@ def test_running_update_retries_only_q2_after_transient_failure(monkeypatch):
 
     assert result.ok
     assert result.q1_ok and result.q2_ok
-    assert calls == [1, 2, 2]
+    assert result.stop_verified_before_write and result.restart_verified
+    assert calls == ["stop", 1, 2, 2, "start"]
+
+
+def test_running_update_never_writes_when_stop_is_unverified(monkeypatch):
+    service = PumpHardwareService()
+    running = RunState(1, 0x03, True, [True, True, False, False])
+    monkeypatch.setattr(service, "read_run_state",
+                        lambda: PumpOperationResult(ok=True, parsed_reply=running))
+    monkeypatch.setattr(service, "_channel_params_with_flow",
+                        lambda ch, q: service._default_channel_params_for_q(ch, q))
+    monkeypatch.setattr(service, "stop_system_and_verify",
+                        lambda: PumpOperationResult(ok=False, error="stop timeout"))
+    monkeypatch.setattr(service, "write_wsp_and_verify",
+                        lambda *_: pytest.fail("must not write while stop is unverified"))
+    monkeypatch.setattr(service, "start_infusion_and_verify",
+                        lambda *_: pytest.fail("must not restart after failed stop"))
+
+    result = service.update_flow_while_running(100.0, 20.0)
+
+    assert not result.ok
+    assert not result.safe_stop_verified
+    assert not result.stop_verified_before_write
+    assert "停泵未核验" in result.reason
+
+
+def test_q2_only_step_skips_rewriting_verified_unchanged_q1(monkeypatch):
+    service = PumpHardwareService()
+    service.runtime_config.inter_channel_update_delay = 0.0
+    p1 = service._default_channel_params_for_q(1, 100.0)
+    p2 = service._default_channel_params_for_q(2, 30.0)
+    service.last_channel_params[1] = p1
+    service.last_channel_params[2] = service._default_channel_params_for_q(2, 10.0)
+    running = RunState(1, 0x03, True, [True, True, False, False])
+    monkeypatch.setattr(service, "read_run_state",
+                        lambda: PumpOperationResult(ok=True, parsed_reply=running))
+    monkeypatch.setattr(service, "_channel_params_with_flow",
+                        lambda channel, _q: p1 if channel == 1 else p2)
+    events = []
+    monkeypatch.setattr(service, "stop_system_and_verify",
+                        lambda: (events.append("stop") or PumpOperationResult(ok=True, verified=True)))
+    monkeypatch.setattr(service, "read_rsp", lambda ch: (
+        events.append("read_q1") or PumpOperationResult(ok=True, parsed_reply=p1,
+                                                          verified=True)))
+    monkeypatch.setattr(service, "write_wsp_and_verify", lambda ch, p: (
+        events.append(f"write_q{ch}") or PumpOperationResult(ok=True, parsed_reply=p,
+                                                                verified=True)))
+    monkeypatch.setattr(service, "start_infusion_and_verify", lambda channels: (
+        events.append("start") or PumpOperationResult(ok=True, verified=True)))
+
+    result = service.update_flow_while_running(100.0, 30.0)
+
+    assert result.ok and result.stop_verified_before_write and result.restart_verified
+    assert events == ["stop", "read_q1", "write_q2", "start"]
+
+
+def test_q1_only_step_skips_rewriting_verified_unchanged_q2(monkeypatch):
+    service = PumpHardwareService()
+    service.runtime_config.inter_channel_update_delay = 0.0
+    p1 = service._default_channel_params_for_q(1, 70.0)
+    p2 = service._default_channel_params_for_q(2, 20.0)
+    service.last_channel_params[1] = service._default_channel_params_for_q(1, 60.0)
+    service.last_channel_params[2] = p2
+    running = RunState(1, 0x03, True, [True, True, False, False])
+    monkeypatch.setattr(service, "read_run_state",
+                        lambda: PumpOperationResult(ok=True, parsed_reply=running))
+    monkeypatch.setattr(service, "_channel_params_with_flow",
+                        lambda channel, _q: p1 if channel == 1 else p2)
+    events = []
+    monkeypatch.setattr(service, "stop_system_and_verify",
+                        lambda: (events.append("stop") or PumpOperationResult(ok=True, verified=True)))
+    monkeypatch.setattr(service, "read_rsp", lambda ch: (
+        events.append("read_q2") or PumpOperationResult(ok=True, parsed_reply=p2,
+                                                          verified=True)))
+    monkeypatch.setattr(service, "write_wsp_and_verify", lambda ch, p: (
+        events.append(f"write_q{ch}") or PumpOperationResult(ok=True, parsed_reply=p,
+                                                                verified=True)))
+    monkeypatch.setattr(service, "start_infusion_and_verify", lambda channels: (
+        events.append("start") or PumpOperationResult(ok=True, verified=True)))
+
+    result = service.update_flow_while_running(70.0, 20.0)
+
+    assert result.ok and result.stop_verified_before_write and result.restart_verified
+    assert events == ["stop", "write_q1", "read_q2", "start"]
+
+
+def test_running_update_restart_failure_rolls_back_and_stays_stopped(monkeypatch):
+    service = PumpHardwareService()
+    service.runtime_config.inter_channel_update_delay = 0.0
+    running = RunState(1, 0x03, True, [True, True, False, False])
+    monkeypatch.setattr(service, "read_run_state",
+                        lambda: PumpOperationResult(ok=True, parsed_reply=running))
+    previous = {ch: service._default_channel_params_for_q(ch, q)
+                for ch, q in ((1, 50.0), (2, 20.0))}
+
+    def build(ch, q):
+        service.last_channel_params[ch] = previous[ch]
+        return service._default_channel_params_for_q(ch, q)
+
+    monkeypatch.setattr(service, "_channel_params_with_flow", build)
+    events = []
+    monkeypatch.setattr(service, "stop_system_and_verify",
+                        lambda: (events.append("stop") or PumpOperationResult(ok=True, verified=True)))
+    monkeypatch.setattr(service, "write_wsp_and_verify",
+                        lambda ch, p: (events.append((ch, p)) or PumpOperationResult(
+                            ok=True, parsed_reply=p, verified=True)))
+    monkeypatch.setattr(service, "start_infusion_and_verify",
+                        lambda channels: (events.append("start") or PumpOperationResult(
+                            ok=False, error="restart failed")))
+
+    result = service.update_flow_while_running(100.0, 20.0)
+
+    assert not result.ok and not result.still_running
+    assert result.safe_stop_verified and result.rolled_back
+    assert result.stop_verified_before_write and not result.restart_verified
+    assert [event if isinstance(event, str) else event[0] for event in events] == [
+        "stop", 1, 2, "start", "stop", 1, 2, "stop"]
 
 
 def test_partial_two_channel_update_stops_rolls_back_and_stays_stopped(monkeypatch):
@@ -248,6 +369,6 @@ def test_partial_two_channel_update_stops_rolls_back_and_stays_stopped(monkeypat
     assert not result.still_running
     assert result.safe_stop_verified
     assert result.rolled_back
-    assert stop_calls == 2
+    assert stop_calls == 3
     assert [channel for channel, _ in writes] == [1, 2, 1]
     assert writes[-1][1] == old[1]

@@ -36,12 +36,26 @@ def test_failed_validation_cannot_publish_any_formal_file(tmp_path):
     assert not list(tmp_path.iterdir())
 
 
-def test_pid_only_result_cannot_complete_default_dual_requirement(tmp_path):
+def test_pid_only_result_cannot_complete_explicit_dual_requirement(tmp_path):
     result = build(_measurements()+[_measurement("validation", "validation", 1, 2.1)])
     assert result.record.validated_for_pi and not result.record.validated_for_mpc
     result = replace(result, config=replace(result.config, require_mpc_validation=True))
     with pytest.raises(CalibrationValidationError):
         save_plant_calibration_result(result, tmp_path / "formal.json")
+
+
+def test_pid_result_exports_mpc_building_data_without_claiming_mpc_qualification(tmp_path):
+    result = build(_measurements()+[_measurement("validation", "validation", 1, 2.1)])
+    assert result.accepted
+    assert result.record.validated_for_pi and not result.record.validated_for_mpc
+    saved = save_plant_calibration_result(result, tmp_path / "formal.json")
+    training = json.loads((tmp_path / "formal.mpc-training.json").read_text(encoding="utf-8"))
+    assert saved["mpc_training_path"]
+    assert training["validated_for_mpc"] is False
+    assert training["record"]["validated_for_pi"] is True
+    expected = json.loads(json.dumps([item.to_dict() for item in result.measurements]))
+    assert training["training_trials"] == [item for item in expected if item["channel"] != "validation"]
+    assert training["validation_trials"] == [item for item in expected if item["channel"] == "validation"]
 
 
 def test_qualified_result_delivers_calibration_and_separate_training_validation(tmp_path):

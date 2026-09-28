@@ -1,0 +1,119 @@
+{
+  "schema_version": 1,
+  "experiment_id": "live_probe_20260907_144141",
+  "local_start": "2026-09-07 14:41:41",
+  "timezone": "Asia/Shanghai",
+  "software": {
+    "base_commit": "00685d5b0794b43d6b90cf9d804208ece8afe9ea",
+    "uncommitted_changes_at_capture": true,
+    "exact_capture_source_snapshot_available": false
+  },
+  "scope": "Read-only pump queries and short camera acquisition; no pump start/stop/flow-write commands; image recognition performed offline.",
+  "pump": {
+    "baudrate": 1200,
+    "data_bits": 8,
+    "stop_bits": 1,
+    "address": 1,
+    "successful_parity": "E",
+    "initial_N_query_error": "等待帧头超时",
+    "running": false,
+    "channel_parameter_flow_ul_min": {
+      "CH1": 69.93006993006993,
+      "CH2": 20.0
+    },
+    "flow_measurement_kind": "device_parameter_estimate",
+    "query_elapsed_ms": {
+      "RSS": 268.6329000000569,
+      "RSE": 158.15530000008948,
+      "RSP1": 306.307199999992,
+      "RSP2": 306.17350000011356
+    },
+    "physical_response_delay_ms": null
+  },
+  "camera": {
+    "frames": 1164,
+    "acquisition_elapsed_s": 12.006151099999897,
+    "width": 720,
+    "height": 540,
+    "observed_fps": 97.00221858169796,
+    "interval_median_ms": 10.021900000083406,
+    "interval_p95_ms": 13.252650000072208,
+    "non_monotonic_timestamps": 0,
+    "missing_hardware_frame_ids": 36,
+    "sdk_lost_packet_sum": 0,
+    "exposure_metadata_reported_us": 0.0,
+    "actual_exposure_us": null,
+    "exposure_note": "SDK frame metadata reported 0; actual exposure not independently read back.",
+    "whole_frame_mean_gray": 24.129025937150875,
+    "acquisition_errors": []
+  },
+  "recognition": {
+    "frames_with_detections": 0,
+    "frame_detection_instances": 0,
+    "size_track_crossings": 0,
+    "continuous_gate_events": 0,
+    "windows": [
+      {
+        "period_id": 1,
+        "size_samples": 0,
+        "pixel_diameter": null,
+        "frequency": {
+          "count": 0,
+          "rate_hz": null,
+          "valid": false,
+          "reason": "frame gap or gate calibration incomplete"
+        }
+      }
+    ],
+    "offline_processing_mean_ms": 9.045864518905958,
+    "offline_processing_p95_ms": 11.549860000263829
+  },
+  "unresolved": [
+    "Hardware frame ID gaps: location/cause not determined.",
+    "Dark field and changed camera view; ROI/illumination need review.",
+    "No valid droplet-size window; frequency invalid, not a measured 0 Hz.",
+    "No physical flow, pump response delay, closed-loop or sustained 100 FPS validation."
+  ],
+  "local_evidence": [
+    {
+      "path": "artifacts/live_probe_20260907_144141/report.json",
+      "bytes": 958,
+      "sha256": "15d46f305fc46456d34c3ebc20c2640b694440c8b058a8e5d48188e7f22d3662"
+    },
+    {
+      "path": "artifacts/live_probe_20260907_144141/analysis.json",
+      "bytes": 998,
+      "sha256": "2140084bb22ca96a9642d0d603f1cf0479c7a4b535a1ec3b4b7be5d841184540"
+    },
+    {
+      "path": "artifacts/live_probe_20260907_144141/frame_times.json",
+      "bytes": 173510,
+      "sha256": "9cb89df1498fe1e2cfdc830f54123a963a652741a473f2bf0b00f895a4c1193a"
+    },
+    {
+      "path": "artifacts/live_probe_20260907_144141/pump_readback_retry.json",
+      "bytes": 1821,
+      "sha256": "5b3d19b125d591270db99efe4456d55e8c59a877af0e5b8632cb1a86cc4d12e2"
+    },
+    {
+      "path": "artifacts/live_probe_20260907_144141/communication.log",
+      "bytes": 666,
+      "sha256": "1e8fe7691dce25fe5b7428d605d40daf467077d81d850ead311daf3743de1a00"
+    },
+    {
+      "path": "artifacts/live_probe_20260907_144141/pump_readback_retry.log",
+      "bytes": 1140,
+      "sha256": "e0223c596976ce3f911fd32148755765b49df667fa7ab4d6b3de917d050a0991"
+    },
+    {
+      "path": "artifacts/live_probe_20260907_144141/capture_lossless.avi",
+      "bytes": 97331318,
+      "sha256": "a75f471a19d98efca5e5a0370f6c074ba8a1dc9320b9cded6f14361ca702ffa6"
+    },
+    {
+      "path": "artifacts/live_probe_20260907_144141/frame_0500.png",
+      "bytes": 103642,
+      "sha256": "f89cdb879474acb766e844cb761f423837c49cedb0ef467595c59c7c0529f6e3"
+    }
+  ]
+}

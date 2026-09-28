@@ -120,6 +120,18 @@ class DirectPixelConvertParam(Structure):
     ]
 
 
+class DirectFloatValue(Structure):
+    """MVS ``MVCC_FLOATVALUE`` returned by ``MV_CC_GetFloatValue``."""
+
+    _fields_ = [
+        ("fCurValue", c_float),
+        ("fMax", c_float),
+        ("fMin", c_float),
+        ("fInc", c_float),
+        ("nReserved", c_uint * 4),
+    ]
+
+
 class DirectHikrobotDllCamera:
     backend_name = "hikrobot"
 
@@ -342,7 +354,9 @@ class DirectHikrobotDllCamera:
         return self._device.capabilities if self._device else _default_capabilities()
 
     def get_feature(self, name: str) -> Any:
-        del name
+        key = _feature_name(name)
+        if key in {"ExposureTime", "Gain", "AcquisitionFrameRate"}:
+            return self._get_float_value(key)
         return None
 
     def set_feature(self, name: str, value: Any) -> None:
@@ -411,6 +425,9 @@ class DirectHikrobotDllCamera:
         dll.MV_CC_SetIntValue.restype = c_int
         dll.MV_CC_SetFloatValue.argtypes = [c_void_p, c_char_p, c_float]
         dll.MV_CC_SetFloatValue.restype = c_int
+        if hasattr(dll, "MV_CC_GetFloatValue"):
+            dll.MV_CC_GetFloatValue.argtypes = [c_void_p, c_char_p, POINTER(DirectFloatValue)]
+            dll.MV_CC_GetFloatValue.restype = c_int
         if hasattr(dll, "MV_CC_SetBoolValue"):
             dll.MV_CC_SetBoolValue.argtypes = [c_void_p, c_char_p, c_bool]
             dll.MV_CC_SetBoolValue.restype = c_int
@@ -444,6 +461,16 @@ class DirectHikrobotDllCamera:
         ret = self._dll.MV_CC_SetFloatValue(self._handle, name.encode("ascii"), c_float(float(value)))
         if ret != 0 and raise_on_fail:
             raise CameraBackendError(f"MV_CC_SetFloatValue {name} failed: {_ret_hex(ret)}", int(ret))
+
+    def _get_float_value(self, name: str) -> float:
+        getter = getattr(self._dll, "MV_CC_GetFloatValue", None)
+        if getter is None:
+            raise CameraBackendError(f"MV_CC_GetFloatValue {name} is unavailable")
+        value = DirectFloatValue()
+        ret = getter(self._handle, name.encode("ascii"), byref(value))
+        if ret != 0:
+            raise CameraBackendError(f"MV_CC_GetFloatValue {name} failed: {_ret_hex(ret)}", int(ret))
+        return float(value.fCurValue)
 
     def _set_bool_value(self, name: str, value: bool, raise_on_fail: bool) -> None:
         setter = getattr(self._dll, "MV_CC_SetBoolValue", None)

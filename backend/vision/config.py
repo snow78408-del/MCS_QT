@@ -84,7 +84,8 @@ class DetectorConfig:
     generation_volume_correction: float = 1.0
     generation_center_band_ratio: float = 0.60
     generation_edge_mad_multiplier: float = 3.0
-    generation_min_length_ratio: float = 2.50
+    # Short complete plugs are valid candidates; outline checks reject texture.
+    generation_min_length_ratio: float = 0.50
     generation_max_length_ratio: float = 12.0
     generation_min_edge_separation_ratio: float = 0.12
     generation_min_profile_contrast_sigma: float = 0.35
@@ -94,6 +95,18 @@ class DetectorConfig:
     # capsule edges must persist between the menisci. This rejects the carrier
     # phase gap, which has the same two interfaces in the opposite order.
     generation_min_capsule_outline_ratio: float = 0.45
+    # The two capsule edges are located per column as the strongest transverse
+    # gradient row and the next strongest one at least
+    # ``generation_outline_gap_min_ratio`` duct widths away; their separation
+    # must then stay between the min and max ratios below.  Reading the
+    # outermost rows above the threshold instead follows the fixed walls and the
+    # background texture, whose separation is roughly twice the duct width, so
+    # every real low-contrast capsule was rejected on the outline gate.
+    # ``generation_outline_row_window_ratio`` restricts the search to that many
+    # duct widths either side of the band centre.
+    generation_outline_row_window_ratio: float = 0.70
+    generation_outline_gap_min_ratio: float = 0.55
+    generation_outline_gap_max_ratio: float = 1.45
     # Raw 8-bit contour contrast against BOTH adjacent carrier regions.
     # Enhancement alone must not turn background texture into a capsule.
     generation_min_raw_outline_contrast: float = 12.0

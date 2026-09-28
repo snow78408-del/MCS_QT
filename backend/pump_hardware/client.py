@@ -12,6 +12,7 @@ except Exception:  # pragma: no cover - runtime dependency
     serial = None
 
 from .config import PumpHardwareConfig, SerialConfig
+from ..device_lock import DeviceLock, normalize_port_key
 from . import protocol
 
 
@@ -53,6 +54,52 @@ class PumpClient:
         self._lock = threading.RLock()
         self._request_ids = count(1)
         self.connected_parity = serial_config.parity
+        # 设备独占锁：与串口连接同生命周期（打开前取，断开后放）。
+        self._device_lock: DeviceLock | None = None
+        self._owns_device_lock = False
+
+    @property
+    def device_lock_key(self) -> str:
+        """锁键只由串口标识决定，**不含泵地址**：同一串口上的不同地址仍是同一台设备。"""
+        return normalize_port_key(self.serial_config.port)
+
+    def _acquire_device_lock(self) -> None:
+        if self._device_lock is not None:
+            return
+        lock = DeviceLock(self.device_lock_key)
+        lock.acquire()
+        self._device_lock = lock
+        self._owns_device_lock = True
+        self.log(f"[CONNECT][LOCK] 已取得设备锁 {lock.path}")
+
+    def borrow_device_lock(self, lock: DeviceLock) -> None:
+        """Use a lock owned by a wider multi-device lifecycle.
+
+        The live capture session acquires pump and camera locks in one fixed
+        order before opening either device.  The client must therefore borrow
+        that already-held pump lock instead of trying to acquire it again.
+        """
+        if self._device_lock is not None:
+            raise PumpClientError("泵客户端已经绑定设备锁")
+        if lock.key != self.device_lock_key or not lock.held:
+            raise PumpClientError(
+                f"借用的设备锁与串口不匹配或尚未持有：expect={self.device_lock_key}, got={lock.key}")
+        self._device_lock = lock
+        self._owns_device_lock = False
+
+    def _release_device_lock(self) -> None:
+        lock, self._device_lock = self._device_lock, None
+        owns, self._owns_device_lock = self._owns_device_lock, False
+        if lock is None:
+            return
+        if not owns:
+            self.log(f"[CONNECT][LOCK] 借用设备锁由外层会话继续持有 {lock.path}")
+            return
+        try:
+            lock.release()
+            self.log(f"[CONNECT][LOCK] 已释放设备锁 {lock.path}")
+        except Exception as exc:  # 释放失败要报出来，不能吞
+            self.log(f"[CONNECT][LOCK][FAIL] 释放设备锁失败: {exc}")
 
     def log(self, msg: str) -> None:
         self._logger(msg)
@@ -82,34 +129,42 @@ class PumpClient:
             "N": serial.PARITY_NONE,
         }
 
-        last_err = None
-        for p in parities:
-            try:
-                self._ser = serial.Serial(
-                    port=self.serial_config.port,
-                    baudrate=int(self.serial_config.baudrate),
-                    bytesize=serial.EIGHTBITS,
-                    parity=parity_map[p],
-                    stopbits=serial.STOPBITS_ONE,
-                    timeout=float(self.serial_config.timeout),
-                    write_timeout=float(self.serial_config.write_timeout),
-                    xonxoff=False,
-                    rtscts=False,
-                    dsrdtr=False,
-                )
-                self.connected_parity = p
-                self._reset_input_only()
-                self.log(
-                    f"[CONNECT][OK] 串口已打开: {self.serial_config.port} @ {self.serial_config.baudrate}bps ({p})"
-                )
-                return
-            except Exception as e:
-                last_err = e
-                self._ser = None
-                self.log(f"[CONNECT][WARN] parity={p} 打开失败: {e}")
-        raise PumpClientError(f"串口打开失败: {last_err}")
+        # 锁与串口连接同生命周期：打开前取，连上才保留；任何失败路径都释放。
+        self._acquire_device_lock()
+        connected = False
+        try:
+            last_err = None
+            for p in parities:
+                try:
+                    self._ser = serial.Serial(
+                        port=self.serial_config.port,
+                        baudrate=int(self.serial_config.baudrate),
+                        bytesize=serial.EIGHTBITS,
+                        parity=parity_map[p],
+                        stopbits=serial.STOPBITS_ONE,
+                        timeout=float(self.serial_config.timeout),
+                        write_timeout=float(self.serial_config.write_timeout),
+                        xonxoff=False,
+                        rtscts=False,
+                        dsrdtr=False,
+                    )
+                    self.connected_parity = p
+                    self._reset_input_only()
+                    self.log(
+                        f"[CONNECT][OK] 串口已打开: {self.serial_config.port} @ {self.serial_config.baudrate}bps ({p})"
+                    )
+                    connected = True
+                    return
+                except Exception as e:
+                    last_err = e
+                    self._ser = None
+                    self.log(f"[CONNECT][WARN] parity={p} 打开失败: {e}")
+            raise PumpClientError(f"串口打开失败: {last_err}")
+        finally:
+            if not connected:
+                self._release_device_lock()
 
-    def disconnect(self) -> None:
+    def disconnect(self, *, preserve_borrowed_lock: bool = False) -> None:
         with self._lock:
             if self._ser is not None:
                 try:
@@ -117,6 +172,10 @@ class PumpClient:
                 except Exception:
                     pass
             self._ser = None
+            if preserve_borrowed_lock and self._device_lock is not None and not self._owns_device_lock:
+                self.log(f"[CONNECT][LOCK] 重新探测时保留外层会话设备锁 {self._device_lock.path}")
+                return
+            self._release_device_lock()
 
     def _require_open(self) -> None:
         if not self.is_connected():

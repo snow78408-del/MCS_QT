@@ -1,5 +1,72 @@
 # TODO
 
+## 状态口径
+
+本文件与交付文档统一使用四种状态，**不使用「全部完成」这类说法**：
+
+| 状态 | 含义 |
+| --- | --- |
+| **已实现** | 代码已落地，但未必有测试、也未必接进了调用路径 |
+| **mock 已验证** | 有测试覆盖，测试中未连接真实设备 |
+| **尚未接入** | 实现存在，但没有接到实际调用路径上 |
+| **实机未验证** | 没有任何真实设备上的证据 |
+
+## 采集安全与测量可信度（2026-09-20 复查整改）
+
+### §1 实机入口封印 —— mock 已验证
+`--replay`/`--live` 显式互斥；无参数只打印用法并退出（**旧行为会用默认 `q1=17.5/q2=5` 写泵参数并开泵跑 30 分钟**）；
+`--live` 必须加载填写完毕的会话计划并通过完整校验；`execution_enabled=true` 不能替代校验。
+测试用子进程哨兵证明**没有任何设备入口被调用**，另有自检保证哨兵有效。
+
+### §2 设备生命周期 —— 已实现 + mock 已验证；**尚未接入 `--live`**
+新增 `LiveCaptureSession`（依赖注入），顺序为「校验计划 → 取设备锁 → 连接并核验初始状态 → 配置相机并回读 →
+开始采集并存指令前基线 → 写泵参数并验证 → 启动并验证 → 有界运行 → 停泵并验证 → 关设备 → 释放锁」。
+「泵可能运行」标记在启动指令**之前**置位（旧实现放在回读成功之后，半成功会漏停泵）；停机失败记
+`STOP_UNVERIFIED` 并给出现场确认提示，不自动重启；原始异常与清理异常分开保存。
+**但 `--live` 入口还没接上这个会话，也没注入 `FrameFactsRecorder`。**
+
+### §3 采集事实与分析结果分离 —— 已实现 + mock 已验证；实机落盘**尚未接入**
+逐帧事实（硬件帧号／硬件时间戳／单位来源／曝光／丢包／裁剪／数据块索引）写 NDJSON，取不到或未被适配器
+填充的记 `null` 并附原因，**不把默认 0 当实测值**；逐命令记录另写 NDJSON。
+时间轴按窗口做资格检查：时间戳有限、**严格递增**、采样间隔均匀、设备帧号连续，不合格窗口直接拒绝；
+**速度一律用实测间隔换算**（不再用设定帧率），三种时钟（主机接收／墙钟／设备 ticks）分开记录、
+互不顶替，设备 ticks 因单位未知不得充当时间轴。
+
+### §4 速度与稳定性输出分离 —— 已实现 + mock 已验证
+复用 `offline_analysis.screen_velocity`；输出拆为候选像素位移／混叠状态与候选分支／独立约束及来源／
+条件选定速度／像素标定及来源／稳定性诊断。无独立约束时只能是 `ALIAS_UNRESOLVED`；从同一录像推断的流向
+不作独立证据；物理速度需要**通过校验的**像素标定记录（`--scale` 只能出像素域）；稳定窗口必须覆盖完整驻留
+时长且不得跨过无效样本（`0.8 × dwell` 折扣已废除）。始终 `control_authorized=False`。
+
+### §5 严格回读解析 —— 已实现 + mock 已验证
+单位码必须命中已知单位表（不再用 `.get(code, 1.0)` 默认倍率）；拒绝未知单位、非有限值、负容积、非正时间；
+`_verified_flow_actual()` 对**缺失回读**同样拒绝认定验证成功。
+
+### 设备互斥 —— 已实现 + mock 已验证（泵／相机连接入口）；脚本侧**尚未接入**
+`backend/device_lock.py`：OS 建议锁（非 PID 判活），锁目录**不随 `MCS_DATA_DIR` 变化**，
+进程内唯一持有者，句柄登记避免丢弃对象时静默丢锁，多设备固定顺序获取并在失败时回滚。
+接线位置：`PumpClient.connect()/disconnect()`（锁键＝规范化串口，**不含地址**）、
+`CameraManager.open_selected()/test_device()/close_selected()/_reconnect()`（锁键＝稳定设备标识）。
+跨进程竞争测试覆盖「主程序连接入口 vs 脚本」两个方向。
+
+### 安全相关的能力缺口（**实机未验证**，因此 `--live` 仍禁用）
+1. 采集会话与逐帧落盘尚未接进 `--live`。
+2. 会话计划里没有相机 `unique_id` 与泵串口/地址字段，无法核验「实测设备与计划一致」。
+3. 默认相机路径（legacy）不填硬件帧号、硬件时间戳与主机单调时钟，其 `frame_id` 是纯软件计数器、
+   **永不缺口**，因此实机运行既检不出丢帧、也拿不到可用时间轴。
+4. `direct` 只是**候选**实现，不能按适配器名称放行：其 `unique_id` 是 `HIKROBOT:DIRECT:{index}`
+   基于枚举序号，重枚举可能不稳定；须核验设备身份、时间信息、帧号、参数回读与记录能力后才能放开。
+5. 锁只在同一用户内共享（Windows `LOCALAPPDATA` / POSIX 按 uid 分目录），跨用户设备争用不在范围内。
+
+### 登记为后续整改（**不得称为已清理**）
+- `backend/vision/flow_locking.py` 的独立库 CLI 仍以默认标尺输出物理量：`main()` 在 `:838` 调用
+  `measure_flow(..., pixel_to_micron=args.scale, ...)`，而 `--scale` 默认 `1.725`、`--rate` 默认 `320`。
+- 界面占位比例 `frontend/qt_app.py` 的 `get("pixel_to_micron", 1.0)`（`:760`、`:815`、`:875`、`:876`）
+  用于**通道几何标定与预览**，与流量结论分开；`:876` 已带 `fallback_to_configured_scale` 标记，
+  `:760`/`:815` 没有——需要与有效标定状态显式区分。
+
+**尚未开展现场实验，也未提交 Git commit。**
+
 ## P1：需要优先处理
 
 - [ ] 补充 Qt 前端完整 GUI 生命周期测试：初始化、启动、暂停、恢复、停止、关闭窗口及后台任务退出顺序。
@@ -11,13 +78,18 @@
 - [ ] 清理 `frontend/pages/` 和 `frontend/components/` 中遗留的 Tkinter 页面与组件；确认无业务依赖后移出或删除。
 - [ ] 统一相机适配器体系，明确 `backend/vision/camera_adapters/` 与 `backend/vision/cameras/` 的唯一规范实现。
 - [ ] 隔离或归档 `backend/vision/legacy/` 下的旧脚本，避免旧模块被打包、导入或参与测试。
-- [ ] 修复并重构 `backend/orchestrator/flow.py` 中的旧流程骨架、TODO 和空实现，统一使用当前 `OrchestratorService`。
+- [x] 修复并重构 `backend/orchestrator/flow.py` 中的旧流程骨架、TODO 和空实现，统一使用当前 `OrchestratorService`。
+      —— 2026-09-20 核查：该文件全仓零引用（含测试；`orchestrator/__init__.py` 未导出 `SystemFlow`），
+      102 行里 17 处 TODO 且 `run_control_step` 为空实现。**直接删除，无需重构迁移。**
 - [ ] 增加 orchestrator 公共生命周期 API 的完整测试：`configure()`、`prepare_video()`、`initialize_system()`、`start()`、`pause()`、`resume()`、`stop()`、`get_snapshot()`。
 - [ ] 增加相机适配器契约测试，确保各厂商后端不会虚假声明可读/可写能力。
 
 ## 文档与环境
 
-- [ ] 统一 README、开发指南和脚本中的 Python 命令，明确使用 `.venv/bin/python`。
+- [ ] 核对 README、开发指南和脚本中的 Python 命令路径与目标平台是否一致。
+      **注意方向**：本机是 Windows，虚拟环境解释器为 `.venv\Scripts\python.exe`，`.venv\bin` 不存在。
+      原条目要求「统一使用 `.venv/bin/python`」在 Windows 上是错的，照做会把 `README.md:64-70` 那段唯一正确的
+      Windows 命令改坏。若项目同时存在 Linux 环境，应分别标注两条路径，而不是统一成一条。
 - [ ] 明确 `harvesters` 等可选/必需依赖及其对应后端，完善启动时的分命令依赖检查。
 - [ ] 记录 Linux、Windows、无显示器环境下的支持范围和测试矩阵。
 
@@ -29,6 +101,7 @@
 
 ## 当前基线
 
-- 最近一次测试：`117 passed, 5 subtests passed`
+- 最近一次测试：`693 passed, 6 subtests passed in 88.94s`
+  （2026-09-20 实测：`.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider`；旧记录 `117 passed` 已过期）
 - 当前修改尚未提交 Git commit。
 - 以上事项为重构修复后的剩余工作，不代表已在本轮全部实现。

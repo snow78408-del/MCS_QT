@@ -20,6 +20,15 @@ from .models import FrameSnapshot, RecognitionSnapshot, validate_control_batch
 from backend.vision.line_counter import ContinuousLineCounter
 
 INDUSTRIAL_CAMERA_BACKENDS = {"hikrobot", "basler", "daheng", "flir", "allied_vision", "gentl"}
+
+
+def _geometry_version() -> str:
+    """定位几何的版本号；几何实现变化时标尺的已验证范围随之作废。"""
+    from backend.vision.parallel_walls import GEOMETRY_VERSION
+
+    return GEOMETRY_VERSION
+
+
 PREVIEW_MAX_WIDTH = 640
 PREVIEW_MAX_HEIGHT = 480
 PREVIEW_TARGET_INTERVAL_S = 1.0 / 30.0
@@ -181,6 +190,23 @@ class PipelineVisionService:
         self._calibration_metadata: dict[str, Any] = {}
         self._channel_calibration_enabled = False
         self._channel_width_um = 50.0
+        self._generation_measurement_enabled = False
+        self._scale_validated = False
+        self._scale_declared = False
+        self._scale_scope: dict[str, Any] | None = None
+        self._localization_enabled = False
+        self._strict_detection_localization = False
+        # 定位模式的变更记录：模式切换必须可查询，不能让几何更新把它静默改掉。
+        self._localization_mode_revision = 0
+        self._localization_mode_change: dict[str, Any] | None = None
+        self._localizer = None
+        self._localization_work_scale = 1.0
+        self._camera_unique_id = ""
+        self._scale_scope_change: dict[str, Any] | None = None
+        self._last_localization_observation: dict[str, Any] | None = None
+        self._chip_depth_um: float | None = None
+        self._chip_depth_source = "unknown"
+        self._chip_depth_validated = False
         self._channel_width_px: float | None = None
         self._channel_calibration_status = "disabled"
         self._channel_calibration_confidence = 0.0
@@ -558,6 +584,57 @@ class PipelineVisionService:
             )
             return replace(self._latest)
 
+    def set_localization_mode(self, *, strict: bool, enabled: bool | None = None,
+                              reason: str = "") -> dict:
+        """显式切换当前帧定位模式。**这是唯一能改变定位模式的公开接口。**
+
+        为什么必须独立成接口：``set_recognition_roi`` 是 ROI 的**完整几何配置**，
+        而定位模式是模式开关。两者原先混在一个字典里，几何更新一带上缺省的 False
+        就把严格定位静默关掉。模式开关必须有自己会被记录的入口。
+
+        ``strict=True`` 隐含 ``enabled=True``。``strict=False`` 且 ``enabled=None``
+        表示只关严格定位、保留 ``enabled`` 原值。返回切换后的
+        :meth:`localization_mode_state`，供调用方与审计查询。
+        """
+        strict_value = bool(strict)
+        if strict_value:
+            if enabled is not None and not enabled:
+                raise ValueError("strict 定位要求 enabled 为真")
+            enabled_value = True
+        elif enabled is None:
+            enabled_value = bool(self._localization_enabled)
+        else:
+            enabled_value = bool(enabled)
+        previous_strict = bool(self._strict_detection_localization)
+        previous_enabled = bool(self._localization_enabled)
+        self._strict_detection_localization = strict_value
+        self._localization_enabled = enabled_value
+        if strict_value:
+            self._line_counter.reset()
+        # localizer 的构建参数含 contrast_enhance=严格模式，模式一变必须重建。
+        self._localizer = None
+        self._localization_mode_revision += 1
+        self._localization_mode_change = {
+            "strict": strict_value,
+            "enabled": enabled_value,
+            "previous_strict": previous_strict,
+            "previous_enabled": previous_enabled,
+            "changed": (strict_value != previous_strict) or (enabled_value != previous_enabled),
+            "reason": str(reason),
+            "revision": int(self._localization_mode_revision),
+        }
+        return self.localization_mode_state()
+
+    def localization_mode_state(self) -> dict:
+        """当前定位模式与其最近一次变更（可查询状态）。"""
+        return {
+            "strict_detection_localization": bool(self._strict_detection_localization),
+            "localization_enabled": bool(self._localization_enabled),
+            "revision": int(self._localization_mode_revision),
+            "last_change": (dict(self._localization_mode_change)
+                            if self._localization_mode_change else None),
+        }
+
     def set_recognition_roi(self, roi: dict[str, Any] | None) -> None:
         pipeline = self._ensure_pipeline()
         config = pipeline.config.roi
@@ -603,6 +680,46 @@ class PipelineVisionService:
         self._channel_width_um = float(values.get("channel_width_um", 50.0))
         if self._channel_width_um <= 0.0:
             raise ValueError("框选区域实际高度必须大于 0 μm")
+        # 生成区物理测量的开关与证据声明。默认关闭、默认不承认标尺已验证：
+        # 打开即要求在采集路径上跑当前画面管壁核验，未通过就写出拒绝理由。
+        self._generation_measurement_enabled = bool(values.get("generation_measurement_enabled", False))
+        # 标尺的“已验证”只对它被声明时的成像/几何范围有效：相机或图像尺寸、定位几何
+        # 一变，这个布尔值就作废，必须重新声明，不能沿用成永久 valid。
+        self._scale_declared = bool(values.get("scale_validated", False))
+        self._scale_scope = None
+        # 范围作废期间不承认已验证：下一次测量会按新的成像范围重建范围。
+        self._scale_validated = False
+        # 定位模式**不在这里读**：它是模式开关，不是 ROI 几何。原先对缺失的
+        # ``strict_detection_localization`` 取默认 False，于是任何一次几何更新都会把
+        # 严格定位静默关掉（2026-09-24 修复的缺陷）。显式切换走 set_localization_mode()；
+        # 这里收到这两个键就直接报错，不留任何静默关闭路径。
+        for mode_key in ("localization_enabled", "strict_detection_localization"):
+            if mode_key in values:
+                raise ValueError(
+                    f"{mode_key} 不能经 set_recognition_roi 传递：ROI 局部更新不得改变定位模式，"
+                    "请改用 set_localization_mode()"
+                )
+        self._localization_work_scale = float(values.get("localization_work_scale", 1.0) or 1.0)
+        self._localizer = None
+        # 芯片深度是结构尺寸，图像里看不到，必须由调用者显式声明。
+        # 刻意**不**从 generation_channel_height_um 回退：那个字段带默认值，
+        # 把默认值当成“已声明深度”会让体积等效尺寸在没人声明深度时照常产出。
+        declared_depth = values.get("chip_depth_um")
+        try:
+            declared_depth = None if declared_depth in (None, "") else float(declared_depth)
+        except (TypeError, ValueError):
+            declared_depth = None
+        if declared_depth is None or not np.isfinite(declared_depth) or declared_depth <= 0.0:
+            self._chip_depth_um = None
+            self._chip_depth_source = "unknown"
+            self._chip_depth_validated = False
+        else:
+            from ..vision.rectified_measurement import DEPTH_SOURCES
+
+            self._chip_depth_um = declared_depth
+            source = str(values.get("chip_depth_source", "declared_chip_geometry"))
+            self._chip_depth_source = source if source in DEPTH_SOURCES else "unknown"
+            self._chip_depth_validated = bool(values.get("chip_depth_validated", False))
         if self._channel_calibration_enabled and not config.enabled:
             raise ValueError("启用已知高度标定前必须先启用并框选 ROI")
         detector = pipeline.config.detector
@@ -628,6 +745,205 @@ class PipelineVisionService:
             f"x={config.x_start_ratio:.3f}-{config.x_end_ratio:.3f} "
             f"y={config.y_start_ratio:.3f}-{config.y_end_ratio:.3f}"
         )
+
+    def declared_chip_depth(self) -> dict[str, Any]:
+        """公开读取本服务声明的芯片深度证据，供调用方与自己持有的声明核对。"""
+        return {
+            "depth_um": self._chip_depth_um,
+            "source": self._chip_depth_source,
+            "validated": bool(self._chip_depth_validated),
+        }
+
+    def generation_measurement_scale(self) -> dict[str, Any]:
+        """当前可用的标尺证据：来源、取值与是否已验证。"""
+        calibrated = self._channel_calibration_status == "calibrated"
+        return {
+            "um_per_px": float(self._pixel_to_micron),
+            "source": "channel_width_reference" if calibrated else "configured_optical",
+            "validated": bool(self._scale_validated),
+            "reference_um": float(self._channel_width_um) if calibrated else None,
+            "detail": (
+                f"status={self._channel_calibration_status} "
+                f"configured={self._configured_pixel_to_micron:.6f} "
+                f"scope={'established' if self._scale_scope else 'none'}"
+            ),
+        }
+
+    def _apply_evidence_scope(self, image_shape: tuple[int, int]) -> None:
+        """标尺验证状态按适用范围失效：范围变了就必须重新声明。
+
+        范围包含图像尺寸、相机标识与本模块的几何版本。任何一项变化都会把
+        ``scale_validated`` 退回 False，并在 ``_scale_scope_change`` 里记录原因。
+        """
+        scope = {
+            "image_shape": [int(image_shape[0]), int(image_shape[1])],
+            "camera": str(getattr(self, "_camera_unique_id", "") or ""),
+            "geometry_version": _geometry_version(),
+        }
+        change = None
+        if self._scale_scope is None:
+            if self._scale_declared:
+                self._scale_scope = scope
+        elif self._scale_scope != scope:
+            changed = [key for key in scope if self._scale_scope.get(key) != scope.get(key)]
+            change = {"changed": changed, "previous": dict(self._scale_scope), "current": dict(scope)}
+            self._scale_scope = scope
+            self._scale_declared = False
+            self._log(
+                "[VISION][GENERATION_MEASUREMENT][SCALE_SCOPE_CHANGED] "
+                f"changed={changed}；标尺验证状态已作废，需重新声明"
+            )
+        self._scale_validated = bool(self._scale_declared)
+        self._scale_scope_change = change
+
+    def localize_parallel_walls(self, frame, *, frame_id: int, capture_monotonic: float,
+                                region=None) -> dict[str, Any]:
+        """逐帧喂入平行管壁定位器并返回本帧观测（不产出可用几何）。"""
+        from ..vision.parallel_walls import ParallelWallLocalizer
+
+        if self._localizer is None:
+            self._localizer = ParallelWallLocalizer(
+                work_scale=self._localization_work_scale,
+                contrast_enhance=self._strict_detection_localization)
+        observation = self._localizer.observe(frame, frame_id=frame_id,
+                                              capture_monotonic=capture_monotonic, region=region)
+        self._last_localization_observation = observation
+        return observation
+
+    def current_wall_localization(self, *, now_monotonic: float | None = None) -> dict[str, Any]:
+        """聚合定位器缓冲，返回定位结果（含拒绝理由）。未启用时返回 None。"""
+        if self._localizer is None:
+            return None
+        return self._localizer.localize(now_monotonic=now_monotonic).to_dict()
+
+    def reset_wall_localization(self) -> None:
+        """清空定位证据。暂停/停止/换相机/改 ROI 时调用，避免复用旧几何。"""
+        localizer = getattr(self, "_localizer", None)
+        if localizer is not None:
+            localizer.reset()
+        self._last_localization_observation = None
+
+    def measure_generation_zone(
+        self,
+        frame,
+        *,
+        frame_id: int,
+        hardware_frame_id: int,
+        capture_monotonic: float,
+        time_source: str = "host_clock_proxy",
+        localization_frame_id: int | None = None,
+        wall_lines: list[dict[str, float]] | None = None,
+        wall_source: str = "reused",
+        wall_consistency: dict[str, Any] | None = None,
+        verify_walls_on_this_frame: bool = True,
+        duct_depth_um: float | None = None,
+        duct_depth_source: str | None = None,
+    ) -> dict[str, Any] | None:
+        """在原始帧上做生成区物理测量，并带上标尺、几何、帧身份与拒绝理由。
+
+        管壁来源由调用方决定：默认 ``wall_source="reused"`` 表示沿用配置里的
+        ``wall_lines``，此时必须在**这一帧**上跑核验，核验不通过就返回拒绝理由；
+        传入 ``wall_lines`` 可显式给出这一次要用的两条壁。
+
+        芯片深度只有调用方显式声明时才可用。``duct_depth_um`` 为 None 时**不**回退到
+        ``DetectorConfig`` 的默认尺寸——那个字段带默认值，把默认值当声明值会让体积
+        等效尺寸在没人声明深度时照常产出。未声明时只输出轴向长度。
+        """
+        from ..vision.rectified_measurement import (
+            FrameEvidence,
+            ScaleEvidence,
+            measure_generation_plugs,
+            verify_reused_walls,
+        )
+
+        selected_walls = [dict(line) for line in (wall_lines or self._counting_wall_lines or [])]
+        resolved_frame_id = int(frame_id)
+        image_shape = (0, 0)
+        if hasattr(frame, "shape"):
+            shape = frame.shape[:2]
+            image_shape = (int(shape[1]), int(shape[0]))
+        self._apply_evidence_scope(image_shape)
+        scale_payload = self.generation_measurement_scale()
+
+        localization = None
+        localization_payload = None
+        if self._localization_enabled:
+            # 同一帧只能观测一次：重复喂入同一张图会把“管内在变”抹成零变化，
+            # 运动证据随即消失。调用方先观测过就复用它。
+            previous = self._last_localization_observation or {}
+            if int(previous.get("frame_id", -1)) != resolved_frame_id:
+                self.localize_parallel_walls(frame, frame_id=resolved_frame_id,
+                                            capture_monotonic=float(capture_monotonic))
+            localization_payload = self.current_wall_localization(
+                now_monotonic=float(capture_monotonic))
+            if localization_payload is not None:
+                from ..vision.parallel_walls import WallLocalization
+
+                localization = WallLocalization.from_geometry(
+                    localization_payload, localization_payload["status"],
+                    localization_payload["reason"])
+            if localization is None or not localization.usable:
+                reason = ("localization_not_ready" if localization_payload is None
+                          else f"localization_{localization_payload['status']}")
+                return {
+                    "valid": False, "reason": reason,
+                    "localization": localization_payload,
+                    "source": "vision_adapter.measure_generation_zone",
+                    "scale": scale_payload,
+                    "scale_scope_change": self._scale_scope_change,
+                }
+            selected_walls = localization.wall_lines
+
+        if len(selected_walls) != 2:
+            return {"valid": False, "reason": "wall_geometry_missing",
+                    "source": "vision_adapter.measure_generation_zone",
+                    "localization": localization_payload}
+
+        depth_um = self._chip_depth_um if duct_depth_um is None else float(duct_depth_um)
+        depth_source = self._chip_depth_source if duct_depth_source is None else str(duct_depth_source)
+
+        consistency = wall_consistency
+        if (localization is None and consistency is None
+                and str(wall_source) == "reused" and verify_walls_on_this_frame):
+            consistency = verify_reused_walls(frame, selected_walls, frame_id=resolved_frame_id)
+
+        result = measure_generation_plugs(
+            frame,
+            detector=self._ensure_pipeline().detector,
+            wall_lines=selected_walls,
+            localization=localization,
+            scale=ScaleEvidence(
+                um_per_px=scale_payload["um_per_px"],
+                source=scale_payload["source"],
+                validated=scale_payload["validated"],
+                reference_um=scale_payload["reference_um"],
+                detail=scale_payload["detail"],
+            ),
+            frame_evidence=FrameEvidence(
+                frame_id=resolved_frame_id,
+                hardware_frame_id=int(hardware_frame_id),
+                capture_monotonic=float(capture_monotonic),
+                localization_frame_id=int(
+                    resolved_frame_id if localization_frame_id is None else localization_frame_id
+                ),
+                time_source=str(time_source),
+            ),
+            duct_depth_um=None if depth_um is None else float(depth_um),
+            duct_depth_source="unknown" if depth_um is None else depth_source,
+            duct_depth_validated=(False if depth_um is None else bool(self._chip_depth_validated)),
+            duct_width_reference_um=(
+                self._channel_width_um if scale_payload["source"] == "channel_width_reference" else None
+            ),
+            wall_source=str(wall_source if localization is None else "localized"),
+            wall_consistency=consistency,
+        )
+        payload = result.to_dict()
+        payload["source"] = "vision_adapter.measure_generation_zone"
+        payload["wall_verification"] = consistency
+        payload["scale_scope_change"] = self._scale_scope_change
+        if localization_payload is not None:
+            payload["localization"] = localization_payload
+        return payload
 
     def _reset_channel_calibration(self) -> None:
         self._channel_width_px = None
@@ -1035,6 +1351,12 @@ class PipelineVisionService:
             self._video_source = str(video_source or "0")
             self._pixel_to_micron = float(pixel_to_micron) if float(pixel_to_micron) > 0 else 1.0
             self._configured_pixel_to_micron = self._pixel_to_micron
+            # 相机标识进入标尺的适用范围：换设备后旧标尺不再作数。
+            self._camera_unique_id = str(video_source or "")
+            # 换视频源等于换采集条件：旧的定位证据与标尺范围一起作废。
+            self.reset_wall_localization()
+            self._scale_scope = None
+            self._scale_validated = False
             self._last_processed_frame_id = 0
             self._last_processed_frame_timestamp = 0.0
             self._capture_frame_id = 0
@@ -1153,6 +1475,8 @@ class PipelineVisionService:
 
     def stop(self) -> None:
         self._stop_event.set()
+        # 定位证据与本次采集绑定：停止后不清空就可能被下一次会话的测量复用。
+        self.reset_wall_localization()
         worker = self._worker
         if worker is not None and worker.is_alive() and worker is not threading.current_thread():
             worker.join(timeout=1.0)
@@ -1290,17 +1614,33 @@ class PipelineVisionService:
             ))
         measurement_time = self._acquisition_time(acquisition_meta)
         with self._pipeline_lock:
-            with self._lock:
-                self._try_channel_calibration(frame)
-            result = self._ensure_pipeline().process_frame(frame, timestamp=measurement_time)
+            wall_kwargs: dict[str, Any] = {}
+            if self._strict_detection_localization:
+                resolved_frame_id = int(frame_id or 0)
+                self.localize_parallel_walls(frame, frame_id=resolved_frame_id,
+                                            capture_monotonic=measurement_time)
+                geometry = self.current_wall_localization(now_monotonic=measurement_time) or {}
+                usable = geometry.get("status") == "localized" and len(geometry.get("wall_lines", [])) == 2
+                wall_kwargs = {
+                    "current_wall_lines": geometry["wall_lines"] if usable else [],
+                    "wall_rejection_reason": str(geometry.get("reason", "localization_not_ready")),
+                }
+            if not self._strict_detection_localization:
+                with self._lock:
+                    self._try_channel_calibration(frame)
+            result = self._ensure_pipeline().process_frame(frame, timestamp=measurement_time,
+                                                           **wall_kwargs)
         observed_ids = {int(track_id) for track_id, _ in result.tracking.matched_pairs}
         observed_ids.update(int(track_id) for track_id in result.tracking.new_track_ids)
         with self._lock:
             sample_time = measurement_time
-            calibration_frame = self._ensure_pipeline().rectify_selected_channel(frame)
+            calibration_frame = (result.analysis_frame if self._strict_detection_localization
+                                 else self._ensure_pipeline().rectify_selected_channel(frame))
             if calibration_frame is None:
                 calibration_frame = frame
-            if self._ensure_pipeline().config.roi.enabled and not self._ensure_pipeline().config.roi.wall_lines:
+            if (not self._strict_detection_localization
+                    and self._ensure_pipeline().config.roi.enabled
+                    and not self._ensure_pipeline().config.roi.wall_lines):
                 frame_h, frame_w = frame.shape[:2]
                 x0, x1, y0, y1, crop_top = self._ensure_pipeline().config.roi.resolve(frame_w, frame_h)
                 calibration_frame = frame[y0 + crop_top : y1, x0:x1]
@@ -1373,20 +1713,30 @@ class PipelineVisionService:
         frame_meta = acquisition_meta
         capture_monotonic = measurement_time
         with self._lock:
-            for track_id, diameter_um in current_crossed_track_diameters.items():
-                self._calibration_crossing_events[int(track_id)] = (
-                    float(diameter_um),
-                    capture_monotonic,
-                    resolved_frame_id,
-                    int(control.period_id),
-                    control.crossed_track_sample_starts[int(track_id)],
-                )
+            # 启用新测量路径时**不再往校准过线缓存里写旧路径的尺寸**：那份缓存会进入
+            # 标定记录，混入旧口径的尺寸比缺数据更危险。
+            if not self._generation_measurement_enabled:
+                for track_id, diameter_um in current_crossed_track_diameters.items():
+                    self._calibration_crossing_events[int(track_id)] = (
+                        float(diameter_um),
+                        capture_monotonic,
+                        resolved_frame_id,
+                        int(control.period_id),
+                        control.crossed_track_sample_starts[int(track_id)],
+                    )
             while len(self._calibration_crossing_events) > 4000:
                 self._calibration_crossing_events.pop(next(iter(self._calibration_crossing_events)))
             calibration_events = dict(self._calibration_crossing_events)
         crossed_track_diameters = {track_id:item[0] for track_id,item in calibration_events.items()}
         crossed_track_capture_monotonic = {track_id:item[1] for track_id,item in calibration_events.items()}
         crossed_track_frame_ids = {track_id:item[2] for track_id,item in calibration_events.items()}
+        if self._generation_measurement_enabled:
+            # 新路径没有轨迹 ID，这些逐轨迹字段在新路径下没有对应语义，因此交给下游空值，
+            # 而不是让旧口径的尺寸继续流下去。
+            raw_frame_diameters = []
+            crossed_track_diameters = {}
+            crossed_track_capture_monotonic = {}
+            crossed_track_frame_ids = {}
         frequency = self._line_counter.window(control.window_start_time, control.window_end_time)
         calibrated = bool(self._calibration_metadata or self._channel_calibration_status == "calibrated")
         geometry = self._ensure_pipeline().config.detector
@@ -1396,8 +1746,54 @@ class PipelineVisionService:
                 geometry.generation_channel_width_um, geometry.generation_volume_correction,
             )
         ))
+        if self._strict_detection_localization and not self._generation_measurement_enabled:
+            quality_valid = False
+            frame_diameters = []
+            frame_avg_diameter = None
+            frame_diameter_std = None
+            frame_diameter_sum = 0.0
         quality_reason = ("每滴一个有效等效直径" if quality_valid else
                           "比例未标定：尺寸仅供预览" if not calibrated else "无有效尺寸数据或几何参数无效")
+        valid_size_sample_count = control.sample_size if quality_valid else 0
+        generation_measurement = None
+        if self._generation_measurement_enabled:
+            generation_measurement = self.measure_generation_zone(
+                frame,
+                frame_id=resolved_frame_id,
+                hardware_frame_id=int(frame_meta.get("hardware_frame_id", 0) or 0),
+                capture_monotonic=float(capture_monotonic),
+                time_source="host_clock_proxy",
+            )
+        # 启用新路径时，尺寸列与质量门槛由它决定：拒绝就写出空尺寸并标记为不可用，
+        # 不允许旧管线尺寸继续参与记录与标定。
+        if self._generation_measurement_enabled:
+            measurement = generation_measurement or {"valid": False, "reason": "not_evaluated"}
+            if not measurement.get("valid"):
+                quality_valid = False
+                quality_reason = f"生成区测量未通过：{measurement.get('reason')}"
+                frame_diameters = []
+                frame_avg_diameter = None
+                frame_diameter_std = None
+                frame_diameter_sum = 0.0
+                valid_size_sample_count = 0
+            elif not measurement.get("has_complete_plug"):
+                quality_valid = False
+                quality_reason = "生成区测量有效但没有完整柱塞"
+                frame_diameters = []
+                frame_avg_diameter = None
+                frame_diameter_std = None
+                frame_diameter_sum = 0.0
+                valid_size_sample_count = 0
+            else:
+                measured = [float(value) for value
+                            in measurement.get("equivalent_diameters_um", [])]
+                frame_diameters = measured
+                frame_avg_diameter = float(np.mean(measured)) if measured else None
+                frame_diameter_std = (float(np.std(measured)) if len(measured) > 1 else None)
+                frame_diameter_sum = float(np.sum(measured))
+                quality_valid = True
+                quality_reason = "生成区完整柱塞等效直径（定位+全分辨率扶正）"
+                valid_size_sample_count = int(measurement.get("complete_plug_count", 0) or 0)
         return RecognitionSnapshot(
             frame_droplet_count=active_count,
             total_droplet_count=total_count,
@@ -1456,9 +1852,11 @@ class PipelineVisionService:
             processing_completed_monotonic=time.monotonic(),
             current_frame_droplet_count=control.current_frame_droplet_count,
             window_passage_count=control.window_passage_count,
-            valid_size_sample_count=control.sample_size if quality_valid else 0,
+            valid_size_sample_count=(valid_size_sample_count if self._generation_measurement_enabled
+                                     else (control.sample_size if quality_valid else 0)),
             measurement_quality_valid=quality_valid,
             measurement_quality_reason=quality_reason,
+            generation_measurement=generation_measurement,
             pixel_to_micron=scale,
             scale_source=(
                 "generation_channel_width"
@@ -1798,8 +2196,10 @@ class PipelineVisionService:
                     frame_meta = dict(self._frame_metadata.get(int(frame_id), {}))
                 sequence_id = int(frame_meta.get("hardware_frame_id", 0) or frame_id)
                 measurement_time = self._acquisition_time(frame_meta)
-                self._line_counter.observe_frame(frame, sequence_id, measurement_time,
-                                                 self._counting_wall_lines, line_ratio=self._counting_line_ratio)
+                if not self._strict_detection_localization:
+                    self._line_counter.observe_frame(frame, sequence_id, measurement_time,
+                                                     self._counting_wall_lines,
+                                                     line_ratio=self._counting_line_ratio)
             except Exception as exc:
                 self._line_counter.reset()
                 self._log(f"[VISION][FREQUENCY][INVALID] {exc}")
@@ -1909,7 +2309,8 @@ class PipelineVisionService:
         return float(value)
 
     def _publish_video_frame(self, frame, frame_id: int, timestamp: float) -> None:
-        display_frame = self._ensure_pipeline().rectify_selected_channel(frame)
+        display_frame = (None if self._strict_detection_localization
+                         else self._ensure_pipeline().rectify_selected_channel(frame))
         if display_frame is None:
             display_frame = frame
         frame_jpeg, width, height = self._encode_jpeg(display_frame)

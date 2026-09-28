@@ -111,10 +111,22 @@ def test_body_outline_validation_does_not_depend_on_enhancement(monkeypatch) -> 
 
 def test_vectorized_outline_support_matches_column_reference() -> None:
     gradient = np.random.default_rng(4).uniform(0, 10, size=(35, 150))
+    # Row window is 4:31 for left=10, right=130, row_margin=4 and
+    # reference_width_px=30, which puts min/max gap at 16/44 px.
+    minimum_gap, maximum_gap, suppression = 16, 44, 8
     expected = 0
     for column in range(12, 128):
-        rows = np.flatnonzero(gradient[4:31, column] >= 8)
-        expected += int(len(rows) >= 2 and 5 <= rows[-1]-rows[0] <= 38)
+        rows = gradient[4:31, column]
+        strongest = int(np.argmax(rows))
+        if rows[strongest] < 8:
+            continue
+        partner = -1
+        for row in np.argsort(rows)[::-1]:
+            if abs(int(row) - strongest) >= suppression:
+                partner = int(row)
+                break
+        if minimum_gap <= abs(strongest - partner) <= maximum_gap:
+            expected += 1
     actual = DropletDetector._capsule_outline_support(
         gradient, left=10, right=130, row_margin=4, edge_threshold=8, reference_width_px=30)
     assert actual == expected / 116
@@ -176,7 +188,8 @@ def test_rejected_neighbour_is_excluded_from_carrier_reference(neighbour):
     left = -30 if neighbour == "partial" else 40
     cv2.rectangle(frame, (left, 7), (70, 32), 180, 2)
     cv2.rectangle(frame, (78, 7), (208, 32), 180, 2)
-    detector = DropletDetector(DetectorConfig(measurement_mode="generation_plug"), DebugConfig())
+    detector = DropletDetector(DetectorConfig(measurement_mode="generation_plug",
+                                             generation_min_length_ratio=2.5), DebugConfig())
     detector.configure_expected_diameter(100, 1.5)
     assert detector.detect(frame).plug_lengths_px == pytest.approx([134], abs=3)
 
@@ -188,3 +201,29 @@ def test_unresolved_carrier_gap_does_not_borrow_neighbour_pixels():
     detector = DropletDetector(DetectorConfig(measurement_mode="generation_plug"), DebugConfig())
     detector.configure_expected_diameter(100, 1.5)
     assert not detector.detect(frame).centers
+
+
+@pytest.mark.parametrize("inverted", [False, True])
+@pytest.mark.parametrize("vertical", [False, True])
+def test_weak_asymmetric_phase_capsules_are_not_the_carrier_gaps(inverted, vertical):
+    rows, columns = np.mgrid[:33, :500]
+    body = np.zeros((33, 500), np.float32)
+    for left, right in ((40, 180), (285, 440)):
+        cv2.rectangle(body, (left, 4), (right, 29), 1, -1)
+    axial = cv2.GaussianBlur(body[16:17], (0, 0), 2).ravel()
+    upper = np.exp(-((rows - 4) / 3) ** 2)
+    lower = np.exp(-((rows - 27) / 3) ** 2)
+    frame = 48 + (12 - 7 * axial) * upper + (-4 + 16 * axial) * lower
+    frame += np.random.default_rng(17).normal(0, .45, frame.shape)
+    frame = np.uint8(np.clip(frame, 0, 255))
+    if inverted:
+        frame = 255 - frame
+    if vertical:
+        frame = frame.T.copy()
+    detector = DropletDetector(DetectorConfig(measurement_mode="generation_plug",
+        generation_min_length_ratio=.9), DebugConfig())
+    detector.configure_expected_diameter(100, 50 / 33)
+    result = detector.detect(frame)
+    assert result.plug_lengths_px == pytest.approx([140, 155], abs=8)
+    axial_centers = [center[1 if vertical else 0] for center in result.centers]
+    assert axial_centers == pytest.approx([110, 362.5], abs=5)

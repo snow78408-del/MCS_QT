@@ -109,3 +109,9 @@ microfluidic-control
 - `backend/pid_control/`：PID 反馈控制逻辑（当前仅保留平均直径反馈链路）。
 - `backend/pump_hardware/`：泵硬件连接、下发与停机控制。
 - `backend/orchestrator/`：后端主流程耦合与状态调度入口。
+
+## 实验验证记录
+
+- [2026-09-19 周期液滴离线复算与使用边界](docs/offline_flow_review_20260919.md)：修复相位平均越界，保留速度混叠候选与异常窗口，附旧结果审计。
+- [2026-09-07 泵机与相机实机读取验证](docs/live_hardware_validation_20260907.md)：偶校验通信、12 秒采集、帧号缺口及待验证事项。
+- [2026-09-07 背景纹理误检离线验证](docs/background_texture_validation_20260907.md)。

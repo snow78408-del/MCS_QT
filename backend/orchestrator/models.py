@@ -151,6 +151,7 @@ class RecognitionSnapshot:
     valid_size_sample_count: int = 0
     measurement_quality_valid: bool = False
     measurement_quality_reason: str = "waiting for calibrated size measurements"
+    generation_measurement: dict[str, Any] | None = None
     pixel_to_micron: float = 0.0
     scale_source: str = "configured"
     channel_width_um: float | None = None

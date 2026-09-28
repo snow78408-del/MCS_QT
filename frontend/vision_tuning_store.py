@@ -118,6 +118,17 @@ class VisionTuningSettingsStore:
             values["generation_min_raw_outline_contrast"] = float(
                 getattr(defaults, "generation_min_raw_outline_contrast")
             )
+        # Files written before the capsule-outline rule changed predate the three
+        # geometric parameters that rule now reads. Without them the whole
+        # profile is rejected and every other tuned value is silently lost.
+        if section == "detector":
+            for name in (
+                "generation_outline_row_window_ratio",
+                "generation_outline_gap_min_ratio",
+                "generation_outline_gap_max_ratio",
+            ):
+                if name not in values:
+                    values[name] = float(getattr(defaults, name))
         if set(values) != expected:
             missing = sorted(expected - set(values))
             extra = sorted(set(values) - expected)

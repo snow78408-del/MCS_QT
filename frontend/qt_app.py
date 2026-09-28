@@ -992,10 +992,7 @@ class PlantCalibrationExperimentDialog(QDialog):
         form.addRow("未确认响应时最短等待",self.response_wait)
         form.addRow("低响应判定前观察等待",self.low_response_wait)
         form.addRow("稳定窗口最短持续时间",self.stability_duration)
-        self.maximum_attempts=QSpinBox(); self.maximum_attempts.setRange(1,5)
-        self.maximum_attempts.setValue(int(cfg.get("plant_calibration_maximum_attempts",3)))
-        form.addRow("自动辨识最多轮数",self.maximum_attempts)
-        completion_hint=QLabel("目标：PID 独立验证与 MPC 数据验证均通过才算成功。未通过自动延长观察并增加重复；每轮使用新验证数据，达到轮数上限则停泵保留诊断。")
+        completion_hint=QLabel("按设定次数采集一轮，再拟合 Q1/Q2 二次响应及动态参数。正反方向或弱响应不提前结束采集。PID 使用验证通过的工作点局部参数；全部原始数据保留用于 MPC 建模，不自动追加轮次。")
         completion_hint.setWordWrap(True); form.addRow("成功条件",completion_hint)
         self.single_pass_button=QPushButton("一次建模（8 组）")
         self.single_pass_button.setToolTip("建模正反方向各一次，保留两组独立验证；不改变等待、样本数或稳定阈值。正式重复性实验需另行增加重复数。")
@@ -1011,7 +1008,7 @@ class PlantCalibrationExperimentDialog(QDialog):
         self.config_scroll.setMinimumHeight(240)
         layout.addWidget(self.config_scroll,1)
         self._config_widgets=[*self.metadata.values(),self.continuous_phase_oil,self.surfactant_name,self.surfactant_concentration,self.surfactant_basis,self.aqueous_phase,self.temperature,self.channel_height,self.channel_width,self.volume_correction,self.q1_step,self.q2_step,self.repetitions,self.validation_repetitions,self.baseline_count,self.stable_count,self.response_limit,self.liveness_timeout,self.minimum_response,self.stability]
-        self._config_widgets.extend([self.baseline_wait,self.response_wait,self.low_response_wait,self.stability_duration,self.single_pass_button,self.maximum_attempts])
+        self._config_widgets.extend([self.baseline_wait,self.response_wait,self.low_response_wait,self.stability_duration,self.single_pass_button])
 
         status_box=QGroupBox("标定运行状态"); status_layout=QVBoxLayout(status_box)
         self.baseline_label=QLabel("当前基准流量：等待读取已验证的 Q1/Q2")
@@ -1061,7 +1058,7 @@ class PlantCalibrationExperimentDialog(QDialog):
 
     def _config(self):
         return PlantCalibrationExperimentConfig(
-            maximum_attempts=int(self.maximum_attempts.value()), require_mpc_validation=True,
+            maximum_attempts=1, require_mpc_validation=False,
             plant_id=self.metadata["plant_id"].text().strip(),chip_id=self.metadata["chip_id"].text().strip(),
             fluid_id=self.metadata["fluid_id"].text().strip(),pump_model=self.metadata["pump_model"].text().strip(),
             syringe_profile=self.metadata["syringe_profile"].text().strip(),q1_step=float(self.q1_step.value()),q2_step=float(self.q2_step.value()),
@@ -1173,7 +1170,7 @@ class PlantCalibrationExperimentDialog(QDialog):
             f"响应延迟：{result.record.response_delay_median_ms:.1f} ± {result.record.response_delay_uncertainty_ms:.1f} ms\n"
             f"Q1/Q2 对数直径灵敏度：{result.record.q1_log_diameter_sensitivity:.6f} / {result.record.q2_log_diameter_sensitivity:.6f}\n"
             f"FOPDT：τ={result.record.response_time_constant_ms:.1f} ms，拟合 MAE={result.record.model_fit_mae_um:.3f} μm，NRMSE={result.record.model_fit_nrmse:.3f}\n"
-            f"独立验证：MAE={result.record.validation_mae_um:.3f} μm，NRMSE={result.record.validation_nrmse:.3f}；PI {'已授权' if result.record.validated_for_pi else '未授权'}，MPC {'数据合格' if result.record.validated_for_mpc else '数据不足'}\n"
+            f"独立验证：MAE={result.record.validation_mae_um:.3f} μm，NRMSE={result.record.validation_nrmse:.3f}；PI {'已授权' if result.record.validated_for_pi else '未授权'}，MPC 当前模型 {'验证通过' if result.record.validated_for_mpc else '尚未通过；原始数据仍可建模'}\n"
             f"验证标准：MAE ≤ {result.config.validation_mae_limit_um:g} μm，NRMSE ≤ {result.config.validation_nrmse_limit:g}；观测数 {result.record.validation_sample_count}\n"
             f"{validation_details}\n{repeatability}\n"
             "稳定但未检测到响应不等于故障或零增益；验证未通过表示预测误差或证据不足，不能由此判断有空气。\n"
@@ -1193,9 +1190,9 @@ class PlantCalibrationExperimentDialog(QDialog):
         if "cancelled by a lifecycle transition" in str(exc) and state in {"PAUSED","STOPPED"}:
             QMessageBox.information(self,"标定已中止","自动标定已由暂停或停止操作中止，泵已进入安全状态。")
         elif status=="insufficient_response" and state=="STOPPED":
-            QMessageBox.information(self,"标定响应不足，需要重测",str(exc))
+            QMessageBox.information(self,"采集已结束：当前工作点尚不能整定 PID",str(exc))
         elif status=="validation_failed" and state=="STOPPED":
-            QMessageBox.information(self,"标定未成功：已达重试上限",str(exc))
+            QMessageBox.information(self,"标定未成功：独立验证未通过",str(exc))
         else:self.app.error("自动标定失败",str(exc))
 
     def _pause(self):

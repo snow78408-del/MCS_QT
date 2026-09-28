@@ -16,6 +16,7 @@ except Exception:
 from .base import BaseCameraAdapter, CameraBackendError
 from .models import CameraDeviceInfo, CameraDiscoveryResult, CameraStatus, CameraTestResult, FrameData
 from .registry import backend_sort_key, default_registry, device_dedupe_key
+from ...device_lock import DeviceLock, camera_lock_key
 
 
 class CameraManager:
@@ -39,6 +40,9 @@ class CameraManager:
         self._camera_config: dict[str, Any] = {}
         self._reconnecting = False
         self._reconnect_attempts = 0
+        # 相机设备独占锁：与连接同生命周期（open 前取，close 后放）。
+        self._device_lock: DeviceLock | None = None
+        self._device_lock_key: str = ""
 
     def discover_all_result(self) -> CameraDiscoveryResult:
         self.close_selected()
@@ -115,6 +119,33 @@ class CameraManager:
         )
         return device
 
+    def _acquire_device_lock(self, device: CameraDeviceInfo) -> None:
+        """按稳定设备标识获取相机独占锁；目标是别的设备时先释放原有的。
+
+        与泵一致：锁在真正 ``open`` 之前取得，连接关闭后释放。设备标识用 ``unique_id``
+        （含序列号时跨重连稳定），而**不是**适配器名或枚举序号。
+        """
+        key = camera_lock_key(device.unique_id)
+        if self._device_lock is not None and self._device_lock_key == key:
+            return
+        self._release_device_lock()
+        lock = DeviceLock(key)
+        lock.acquire()
+        self._device_lock = lock
+        self._device_lock_key = key
+        self._log(f"[CAMERA][LOCK] 已取得设备锁 {lock.path}")
+
+    def _release_device_lock(self) -> None:
+        lock, self._device_lock = self._device_lock, None
+        self._device_lock_key = ""
+        if lock is None:
+            return
+        try:
+            lock.release()
+            self._log(f"[CAMERA][LOCK] 已释放设备锁 {lock.path}")
+        except Exception as exc:  # 释放失败要报出来，不能吞
+            self._log(f"[CAMERA][LOCK][FAIL] 释放设备锁失败: {exc}")
+
     def _build_adapter(self, device: CameraDeviceInfo) -> BaseCameraAdapter:
         adapter_cls = self.registry.get_adapter_for_device(device, device.selected_backend)
         return adapter_cls(config=self.config, logger=self._log)
@@ -123,7 +154,12 @@ class CameraManager:
         device = self._require_selected()
         adapter = self._build_adapter(device)
         frames: list[FrameData] = []
+        # 管理器的连接若已持有同一设备的锁就借用，不再取第二把——同一设备只能有一个持有者。
+        borrowed = (self._device_lock is not None
+                    and self._device_lock_key == camera_lock_key(device.unique_id))
         try:
+            if not borrowed:
+                self._acquire_device_lock(device)
             self._log("[CAMERA][TEST] 请关闭厂商官方相机软件及其预览窗口，避免设备被独占。")
             adapter.open(device)
             caps = adapter.get_capabilities()
@@ -179,10 +215,19 @@ class CameraManager:
                 adapter.close()
             except Exception:
                 pass
+            if not borrowed:
+                self._release_device_lock()
 
     def open_selected(self) -> None:
         device = self._require_selected()
         adapter = self._build_adapter(device)
+        # 换设备时先关掉旧连接（并因此在关完之后释放旧设备的锁），避免出现
+        # 「旧设备锁已放开、句柄还开着」的窗口；然后再取新设备的锁。
+        if (self._device_lock is not None
+                and self._device_lock_key != camera_lock_key(device.unique_id)):
+            self.close_selected()
+        # 打开前先取设备锁：与连接同生命周期。打开失败时关闭适配器并释放锁，不留半开状态。
+        self._acquire_device_lock(device)
         try:
             adapter.open(device)
             with self._lock:
@@ -197,14 +242,23 @@ class CameraManager:
                 f"vendor={device.manufacturer} model={device.model} sn={device.serial_number} backend={device.selected_backend}"
             )
         except CameraBackendError as exc:
-            self._last_error = str(exc)
-            self._log(f"[CAMERA][OPEN][FAIL] backend={device.selected_backend} error={exc}")
+            self._fail_open(adapter, device, exc)
             raise
         except Exception as exc:
             logging.exception("camera open failed")
-            self._last_error = str(exc)
-            self._log(f"[CAMERA][OPEN][FAIL] backend={device.selected_backend} error={exc}")
+            self._fail_open(adapter, device, exc)
             raise
+
+    def _fail_open(self, adapter: BaseCameraAdapter, device: CameraDeviceInfo,
+                   exc: BaseException) -> None:
+        """打开失败：关闭可能半开的适配器并释放设备锁。"""
+        self._last_error = str(exc)
+        self._log(f"[CAMERA][OPEN][FAIL] backend={device.selected_backend} error={exc}")
+        try:
+            adapter.close()
+        except Exception:
+            pass
+        self._release_device_lock()
 
     def configure_selected(self, camera_config: dict[str, Any] | None = None) -> dict[str, Any]:
         adapter = self._require_adapter()
@@ -315,7 +369,12 @@ class CameraManager:
             self._camera_streaming = False
             self._latest_frame = FrameData(None, 0, 0.0)
         if adapter is not None:
-            adapter.close()
+            try:
+                adapter.close()
+            finally:
+                self._release_device_lock()
+        else:
+            self._release_device_lock()
 
     def _grab_loop(self) -> None:
         adapter = self._require_adapter()
@@ -415,6 +474,8 @@ class CameraManager:
             self._reconnecting = False
             self._camera_connected = False
             self._camera_streaming = False
+        # 重连彻底失败：已不再持有可用连接，锁必须释放，否则设备被无限期占住。
+        self._release_device_lock()
         return None
 
     def _require_selected(self) -> CameraDeviceInfo:

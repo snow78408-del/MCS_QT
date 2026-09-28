@@ -34,9 +34,11 @@ class RectifiedRoiTests(unittest.TestCase):
         config.roi.wall_lines = self.lines
         pipeline = VisionPipeline(config)
 
-        roi, offset = pipeline._apply_roi(self.frame)
+        # 第三个分量标明「这是扶正图」——检测参考几何只对扶正图有意义。
+        roi, offset, rectified = pipeline._apply_roi(self.frame)
 
         self.assertEqual(offset, (0, 0))
+        self.assertTrue(rectified)
         self.assertAlmostEqual(roi.shape[0], 165, delta=2)
         self.assertGreater(roi.shape[1], 600)
 

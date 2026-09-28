@@ -11,6 +11,8 @@ import numpy as np
 from .channel_region import ChannelRegionResult, detect_channel_region
 from .config import ChannelRegionConfig, DetectorConfig, DebugConfig
 from .detector import DetectionResult, DropletDetector
+from .rectified_measurement import detect_rectified_generation_plugs
+from .rectified_roi import rectify_channel_frame, rectify_lower_outer_band
 
 
 @dataclass(frozen=True)
@@ -185,10 +187,17 @@ def _inspect_generation_frame(
     detector: DropletDetector,
     config: DetectorConfig,
     pixel_to_micron: float,
+    outer_observation: np.ndarray | None = None,
+    rectified: bool = False,
 ) -> tuple[DetectionResult, list[PipelineStage]]:
     gray = detector._ensure_gray(detection_frame)
     trace: dict[str, object] = {}
-    result = detector._detect_generation_plugs(gray, trace)
+    if rectified:
+        result, trace = detect_rectified_generation_plugs(
+            gray, detector=detector, trace=trace,
+            outer_observation=outer_observation)
+    else:
+        result = detector.detect(gray, mode="generation_plug", trace=trace)
     flow_axis = str(trace["flow_axis"])
     band_start = int(trace["band_start"])
     band_size = int(trace["band_size"])
@@ -197,6 +206,7 @@ def _inspect_generation_frame(
     threshold = float(trace["gradient_threshold"])
     peak_indices = [int(value) for value in trace["peak_indices"]]
     intervals = [tuple(value) for value in trace["selected_intervals"]]
+    raw_shoulders = trace.get("interval_source") == "bounded_raw_shoulders"
     stages = [
         PipelineStage(
             "1. 生成区原始图像",
@@ -235,20 +245,23 @@ def _inspect_generation_frame(
         ),
         PipelineStage(
             "5. 弯月面配对与塞状液滴筛选",
-            "相邻弯月面只有同时满足长度、相内外对比和二维横向支撑，才登记为独立液滴；方向不一致或共享边缘不会放行。",
+            ("本帧使用上下双侧原灰度外边界定位完整液柱两端；截断液柱不计入。"
+             if raw_shoulders else
+             "相邻弯月面只有同时满足长度、相内外对比和二维横向支撑，才登记为独立液滴；方向不一致或共享边缘不会放行。"),
             _generation_pair_overlay(
                 detection_frame,
                 flow_axis=flow_axis,
                 intervals=intervals,
             ),
-            parameters=(
+            parameters=("双肩原灰度判据；有限端点延伸；管宽仍取内壁间距"
+                        if raw_shoulders else (
                 f"长度 {config.generation_min_length_ratio:g}–{config.generation_max_length_ratio:g}×管宽；"
                 f"对比 ≥ {config.generation_min_profile_contrast_sigma:g}σ；"
                 f"弯月面支撑 ≥ {config.generation_min_meniscus_support_ratio:g}；"
                 f"上下胶囊边缘覆盖 ≥ {config.generation_min_capsule_outline_ratio:g}；"
                 f"原图轮廓对比 ≥ {config.generation_min_raw_outline_contrast:g} 灰度级；"
                 f"极性 {config.generation_polarity}"
-            ),
+            )),
             statistics=f"有效配对 {len(result.centers)} 个",
         ),
         PipelineStage(
@@ -285,6 +298,8 @@ def inspect_frame(
     """Inspect channel calibration followed by the selected measurement model."""
     channel_stages: list[PipelineStage] = []
     detection_frame = frame
+    outer_observation = None
+    rectified = False
     if channel_config is not None:
         samples = list(channel_frames or [frame])
         channel_result = (
@@ -298,7 +313,14 @@ def inspect_frame(
         line_overlay = channel_result.line_overlay if channel_result.line_overlay is not None else frame.copy()
         region_overlay = channel_result.region_overlay if channel_result.region_overlay is not None else frame.copy()
         if channel_result.status == "calibrated" and channel_result.rectified_frame is not None:
-            detection_frame = channel_result.rectified_frame
+            if len(channel_result.wall_lines) == 2:
+                # The calibration result can contain a different sample's
+                # preview. Both inspection bands must come from this frame.
+                current_inner = rectify_channel_frame(frame, channel_result.wall_lines)
+                if current_inner is not None:
+                    detection_frame = current_inner
+                    rectified = True
+                    outer_observation = rectify_lower_outer_band(frame, channel_result.wall_lines)
         channel_stages = [
             PipelineStage(
                 "A1. 管道检定 · 原始大图",
@@ -346,6 +368,8 @@ def inspect_frame(
             detector,
             config,
             float(pixel_to_micron),
+            outer_observation=outer_observation,
+            rectified=rectified,
         )
         if channel_stages:
             stages = channel_stages + [

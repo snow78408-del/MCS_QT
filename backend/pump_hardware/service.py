@@ -7,7 +7,8 @@ from typing import Callable
 from . import protocol
 from .client import CommandMismatchError, FrameParseError, NoReplyError, PumpClient
 from .config import PumpHardwareConfig, SerialConfig
-from .invariants import effective_q1_q2_gap
+from ..device_lock import DeviceLockError
+from .invariants import effective_q1_q2_gap, q1_is_strictly_more_than_twice_q2
 from .models import (
     ChannelParams,
     FlowUpdateResult,
@@ -16,6 +17,24 @@ from .models import (
     RunState,
     SystemSetup,
 )
+
+
+class ChannelFlowParseError(ValueError):
+    """泵通道回读参数存在但无法解析（协议错位、字段损坏或单位码未知）。
+
+    与 ``None`` 严格区分：``None`` 表示**没有回读数据**，本异常表示
+    **回读数据存在但不可用**。回读校验路径必须用
+    ``flow_from_channel_params_strict``；若用宽松版本，调用方会把损坏回读
+    当成「无读数」而回退到指令值，使 ``_flow_matches`` 退化成自比恒真。
+    """
+
+
+class FlowReadbackUnavailableError(RuntimeError):
+    """没有回读数据，因此无法认定写入已通过验证。
+
+    指令值只能作为**指令**单独记录展示，不能拿来充当实测值——否则
+    ``_flow_matches(name, commanded, actual)`` 是拿指令值和它自己比，必然通过。
+    """
 
 
 class PumpHardwareService:
@@ -81,18 +100,75 @@ class PumpHardwareService:
     def _time_unit_to_min(cls, unit: int) -> float:
         return float(cls._TIME_UNIT_TO_MIN.get(int(unit), 1.0))
 
+    @staticmethod
+    def _unit_code(value: object, name: str) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError) as exc:
+            raise ChannelFlowParseError(f"{name} 不是整数单位码：{value!r}") from exc
+
+    @staticmethod
+    def _finite_number(value: object, name: str) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ChannelFlowParseError(f"{name} 不是数值：{value!r}") from exc
+        if not math.isfinite(number):
+            raise ChannelFlowParseError(f"{name} 不是有限值：{value!r}")
+        return number
+
     @classmethod
-    def flow_from_channel_params(cls, params: ChannelParams | None) -> float | None:
+    def _parse_channel_flow(cls, params: ChannelParams | None) -> float | None:
+        """把回读参数换算成 uL/min。
+
+        ``None`` 只表示**没有回读数据**；参数存在但不可用时抛 ``ChannelFlowParseError``。
+
+        单位码必须命中已知单位表：不允许走 ``.get(code, 1.0)`` 的默认倍率，否则未知单位
+        会被静默当成 1.0，流量可能差几个数量级。
+        """
         if params is None:
             return None
+        dispense_unit = cls._unit_code(params.dispense_unit, "dispense_unit")
+        infuse_unit = cls._unit_code(params.infuse_time_unit, "infuse_time_unit")
+        if dispense_unit not in cls._VOLUME_UNIT_TO_UL:
+            raise ChannelFlowParseError(f"未知容积单位码：{dispense_unit!r}")
+        if infuse_unit not in cls._TIME_UNIT_TO_MIN:
+            raise ChannelFlowParseError(f"未知时间单位码：{infuse_unit!r}")
+        dispense_value = cls._finite_number(params.dispense_value, "dispense_value")
+        infuse_value = cls._finite_number(params.infuse_time_value, "infuse_time_value")
+        if dispense_value < 0.0:
+            raise ChannelFlowParseError(f"回读容积为负：{dispense_value!r}")
+        if infuse_value <= 0.0:
+            raise ChannelFlowParseError(f"回读灌注时间为非正：{infuse_value!r}")
+        volume_ul = dispense_value * cls._VOLUME_UNIT_TO_UL[dispense_unit]
+        time_min = infuse_value * cls._TIME_UNIT_TO_MIN[infuse_unit]
+        if not math.isfinite(volume_ul) or not math.isfinite(time_min):
+            raise ChannelFlowParseError("回读换算中间量非有限")
+        if time_min <= 0.0:
+            raise ChannelFlowParseError(f"回读换算后的时间为非正：{time_min!r}")
+        flow = volume_ul / time_min
+        if not math.isfinite(flow) or flow < 0.0:
+            raise ChannelFlowParseError(f"回读换算结果非法：{flow!r}")
+        return flow
+
+    @classmethod
+    def flow_from_channel_params(cls, params: ChannelParams | None) -> float | None:
+        """宽松解析，仅供日志与展示：无回读和损坏回读都返回 None。
+
+        校验回读必须用 ``flow_from_channel_params_strict``。
+        """
         try:
-            volume_ul = float(params.dispense_value) * cls._volume_unit_to_ul(int(params.dispense_unit))
-            time_min = float(params.infuse_time_value) * cls._time_unit_to_min(int(params.infuse_time_unit))
-            if time_min <= 0.0:
-                return None
-            return volume_ul / time_min
-        except Exception:
+            return cls._parse_channel_flow(params)
+        except ChannelFlowParseError:
             return None
+
+    @classmethod
+    def flow_from_channel_params_strict(cls, params: ChannelParams | None) -> float | None:
+        """严格解析，供回读校验：``None`` 只表示没有回读数据。
+
+        参数存在但损坏时抛 ``ChannelFlowParseError``，避免调用方回退到指令值。
+        """
+        return cls._parse_channel_flow(params)
 
     @staticmethod
     def ul_min_to_nl_sec(flow_ul_min: float) -> float:
@@ -224,12 +300,19 @@ class PumpHardwareService:
 
         best_state = PumpConnectionState(serial_connected=False, comm_established=False, fully_ready=False)
         for parity in candidates:
-            self.client.disconnect()
+            self.client.disconnect(preserve_borrowed_lock=True)
             self.serial_config.parity = parity
             state = PumpConnectionState(serial_connected=False, comm_established=False, fully_ready=False)
             try:
                 self.client.connect()
                 state.serial_connected = self.client.is_connected()
+            except DeviceLockError as e:
+                # 设备被其他进程占用：换奇偶校验重试没有意义，立刻失败并保留真正的原因——
+                # 否则会被下面的分支记成「串口打开失败」，把设备互斥冲突掩盖掉。
+                state.failed["device_lock"] = str(e)
+                self.log(f"[CONNECT][BLOCKED] {e}")
+                self.connection_state = state
+                return state
             except Exception as e:
                 state.failed["serial"] = str(e)
                 self.log(f"[CONNECT][FAIL] parity={parity} {e}")
@@ -285,6 +368,10 @@ class PumpHardwareService:
         self.client.disconnect()
         self.connection_state = PumpConnectionState()
         self.log("[CONNECT][OK] 串口已断开")
+
+    def borrow_device_lock(self, lock) -> None:
+        """Bind a pump lock owned by an outer multi-device session."""
+        self.client.borrow_device_lock(lock)
 
     def read_rss(self) -> PumpOperationResult:
         try:
@@ -952,7 +1039,7 @@ class PumpHardwareService:
 
     def update_flow_while_running(self, q1: float, q2: float) -> FlowUpdateResult:
         transaction_started = time.monotonic()
-        self.log(f"[PUMP][UPDATE] 运行中参数更新: q1={q1:.6f}, q2={q2:.6f}")
+        self.log(f"[PUMP][UPDATE] 停泵后更新并重启: q1={q1:.6f}, q2={q2:.6f}")
         if not math.isfinite(float(q1)) or not math.isfinite(float(q2)) or float(q1) <= 0.0 or float(q2) <= 0.0:
             reason = "拒绝泵流量更新：Q1 和 Q2 必须为有限正数"
             self.log(f"[PUMP][UPDATE][REJECT] {reason}")
@@ -964,9 +1051,9 @@ class PumpHardwareService:
                 reason=reason,
             )
         min_gap = effective_q1_q2_gap(self.runtime_config.min_q1_q2_gap)
-        if float(q1) < float(q2) + min_gap:
+        if not q1_is_strictly_more_than_twice_q2(q1, q2):
             reason = (
-                f"拒绝泵流量更新：油相 Q1 必须至少比水相 Q2 大 {min_gap:.6f} uL/min；"
+                "拒绝泵流量更新：油相 Q1 必须严格大于水相 Q2 的 2 倍；"
                 f"当前 q1={float(q1):.6f}, q2={float(q2):.6f}"
             )
             self.log(f"[PUMP][UPDATE][REJECT] {reason}")
@@ -1011,10 +1098,10 @@ class PumpHardwareService:
         if (
             encoded_q1 is None
             or encoded_q2 is None
-            or encoded_q1 < encoded_q2 + min_gap
+            or not q1_is_strictly_more_than_twice_q2(encoded_q1, encoded_q2)
         ):
             reason = (
-                "拒绝泵流量更新：编码后的泵参数不能保持油相 Q1 严格大于水相 Q2；"
+                "拒绝泵流量更新：编码后的泵参数不能保持油相 Q1 严格大于水相 Q2 的 2 倍；"
                 f"encoded_q1={encoded_q1}, encoded_q2={encoded_q2}, min_gap={min_gap:.6f}"
             )
             self.log(f"[PUMP][UPDATE][REJECT] {reason}")
@@ -1035,7 +1122,44 @@ class PumpHardwareService:
             f"calc={self.flow_from_channel_params(p2) or 0.0:.6f}uL/min"
         )
 
-        wr1 = self.write_wsp_and_verify(1, p1)
+        # This pump accepts WSP readback while running, but the new infusion
+        # rate is latched only by a subsequent start. Never treat a successful
+        # parameter echo or a still-running RSE as proof of the new flow.
+        try:
+            stopped = self.stop_system_and_verify()
+        except Exception as exc:
+            stopped = PumpOperationResult(ok=False, error=f"停泵调用异常: {exc!r}")
+        if not stopped.ok:
+            reason = f"更新前停泵未核验，拒绝写参数: {stopped.reason or stopped.error}"
+            self.log(f"[PUMP][UPDATE][FAIL] {reason}")
+            return FlowUpdateResult(
+                ok=False, q1_ok=False, q2_ok=False, still_running=False,
+                reason=reason, safe_stop_verified=False,
+                command_started_monotonic=transaction_started,
+                readback_completed_monotonic=time.monotonic(),
+            )
+        self.log("[PUMP][UPDATE][STOPPED] 停泵回读通过，开始写参数")
+
+        # A Q2-only step should not spend several serial round trips rewriting
+        # unchanged CH1. Re-read it after the verified stop; skip WSP only when
+        # the stopped pump confirms the exact requested parameter profile.
+        q1_written = False
+        unchanged_q1 = None
+        if before_p1 is not None and before_p1 == p1:
+            try:
+                unchanged_q1 = self.read_rsp(1)
+            except Exception:
+                unchanged_q1 = None
+        if (unchanged_q1 is not None and unchanged_q1.ok
+                and unchanged_q1.parsed_reply == p1):
+            wr1 = unchanged_q1
+            self.log("[PUMP][UPDATE][CH1] 停泵后回读确认参数未变，省略重复写入")
+        else:
+            q1_written = True
+            try:
+                wr1 = self.write_wsp_and_verify(1, p1)
+            except Exception as exc:
+                wr1 = PumpOperationResult(ok=False, error=f"CH1 写入异常: {exc!r}")
         q1_ok = bool(wr1.ok)
         q1_error = None if wr1.ok else (wr1.reason or wr1.error or "Q1下发失败")
         if q1_ok:
@@ -1047,7 +1171,7 @@ class PumpHardwareService:
             0.0,
             float(getattr(self.runtime_config, "inter_channel_update_delay", 0.0)),
         )
-        if inter_channel_delay > 0.0:
+        if q1_written and inter_channel_delay > 0.0:
             time.sleep(inter_channel_delay)
 
         q2_attempts = max(
@@ -1055,25 +1179,41 @@ class PumpHardwareService:
             int(getattr(self.runtime_config, "q2_update_max_attempts", 1)),
         )
         wr2 = PumpOperationResult(ok=False, error="Q2 尚未写入")
+        q2_written = False
         if q1_ok:
-            for attempt in range(1, q2_attempts + 1):
-                wr2 = self.write_wsp_and_verify(2, p2)
-                if wr2.ok:
-                    if attempt > 1:
-                        self.log(f"[PUMP][Q2][RECOVERED] 第 {attempt} 次独立写入/回读成功")
-                    break
-                q2_attempt_error = wr2.reason or wr2.error or "Q2下发失败"
-                self.log(
-                    f"[PUMP][Q2][RETRY] 第 {attempt}/{q2_attempts} 次写入/回读失败: "
-                    f"{q2_attempt_error}"
-                )
-                if attempt < q2_attempts:
-                    time.sleep(
-                        max(
-                            0.0,
-                            float(getattr(self.runtime_config, "q2_update_retry_interval", 0.0)),
-                        )
+            unchanged_q2 = None
+            if before_p2 is not None and before_p2 == p2:
+                try:
+                    unchanged_q2 = self.read_rsp(2)
+                except Exception:
+                    unchanged_q2 = None
+            if (unchanged_q2 is not None and unchanged_q2.ok
+                    and unchanged_q2.parsed_reply == p2):
+                wr2 = unchanged_q2
+                self.log("[PUMP][UPDATE][CH2] 停泵后回读确认参数未变，省略重复写入")
+            else:
+                q2_written = True
+                for attempt in range(1, q2_attempts + 1):
+                    try:
+                        wr2 = self.write_wsp_and_verify(2, p2)
+                    except Exception as exc:
+                        wr2 = PumpOperationResult(ok=False, error=f"CH2 写入异常: {exc!r}")
+                    if wr2.ok:
+                        if attempt > 1:
+                            self.log(f"[PUMP][Q2][RECOVERED] 第 {attempt} 次独立写入/回读成功")
+                        break
+                    q2_attempt_error = wr2.reason or wr2.error or "Q2下发失败"
+                    self.log(
+                        f"[PUMP][Q2][RETRY] 第 {attempt}/{q2_attempts} 次写入/回读失败: "
+                        f"{q2_attempt_error}"
                     )
+                    if attempt < q2_attempts:
+                        time.sleep(
+                            max(
+                                0.0,
+                                float(getattr(self.runtime_config, "q2_update_retry_interval", 0.0)),
+                            )
+                        )
         else:
             wr2 = PumpOperationResult(ok=False, error="Q1 未验证，禁止继续写入 Q2")
         q2_ok = bool(wr2.ok)
@@ -1083,19 +1223,21 @@ class PumpHardwareService:
         else:
             self.log(f"[PUMP][VERIFY][FAIL] CH2 参数回读校验失败: {q2_error}")
 
-        rs_after = self.read_run_state()
         still_running = False
         run_state_error = None
-        if not rs_after.ok or rs_after.parsed_reply is None:
-            run_state_error = rs_after.error or rs_after.reason or "更新后读取运行状态失败"
-            self.log(f"[PUMP][RUNSTATE][FAIL] {run_state_error}")
-        else:
-            still_running, running_reason = self.are_required_channels_running([1, 2], run_state=rs_after.parsed_reply)
+        if q1_ok and q2_ok:
+            try:
+                restarted = self.start_infusion_and_verify([1, 2])
+            except Exception as exc:
+                restarted = PumpOperationResult(ok=False, error=f"重新启动异常: {exc!r}")
+            still_running = bool(restarted.ok)
             if still_running:
-                self.log("[PUMP][RUNSTATE][OK] 参数更新后仍在灌注")
+                self.log("[PUMP][UPDATE][RESTARTED] 新参数写入后重新启动，运行态回读通过")
             else:
-                run_state_error = running_reason
-                self.log(f"[PUMP][RUNSTATE][FAIL] 参数更新后灌注状态异常: {run_state_error}")
+                run_state_error = restarted.reason or restarted.error or "重新启动未核验"
+                self.log(f"[PUMP][UPDATE][RESTART_FAIL] {run_state_error}")
+        else:
+            run_state_error = "参数写入未全部核验，禁止重新启动"
 
         ok = q1_ok and q2_ok and still_running
         reason_parts: list[str] = []
@@ -1111,14 +1253,17 @@ class PumpHardwareService:
             # The TS protocol cannot atomically commit two channels.  Treat a
             # partial result as a failed transaction: stop first, restore every
             # channel that may have changed, and deliberately remain stopped.
-            stop_result = self.stop_system_and_verify()
+            try:
+                stop_result = self.stop_system_and_verify()
+            except Exception as exc:
+                stop_result = PumpOperationResult(ok=False, error=f"失败后停泵异常: {exc!r}")
             safe_stop_verified = bool(stop_result.ok)
             rollback_errors: list[str] = []
             rollback_attempted = False
             if safe_stop_verified:
                 for channel, changed, previous in (
-                    (1, q1_ok, before_p1),
-                    (2, q2_ok, before_p2),
+                    (1, q1_written and q1_ok, before_p1),
+                    (2, q2_written and q2_ok, before_p2),
                 ):
                     if not changed:
                         continue
@@ -1126,12 +1271,18 @@ class PumpHardwareService:
                     if previous is None:
                         rollback_errors.append(f"CH{channel} 缺少事务前快照")
                         continue
-                    restored = self.write_wsp_and_verify(channel, previous)
+                    try:
+                        restored = self.write_wsp_and_verify(channel, previous)
+                    except Exception as exc:
+                        restored = PumpOperationResult(ok=False, error=f"CH{channel} 回滚异常: {exc!r}")
                     if not restored.ok:
                         rollback_errors.append(
                             f"CH{channel} 回滚失败:{restored.reason or restored.error}"
                         )
-                final_stop = self.stop_system_and_verify()
+                try:
+                    final_stop = self.stop_system_and_verify()
+                except Exception as exc:
+                    final_stop = PumpOperationResult(ok=False, error=f"回滚后停泵异常: {exc!r}")
                 safe_stop_verified = bool(final_stop.ok)
                 if not final_stop.ok:
                     rollback_errors.append(
@@ -1163,6 +1314,8 @@ class PumpHardwareService:
                 rolled_back=rolled_back,
                 rollback_error="；".join(rollback_errors) or None,
                 safe_stop_verified=safe_stop_verified,
+                stop_verified_before_write=True,
+                restart_verified=False,
                 command_started_monotonic=transaction_started,
                 readback_completed_monotonic=time.monotonic(),
             )
@@ -1179,6 +1332,8 @@ class PumpHardwareService:
             verified_q2=wr2.parsed_reply if wr2.ok else None,
             reason=reason,
             safe_stop_verified=False,
+            stop_verified_before_write=True,
+            restart_verified=True,
             command_started_monotonic=transaction_started,
             readback_completed_monotonic=time.monotonic(),
         )

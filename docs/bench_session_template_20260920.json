@@ -1,0 +1,74 @@
+{
+  "document_type": "planning_template_not_application_configuration",
+  "execution_enabled": false,
+  "session_id": null,
+  "operator": null,
+  "onsite_ready_record": null,
+  "apparatus": {
+    "chip_id": null,
+    "observation_site": null,
+    "pump_port": null,
+    "pump_address": null,
+    "pump_baudrate": 1200,
+    "pump_parity": "E",
+    "camera_unique_id": null,
+    "channel_phase_mapping_evidence": null,
+    "channel_width_um": null,
+    "channel_height_um": null,
+    "geometry_evidence": null,
+    "scale_um_per_px": null,
+    "scale_evidence": null,
+    "syringe_and_code_evidence": null,
+    "load_condition": null
+  },
+  "flow_plan": {
+    "baseline_q1_ul_min": null,
+    "baseline_q2_ul_min": null,
+    "q1_allowed_range_ul_min": null,
+    "q2_allowed_range_ul_min": null,
+    "delta_q1_ul_min": null,
+    "delta_q2_ul_min": null,
+    "max_step_ul_min": null,
+    "remaining_volume_each_ul": null,
+    "max_cumulative_delivery_each_ul": null,
+    "max_plunger_travel_each_mm": null,
+    "planned_repeats_per_direction": 3,
+    "automatic_refill": false
+  },
+  "capture_plan": {
+    "requested_fps": null,
+    "requested_exposure_us": null,
+    "camera_backend": null,
+    "timestamp_source_and_units": null,
+    "raw_recording_format": null,
+    "output_directory": null,
+    "required_free_space_bytes": null,
+    "max_no_valid_frame_s": null,
+    "max_backlog_frames": null
+  },
+  "termination": {
+    "max_segment_s": null,
+    "max_session_s": null,
+    "command_timeout_s": null,
+    "stop_timeout_s": null,
+    "max_stop_retries": null,
+    "physical_stop_method": null
+  },
+  "stability_criteria": {
+    "pilot_evidence": null,
+    "window_s": null,
+    "minimum_dwell_s": null,
+    "slope_limit_with_units": null,
+    "spread_limit_with_units": null,
+    "minimum_quality_fraction": null
+  },
+  "software_readiness": {
+    "code_hash": null,
+    "offline_test_log": null,
+    "start_ack_failure_stop_test_passed": false,
+    "timestamp_and_raw_capture_test_passed": false,
+    "stop_failure_test_passed": false
+  },
+  "steps": [],
+  "control_authorized": false
+}

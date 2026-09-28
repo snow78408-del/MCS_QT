@@ -40,6 +40,17 @@ temp/
 .camera_cache/
 *.sqlite3-journal
 
+# 测试/实验临时目录（默认 basetemp 不可用时 pytest 会在仓库根生成）
+pytest-cache-files-*/
+.test-*/
+.test_tmp/
+.tmp_pytest_*/
+test-artifacts/
+_trash_*/
+
+# 根目录落下的标定/训练产物（测试产生）
+/.plant-calibration-*.mpc-training.json
+
 # Coverage
 .coverage
 .coverage.*

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import math
+import uuid
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -72,8 +73,13 @@ class PlantCalibrationRecord:
     baseline_generation_frequency_hz: float = 0.0
     baseline_diameter_cv: float = 0.0
     flow_measurement_kind: str = "device_parameter_readback"
+    nonlinear_model: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
+        if self.nonlinear_model is not None:
+            from .nonlinear_calibration import validate_model
+
+            validate_model(self.nonlinear_model)
         if int(self.schema_version) not in {1, 2, 3}:
             raise ValueError("unsupported plant calibration schema_version")
         for name in (
@@ -221,10 +227,11 @@ class PlantCalibrationRecord:
                 raise ValueError("PI authorization requires independent validation samples")
             if self.validated_for_mpc and (
                 not self.validated_for_pi
-                or self.model_fit_method != "robust_fopdt_grid"
+                or self.model_fit_method not in {"robust_fopdt_grid", "quadratic_response_fopdt"}
+                or (self.model_fit_method == "quadratic_response_fopdt" and self.nonlinear_model is None)
             ):
                 raise ValueError("MPC authorization requires validated robust FOPDT fitting")
-            if self.model_fit_method not in {"legacy_threshold", "robust_fopdt_grid"}:
+            if self.model_fit_method not in {"legacy_threshold", "robust_fopdt_grid", "quadratic_response_fopdt"}:
                 raise ValueError("model_fit_method is invalid")
             if self.flow_measurement_kind not in {
                 "device_parameter_readback",
@@ -265,6 +272,124 @@ class PlantCalibrationRecord:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def build_calibration_record(
+    *,
+    config: Any,
+    session_id: str,
+    completed_at: datetime,
+    measurement_source: str,
+    response_delay_median_ms: float,
+    response_delay_uncertainty_ms: float,
+    diameter_sensitivity_um_per_output: float,
+    q1_control_sign: float,
+    q2_control_sign: float,
+    q1_output_gain: float,
+    q2_output_gain: float,
+    q1_min: float,
+    q1_max: float,
+    q2_min: float,
+    q2_max: float,
+    total_flow_max: float,
+    min_q1_q2_gap: float,
+    baseline_q1: float,
+    baseline_q2: float,
+    baseline_diameter_um: float,
+    q1_log_diameter_sensitivity: float,
+    q2_log_diameter_sensitivity: float,
+    response_time_constant_ms: float,
+    controller_kp: float,
+    controller_ki: float,
+    response_time_constant_uncertainty_ms: float,
+    q1_log_sensitivity_uncertainty: float,
+    q2_log_sensitivity_uncertainty: float,
+    model_fit_method: str,
+    model_fit_mae_um: float,
+    model_fit_nrmse: float,
+    validation_mae_um: float,
+    validation_nrmse: float,
+    validation_sample_count: int,
+    validated_for_pi: bool,
+    validated_for_mpc: bool,
+    q1_response_delay_ms: float,
+    q2_response_delay_ms: float,
+    baseline_generation_frequency_hz: float,
+    baseline_diameter_cv: float,
+    nonlinear_model: dict[str, Any] | None = None,
+) -> PlantCalibrationRecord:
+    """装配 schema_version=3 的标定记录。
+
+    两条辨识分支（FOPDT 线性增益与二次响应曲面）此前各自复制一份字段装配代码，
+    并因此漂移：二次分支漏建 per-channel 延迟与基线频次/CV，且 ``calibration_id``
+    不可回溯到具体运行。这里收敛成唯一一份实现。
+
+    最后四个字段是两条分支取值曾经不同的部分，因此**不设默认值**：调用方必须
+    显式决定传什么，无法再静默继承默认值——字段静默缺失正是当初漂移的成因。
+    """
+    stamp = completed_at.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    session_suffix = str(session_id)[:8] or uuid.uuid4().hex[:8]
+    return PlantCalibrationRecord(
+        schema_version=3,
+        calibration_id=f"plant-cal-{stamp}-{session_suffix}",
+        created_at=completed_at.isoformat(),
+        plant_id=str(config.plant_id).strip(),
+        chip_id=str(config.chip_id).strip(),
+        fluid_id=str(config.fluid_id).strip(),
+        pump_model=str(config.pump_model).strip(),
+        syringe_profile=str(config.syringe_profile).strip(),
+        response_delay_median_ms=float(response_delay_median_ms),
+        response_delay_uncertainty_ms=float(response_delay_uncertainty_ms),
+        diameter_sensitivity_um_per_output=float(diameter_sensitivity_um_per_output),
+        q1_control_sign=float(q1_control_sign),
+        q2_control_sign=float(q2_control_sign),
+        q1_output_gain=float(q1_output_gain),
+        q2_output_gain=float(q2_output_gain),
+        q1_min=float(q1_min),
+        q1_max=float(q1_max),
+        q2_min=float(q2_min),
+        q2_max=float(q2_max),
+        total_flow_max=float(total_flow_max),
+        min_q1_q2_gap=float(min_q1_q2_gap),
+        measurement_source=str(measurement_source),
+        measurement_region="generation",
+        channel_height_um=float(config.channel_height_um),
+        channel_width_um=float(config.channel_width_um),
+        volume_correction_factor=float(config.volume_correction_factor),
+        baseline_q1=float(baseline_q1),
+        baseline_q2=float(baseline_q2),
+        baseline_diameter_um=float(baseline_diameter_um),
+        q1_log_diameter_sensitivity=float(q1_log_diameter_sensitivity),
+        q2_log_diameter_sensitivity=float(q2_log_diameter_sensitivity),
+        sensitivity_allocation_regularization=float(config.sensitivity_allocation_regularization),
+        response_time_constant_ms=float(response_time_constant_ms),
+        controller_kp=float(controller_kp),
+        controller_ki=float(controller_ki),
+        controller_kd=0.0,
+        continuous_phase_oil=str(config.continuous_phase_oil).strip(),
+        surfactant_name=str(config.surfactant_name).strip(),
+        surfactant_concentration_percent=float(config.surfactant_concentration_percent),
+        surfactant_concentration_basis=str(config.surfactant_concentration_basis),
+        aqueous_phase=str(config.aqueous_phase).strip(),
+        temperature_c=float(config.temperature_c),
+        q1_response_delay_ms=float(q1_response_delay_ms),
+        q2_response_delay_ms=float(q2_response_delay_ms),
+        response_time_constant_uncertainty_ms=float(response_time_constant_uncertainty_ms),
+        q1_log_sensitivity_uncertainty=float(q1_log_sensitivity_uncertainty),
+        q2_log_sensitivity_uncertainty=float(q2_log_sensitivity_uncertainty),
+        model_fit_method=str(model_fit_method),
+        model_fit_mae_um=float(model_fit_mae_um),
+        model_fit_nrmse=float(model_fit_nrmse),
+        validation_mae_um=float(validation_mae_um),
+        validation_nrmse=float(validation_nrmse),
+        validation_sample_count=int(validation_sample_count),
+        validated_for_pi=bool(validated_for_pi),
+        validated_for_mpc=bool(validated_for_mpc),
+        baseline_generation_frequency_hz=float(baseline_generation_frequency_hz),
+        baseline_diameter_cv=float(baseline_diameter_cv),
+        flow_measurement_kind="device_parameter_readback",
+        nonlinear_model=nonlinear_model,
+    )
 
 
 def load_plant_calibration(path: str | Path) -> PlantCalibrationRecord:

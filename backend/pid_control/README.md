@@ -31,10 +31,29 @@ feedforward compensation itself.
 
 Supported modes:
 
-- `CLASSIC_PID`: fixed base `kp/ki/kd`, no feedforward.
+- `CLASSIC_PID`: fixed base `kp/ki/kd`.
 - `ADAPTIVE_PID`: bounded, interval-based `kp/ki/kd` adaptation.
-- `ADAPTIVE_PID_WITH_FEEDFORWARD`: adaptive PID plus disturbance-model
-  feedforward.
+- `ADAPTIVE_PID_WITH_FEEDFORWARD`: legacy combined selection, retained for old
+  callers. Explicit `disturbance_feedforward_enabled` overrides that selection
+  without changing the feedback mode; `target_feedforward_enabled` is separate.
+
+Production defaults both feedforward switches to false. A validated generation
+calibration still selects fixed PI (Kd=0); enabling target feedforward does not
+enable the old heuristic adaptation. The target compensator inverts the local
+log-diameter model along the existing Q1/Q2 allocation direction. It computes an
+absolute correction relative to the saved operating-point bias, so identical
+targets do not accumulate repeated flow increments. The requested target must
+be reachable inside the calibrated/local pump ranges, phase gap and total-flow
+limit; otherwise target feedforward is zero and bounded PI remains available.
+PI and both feedforward terms share the original saturation, step limits,
+anti-windup and speculative transaction commit path. Component outputs are
+requested corrections; the final pump command may be limited.
+
+The legacy disturbance gain has incompatible units with calibrated log-diameter
+control and remains blocked in that path, even when the independent switch is
+selected. A plant/target calibration does not authorize disturbance feedforward.
+Existing calibration, causal lead, freshness and confidence gates remain in
+place for the legacy compatible-unit path.
 
 Safety behavior is internal to this package:
 
@@ -66,7 +85,10 @@ Calibration observation horizons are persisted with experiment settings:
 `stability_duration_s=3`. These are operator-adjustable starting values, not
 identified pump constants. A confirmed onset permits response completion before
 the 30-second horizon, using a full stable window after both onset and transaction
-completion. Baseline waiting remains unchanged. The low-response horizon and
+completion. Baseline waiting has an independent optional `baseline_wait_s`
+(finite, nonnegative); omitted values retain `minimum_response_wait_s` for
+backward compatibility. Zero removes only the fixed wait, preserving stable
+sample gates. The low-response horizon and
 stable window run concurrently. Orchestration requires valid droplet counts
 and elapsed capture time before classifying a stable response; full transient
 curves remain available for fitting. The default is now 8 trials (6 modeling
@@ -74,3 +96,49 @@ steps plus 2 held-out validation steps), with one modeling repetition. Saved
 settings remain respected; the dialog offers an explicit single-pass preset.
 Validation thresholds are unchanged. Repeatability studies require additional
 repetitions; fewer trials do not establish equivalent identification precision.
+
+Identification now compares changes relative to each trial's own baseline in
+linear and log space. Between-trial baseline offsets are not actuator gain;
+unobserved drift during a trial is not corrected by this method. FOPDT fitting
+uses a mean of per-trial median normalized errors, giving each curve equal weight.
+Held-out validation does not set the baseline operating point or flow envelope.
+
+Only explicit legacy linear mode ends identification before validation when
+all combined trials lack a detected response. Default nonlinear mode completes
+the planned trials first. Failed/cancelled experiments archive
+completed measurements and the partial trial after safety cleanup in a non-loadable
+`incomplete_*.measurements.json`. Successful audits include `diagnostics` with
+response counts, repeated-direction changes, baseline spans and per-validation
+predicted/observed changes, MAE and NRMSE. No trials are discarded and authorization
+thresholds remain unchanged. A separate non-authorizing MPC dataset is also saved.
+
+## Validated delivery
+
+Default identification is `quadratic_response`: fit five scaled flow terms
+(Q1, Q2, Q1 squared, Q1*Q2, Q2 squared) to per-trial diameter changes, using
+feature differences between verified baseline and step flows. All training
+trials participate, including observations below the per-droplet onset threshold.
+Held-out validation never changes coefficients, dynamics, operating point or bounds.
+Dynamic curves fit a shared first-order lag and delay; this is a local empirical
+model, not a claim of a universal physical law. Local derivatives yield PI
+allocation and tuning; curvature restricts the deployment range.
+Rank deficiency, uncertain/zero local slopes or poor held-out prediction prevent
+PI authorization but preserve a separate MPC building dataset and fitted surface
+when available. Raw curves remain suitable for evaluating other black-box models.
+The explicit `legacy_local_linear` mode retains the previous API behavior.
+
+`maximum_attempts` defaults to 1; legacy values (1–5) remain readable, but the
+orchestrator always executes a single round. `require_mpc_validation` defaults
+to false. Desktop calibration requires PI qualification; explicit API callers
+may require MPC qualification too, without automatic retries.
+`accepted`/`require_accepted()` distinguish an internal
+candidate from success; export rejects unaccepted candidates before writing files.
+
+Accepted export writes the loadable JSON and `.measurements.json`, plus
+`.mpc-training.json` regardless of current MPC qualification. The package records
+`validated_for_mpc` without authorizing deployment. Training and held-out validation trials
+remain separate with flows, times, observations, conditions and units. Readback
+flows are device parameters, not independent physical measurements. This dataset
+supports subsequent MPC training, not deployment of an already trained controller.
+Formal JSON is written last. Failures retain non-loadable diagnostic measurements;
+they do not automatically restart or become a deployable PID calibration.

@@ -91,7 +91,7 @@ class DropletDetectorTests(unittest.TestCase):
         detector = DropletDetector(default_config().detector, default_config().debug)
 
         actual = detector._preprocess(image)
-        background = cv2.GaussianBlur(image, (0, 0), sigmaX=25, sigmaY=25)
+        background = cv2.boxFilter(image, -1, (151, 151))
         expected = cv2.addWeighted(image, 1.0, background, -1.0, 128)
         expected = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(expected)
         expected = cv2.GaussianBlur(expected, (7, 7), 1.4)

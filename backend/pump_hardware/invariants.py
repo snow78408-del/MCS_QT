@@ -6,6 +6,7 @@ import math
 # CH1 is the continuous oil phase and CH2 is the dispersed water phase. This
 # safety gap is deliberately not user-configurable.
 STRICT_Q1_Q2_GAP_UL_MIN = 0.2
+STRICT_Q1_Q2_RATIO = 2.0
 
 
 def effective_q1_q2_gap(configured_gap: float | None = None) -> float:
@@ -32,4 +33,21 @@ def q1_is_strictly_above_q2(
             q1_value >= minimum_q1
             or math.isclose(q1_value, minimum_q1, rel_tol=1e-12, abs_tol=1e-9)
         )
+    )
+
+
+def q1_is_strictly_more_than_twice_q2(q1: float, q2: float) -> bool:
+    """Return whether the fixed two-phase commissioning invariant is met.
+
+    The process-optimization bench plan requires a strict ``Q1 > 2 * Q2``
+    relationship.  Keep this invariant in the hardware package so callers
+    cannot weaken it with a runtime configuration value.
+    """
+    q1_value = float(q1)
+    q2_value = float(q2)
+    return bool(
+        math.isfinite(q1_value)
+        and math.isfinite(q2_value)
+        and q2_value > 0.0
+        and q1_value > STRICT_Q1_Q2_RATIO * q2_value
     )

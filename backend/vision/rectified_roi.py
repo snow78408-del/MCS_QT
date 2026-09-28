@@ -104,6 +104,62 @@ def rectify_channel_frame(
     )
 
 
+def rectify_lower_outer_band(
+    frame: np.ndarray,
+    wall_lines: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+) -> np.ndarray | None:
+    """Rectify the inner duct plus one duct width outside its lower wall.
+
+    The axial mapping is identical to :func:`rectify_channel_frame`. This
+    additional image is only for weak outer-outline evidence; its extra rows
+    must never be used as the physical duct width or scale reference.
+    """
+    if frame is None or getattr(frame, "size", 0) == 0:
+        return None
+    height, width = frame.shape[:2]
+    geometry = wall_line_quad(width, height, wall_lines)
+    if geometry is None:
+        return None
+    source, output_width, output_height = geometry
+    if abs(float(source[1, 0] - source[0, 0])) < abs(float(source[1, 1] - source[0, 1])):
+        return None
+    # wall_line_quad keeps the first input line's axial direction. Reversed
+    # endpoints can therefore make its first pair the physical lower wall.
+    # Orient the observation vertically by image y while keeping the same
+    # axial x mapping as the inner-wall rectification.
+    if float(np.mean(source[:2, 1])) <= float(np.mean(source[2:, 1])):
+        top_left, top_right = source[0], source[1]
+        bottom_right, bottom_left = source[2], source[3]
+    else:
+        top_left, top_right = source[3], source[2]
+        bottom_right, bottom_left = source[1], source[0]
+    expanded = np.array([
+        top_left, top_right,
+        bottom_right + bottom_right - top_right,
+        bottom_left + bottom_left - top_left,
+    ], dtype=np.float32)
+    # The final few rows may cross the sensor edge, but the lower-shoulder
+    # sampling band (at most about 80% of this extension) must remain visible.
+    shoulder_visible = np.array([
+        bottom_right + 0.75 * (bottom_right - top_right),
+        bottom_left + 0.75 * (bottom_left - top_left),
+    ], dtype=np.float32)
+    if (np.any(expanded[:, 0] < 0) or np.any(expanded[:, 0] >= width)
+            or np.any(np.asarray((top_left[1], top_right[1])) < 0)
+            or np.any(shoulder_visible[:, 1] >= height)):
+        return None
+    destination = np.array(
+        [[0, 0], [output_width - 1, 0],
+         [output_width - 1, 2 * output_height - 2], [0, 2 * output_height - 2]],
+        dtype=np.float32,
+    )
+    transform = cv2.getPerspectiveTransform(expanded, destination)
+    return cv2.warpPerspective(
+        frame, transform, (output_width, 2 * output_height - 1),
+        flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE,
+    )
+
+
 def wall_separation_px(
     width: int,
     height: int,

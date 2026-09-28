@@ -85,6 +85,8 @@ class FlowUpdateResult:
     rolled_back: bool = False
     rollback_error: str | None = None
     safe_stop_verified: bool = False
+    stop_verified_before_write: bool = False
+    restart_verified: bool = False
     command_started_monotonic: float = 0.0
     readback_completed_monotonic: float = 0.0
     physical_response_started_monotonic: float | None = None

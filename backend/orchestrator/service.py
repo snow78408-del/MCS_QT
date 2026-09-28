@@ -7,6 +7,7 @@ import threading
 import time
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
+from pathlib import Path
 from statistics import median
 from typing import Any, Callable
 
@@ -31,6 +32,7 @@ from ..pid_control import (
 )
 from ..pump_hardware import ChannelParams, PumpHardwareService
 from ..pump_hardware.models import FlowUpdateResult
+from ..pump_hardware.service import FlowReadbackUnavailableError
 from ..pump_hardware.invariants import effective_q1_q2_gap, q1_is_strictly_above_q2
 from .config import OrchestratorConfig
 from .drift import DriftSupervisor
@@ -307,6 +309,25 @@ class OrchestratorService:
     @staticmethod
     def _flow_from_channel_params(params: ChannelParams | None) -> float | None:
         return PumpHardwareService.flow_from_channel_params(params)
+
+    @staticmethod
+    def _flow_from_channel_params_strict(params: ChannelParams | None) -> float | None:
+        return PumpHardwareService.flow_from_channel_params_strict(params)
+
+    def _verified_flow_actual(self, params: ChannelParams | None, commanded: float) -> float:
+        """把泵回读换算成实际流量，供回读校验使用——**不允许**用指令值顶替。
+
+        回读**缺失**（``None``）或**损坏**都必须让校验失败。指令值只能作为「指令」
+        单独记录展示；拿它充当实测值会让 ``_flow_matches(name, commanded, actual)``
+        变成拿指令值和它自己比，校验恒真，于是写入被报告成「更新成功」——正是该校验
+        本该抓到的情形。
+        """
+        readback = self._flow_from_channel_params_strict(params)
+        if readback is None:
+            raise FlowReadbackUnavailableError(
+                f"泵回读数据缺失，无法认定写入已验证；指令值 {float(commanded):.6f} uL/min 仅供参考"
+            )
+        return float(readback)
 
     def _sync_pump_flow_readback(self, source: str, *, update_command: bool = True) -> bool:
         try:
@@ -885,8 +906,8 @@ class OrchestratorService:
             raise RuntimeError(
                 f"plant calibration flow update failed: {result.reason or result.rollback_error or 'unknown error'}"
             )
-        q1_actual = self._flow_from_channel_params(result.verified_q1) or float(q1)
-        q2_actual = self._flow_from_channel_params(result.verified_q2) or float(q2)
+        q1_actual = self._verified_flow_actual(result.verified_q1, q1)
+        q2_actual = self._verified_flow_actual(result.verified_q2, q2)
         ok1, reason1 = self._flow_matches("Q1", q1, q1_actual)
         ok2, reason2 = self._flow_matches("Q2", q2, q2_actual)
         if not (ok1 and ok2):
@@ -1280,7 +1301,7 @@ class OrchestratorService:
         started_at = datetime.now(timezone.utc).isoformat()
         measurements: list[PlantCalibrationMeasurement] = []
         attempt_history: list[dict[str, Any]] = []
-        requested_config = config
+        config = replace(config, maximum_attempts=1)
         try:
             token = self._safety.begin_session()
             self._run_token = token
@@ -1329,216 +1350,195 @@ class OrchestratorService:
                         token,
                     )
                 )
-            for attempt in range(1, requested_config.maximum_attempts + 1):
-                self._require_calibration_lifecycle(generation, token)
-                config = replace(
-                    requested_config,
-                    baseline_wait_s=min(3600.0, requested_config.effective_baseline_wait_s * (1.5 ** (attempt - 1))),
-                    minimum_response_wait_s=min(3600.0, requested_config.minimum_response_wait_s * (1.5 ** (attempt - 1))),
-                    low_response_wait_s=min(7200.0, requested_config.low_response_wait_s * (1.5 ** (attempt - 1))),
-                    repetitions=min(5, requested_config.repetitions + attempt - 1),
-                )
-                measurements = []
-                result = None
-                self._calibration_partial_trial = None
-                self._update_plant_calibration_experiment(
-                    attempt=attempt, maximum_attempts=requested_config.maximum_attempts,
-                    status="running", completed_trials=0,
-                    total_trials=config.repetitions * 6 + config.validation_repetitions * 2,
-                    phase=f"第 {attempt} 轮：重新建模及独立验证",
-                    reason="重试延长观察并增加重复，不扩大流量阶跃或放宽验证标准" if attempt > 1 else "",
-                )
-                try:
-                    single_targets = (
-                        ("q1", 1, baseline_q1 + config.q1_step, baseline_q2),
-                        ("q1", -1, baseline_q1 - config.q1_step, baseline_q2),
-                        ("q2", 1, baseline_q1, baseline_q2 + config.q2_step),
-                        ("q2", -1, baseline_q1, baseline_q2 - config.q2_step),
-                    )
-                    for _channel, _direction, q1, q2 in single_targets:
-                        self._validate_plant_calibration_target(q1, q2)
+            self._require_calibration_lifecycle(generation, token)
+            self._update_plant_calibration_experiment(
+                attempt=1, maximum_attempts=1,
+                status="running", completed_trials=0,
+                total_trials=config.repetitions * 6 + config.validation_repetitions * 2,
+                phase="执行本次建模及独立验证；不自动追加轮次",
+                reason="",
+            )
+            single_targets = (
+                ("q1", 1, baseline_q1 + config.q1_step, baseline_q2),
+                ("q1", -1, baseline_q1 - config.q1_step, baseline_q2),
+                ("q2", 1, baseline_q1, baseline_q2 + config.q2_step),
+                ("q2", -1, baseline_q1, baseline_q2 - config.q2_step),
+            )
+            for _channel, _direction, q1, q2 in single_targets:
+                self._validate_plant_calibration_target(q1, q2)
 
-                    completed = 0
-                    for repeat in range(int(config.repetitions)):
-                        directions = (1, -1) if repeat % 2 == 0 else (-1, 1)
-                        for channel in ("q1", "q2"):
-                            for direction in directions:
-                                q1 = baseline_q1 + (direction * config.q1_step if channel == "q1" else 0.0)
-                                q2 = baseline_q2 + (direction * config.q2_step if channel == "q2" else 0.0)
-                                trial_id = f"{channel}-r{repeat + 1}-{'plus' if direction > 0 else 'minus'}"
-                                self._update_plant_calibration_experiment(
-                                    phase=f"measuring {trial_id}",
-                                    current_trial=trial_id,
-                                )
-                                self._restore_plant_calibration_baseline(
-                                    baseline_q1=baseline_q1,
-                                    baseline_q2=baseline_q2,
-                                    generation=generation,
-                                    token=token,
-                                    next_trial_id=trial_id,
-                                )
-                                measurement = self._run_plant_calibration_trial(
-                                    config=config,
-                                    generation=generation,
-                                    token=token,
-                                    trial_id=trial_id,
-                                    channel=channel,
-                                    direction=direction,
-                                    baseline_q1=baseline_q1,
-                                    baseline_q2=baseline_q2,
-                                    commanded_q1=q1,
-                                    commanded_q2=q2,
-                                )
-                                measurements.append(measurement)
-                                self._log(
-                                    "[PLANT_CAL][MEASUREMENT] "
-                                    f"trial={measurement.trial_id} channel={measurement.channel} "
-                                    f"direction={measurement.direction:+d} "
-                                    f"baseline={measurement.baseline_diameter_um:.6f}um "
-                                    f"steady={measurement.steady_diameter_um:.6f}um "
-                                    f"delta={measurement.diameter_change_um:+.6f}um "
-                                    f"detected={measurement.response_detected} "
-                                    f"classification={measurement.response_classification}"
-                                )
-                                completed += 1
-                                self._update_plant_calibration_experiment(
-                                    completed_trials=completed,
-                                    measurement_count=len(measurements),
-                                )
-
-                    q1_sensitivity, q2_sensitivity = identify_channel_sensitivities(measurements)
-                    q1_sign = 1.0 if q1_sensitivity > 0.0 else -1.0 if q1_sensitivity < 0.0 else 0.0
-                    q2_sign = 1.0 if q2_sensitivity > 0.0 else -1.0 if q2_sensitivity < 0.0 else 0.0
-                    base_step = min(float(config.q1_step), float(config.q2_step))
-                    for direction in (-1, 1):
-                        self._validate_plant_calibration_target(
-                            baseline_q1 + direction * q1_sign * float(config.q1_step),
-                            baseline_q2 + direction * q2_sign * float(config.q2_step),
+            completed = 0
+            for repeat in range(int(config.repetitions)):
+                directions = (1, -1) if repeat % 2 == 0 else (-1, 1)
+                for channel in ("q1", "q2"):
+                    for direction in directions:
+                        q1 = baseline_q1 + (direction * config.q1_step if channel == "q1" else 0.0)
+                        q2 = baseline_q2 + (direction * config.q2_step if channel == "q2" else 0.0)
+                        trial_id = f"{channel}-r{repeat + 1}-{'plus' if direction > 0 else 'minus'}"
+                        self._update_plant_calibration_experiment(
+                            phase=f"measuring {trial_id}",
+                            current_trial=trial_id,
+                        )
+                        self._restore_plant_calibration_baseline(
+                            baseline_q1=baseline_q1,
+                            baseline_q2=baseline_q2,
+                            generation=generation,
+                            token=token,
+                            next_trial_id=trial_id,
+                        )
+                        measurement = self._run_plant_calibration_trial(
+                            config=config,
+                            generation=generation,
+                            token=token,
+                            trial_id=trial_id,
+                            channel=channel,
+                            direction=direction,
+                            baseline_q1=baseline_q1,
+                            baseline_q2=baseline_q2,
+                            commanded_q1=q1,
+                            commanded_q2=q2,
+                        )
+                        measurements.append(measurement)
+                        self._log(
+                            "[PLANT_CAL][MEASUREMENT] "
+                            f"trial={measurement.trial_id} channel={measurement.channel} "
+                            f"direction={measurement.direction:+d} "
+                            f"baseline={measurement.baseline_diameter_um:.6f}um "
+                            f"steady={measurement.steady_diameter_um:.6f}um "
+                            f"delta={measurement.diameter_change_um:+.6f}um "
+                            f"detected={measurement.response_detected} "
+                            f"classification={measurement.response_classification}"
+                        )
+                        completed += 1
+                        self._update_plant_calibration_experiment(
+                            completed_trials=completed,
+                            measurement_count=len(measurements),
                         )
 
-                    for repeat in range(int(config.repetitions)):
-                        directions = (1, -1) if repeat % 2 == 0 else (-1, 1)
-                        for direction in directions:
-                            q1 = baseline_q1 + direction * q1_sign * float(config.q1_step)
-                            q2 = baseline_q2 + direction * q2_sign * float(config.q2_step)
-                            trial_id = f"combined-r{repeat + 1}-{'plus' if direction > 0 else 'minus'}"
-                            self._update_plant_calibration_experiment(
-                                phase=f"measuring {trial_id}",
-                                current_trial=trial_id,
-                            )
-                            self._restore_plant_calibration_baseline(
-                                baseline_q1=baseline_q1,
-                                baseline_q2=baseline_q2,
-                                generation=generation,
-                                token=token,
-                                next_trial_id=trial_id,
-                            )
-                            measurement = self._run_plant_calibration_trial(
-                                config=config,
-                                generation=generation,
-                                token=token,
-                                trial_id=trial_id,
-                                channel="combined",
-                                direction=direction,
-                                baseline_q1=baseline_q1,
-                                baseline_q2=baseline_q2,
-                                commanded_q1=q1,
-                                commanded_q2=q2,
-                                actuator_step=direction * base_step,
-                            )
-                            measurements.append(measurement)
-                            self._log(
-                                "[PLANT_CAL][MEASUREMENT] "
-                                f"trial={measurement.trial_id} channel={measurement.channel} "
-                                f"direction={measurement.direction:+d} "
-                                f"baseline={measurement.baseline_diameter_um:.6f}um "
-                                f"steady={measurement.steady_diameter_um:.6f}um "
-                                f"delta={measurement.diameter_change_um:+.6f}um "
-                                f"detected={measurement.response_detected} "
-                                f"classification={measurement.response_classification}"
-                            )
-                            completed += 1
-                            self._update_plant_calibration_experiment(
-                                completed_trials=completed,
-                                measurement_count=len(measurements),
-                            )
+            if config.identification_model == "quadratic_response":
+                q1_sign, q2_sign = -1.0, 1.0
+            else:
+                q1_sensitivity, q2_sensitivity = identify_channel_sensitivities(measurements)
+                q1_sign = 1.0 if q1_sensitivity > 0.0 else -1.0 if q1_sensitivity < 0.0 else 0.0
+                q2_sign = 1.0 if q2_sensitivity > 0.0 else -1.0 if q2_sensitivity < 0.0 else 0.0
+            base_step = min(float(config.q1_step), float(config.q2_step))
+            for direction in (-1, 1):
+                self._validate_plant_calibration_target(
+                    baseline_q1 + direction * q1_sign * float(config.q1_step),
+                    baseline_q2 + direction * q2_sign * float(config.q2_step),
+                )
 
-                    validation_fraction = float(config.validation_step_fraction)
-                    validation_base_step = base_step * validation_fraction
-                    require_combined_response(measurements)
-                    for repeat in range(int(config.validation_repetitions)):
-                        directions = (1, -1) if repeat % 2 == 0 else (-1, 1)
-                        for direction in directions:
-                            q1 = (
-                                baseline_q1
-                                + direction * q1_sign * float(config.q1_step) * validation_fraction
-                            )
-                            q2 = (
-                                baseline_q2
-                                + direction * q2_sign * float(config.q2_step) * validation_fraction
-                            )
-                            self._validate_plant_calibration_target(q1, q2)
-                            trial_id = (
-                                f"validation-r{repeat + 1}-"
-                                f"{'plus' if direction > 0 else 'minus'}"
-                            )
-                            self._update_plant_calibration_experiment(
-                                phase=f"validating {trial_id}",
-                                current_trial=trial_id,
-                            )
-                            self._restore_plant_calibration_baseline(
-                                baseline_q1=baseline_q1,
-                                baseline_q2=baseline_q2,
-                                generation=generation,
-                                token=token,
-                                next_trial_id=trial_id,
-                            )
-                            measurement = self._run_plant_calibration_trial(
-                                config=config,
-                                generation=generation,
-                                token=token,
-                                trial_id=trial_id,
-                                channel="validation",
-                                direction=direction,
-                                baseline_q1=baseline_q1,
-                                baseline_q2=baseline_q2,
-                                commanded_q1=q1,
-                                commanded_q2=q2,
-                                actuator_step=direction * validation_base_step,
-                            )
-                            measurements.append(measurement)
-                            completed += 1
-                            self._update_plant_calibration_experiment(
-                                completed_trials=completed,
-                                measurement_count=len(measurements),
-                            )
-
-                    result = build_plant_calibration_result(
-                        config=config,
-                        measurements=measurements,
-                        session_id=token.session_id,
-                        started_at=started_at,
-                        q1_min=float(self.pid_config.q1_min),
-                        q1_max=float(self.pid_config.q1_max),
-                        q2_min=float(self.pid_config.q2_min),
-                        q2_max=float(self.pid_config.q2_max),
-                        total_flow_max=float(self.pid_config.total_flow_max),
-                        min_q1_q2_gap=float(self.pid_config.min_q1_q2_gap),
+            for repeat in range(int(config.repetitions)):
+                directions = (1, -1) if repeat % 2 == 0 else (-1, 1)
+                for direction in directions:
+                    q1 = baseline_q1 + direction * q1_sign * float(config.q1_step)
+                    q2 = baseline_q2 + direction * q2_sign * float(config.q2_step)
+                    trial_id = f"combined-r{repeat + 1}-{'plus' if direction > 0 else 'minus'}"
+                    self._update_plant_calibration_experiment(
+                        phase=f"measuring {trial_id}",
+                        current_trial=trial_id,
                     )
-                    result.require_accepted()
-                except CalibrationIdentificationError as exc:
-                    attempt_history.append({
-                        "attempt": attempt, "reason": str(exc), "config": config.to_dict(),
-                        "measurements": [item.to_dict() for item in measurements],
-                        "candidate_record": result.record.to_dict() if result is not None else None,
-                    })
-                    if attempt == requested_config.maximum_attempts:
-                        result = None
-                        raise
-                    self._require_calibration_lifecycle(generation, token)
-                    continue
-                result = replace(result, attempt_history=tuple(attempt_history))
-                break
+                    self._restore_plant_calibration_baseline(
+                        baseline_q1=baseline_q1,
+                        baseline_q2=baseline_q2,
+                        generation=generation,
+                        token=token,
+                        next_trial_id=trial_id,
+                    )
+                    measurement = self._run_plant_calibration_trial(
+                        config=config,
+                        generation=generation,
+                        token=token,
+                        trial_id=trial_id,
+                        channel="combined",
+                        direction=direction,
+                        baseline_q1=baseline_q1,
+                        baseline_q2=baseline_q2,
+                        commanded_q1=q1,
+                        commanded_q2=q2,
+                        actuator_step=direction * base_step,
+                    )
+                    measurements.append(measurement)
+                    self._log(
+                        "[PLANT_CAL][MEASUREMENT] "
+                        f"trial={measurement.trial_id} channel={measurement.channel} "
+                        f"direction={measurement.direction:+d} "
+                        f"baseline={measurement.baseline_diameter_um:.6f}um "
+                        f"steady={measurement.steady_diameter_um:.6f}um "
+                        f"delta={measurement.diameter_change_um:+.6f}um "
+                        f"detected={measurement.response_detected} "
+                        f"classification={measurement.response_classification}"
+                    )
+                    completed += 1
+                    self._update_plant_calibration_experiment(
+                        completed_trials=completed,
+                        measurement_count=len(measurements),
+                    )
+
+            validation_fraction = float(config.validation_step_fraction)
+            validation_base_step = base_step * validation_fraction
+            if config.identification_model == "legacy_local_linear":
+                require_combined_response(measurements)
+            for repeat in range(int(config.validation_repetitions)):
+                directions = (1, -1) if repeat % 2 == 0 else (-1, 1)
+                for direction in directions:
+                    q1 = (
+                        baseline_q1
+                        + direction * q1_sign * float(config.q1_step) * validation_fraction
+                    )
+                    q2 = (
+                        baseline_q2
+                        + direction * q2_sign * float(config.q2_step) * validation_fraction
+                    )
+                    self._validate_plant_calibration_target(q1, q2)
+                    trial_id = (
+                        f"validation-r{repeat + 1}-"
+                        f"{'plus' if direction > 0 else 'minus'}"
+                    )
+                    self._update_plant_calibration_experiment(
+                        phase=f"validating {trial_id}",
+                        current_trial=trial_id,
+                    )
+                    self._restore_plant_calibration_baseline(
+                        baseline_q1=baseline_q1,
+                        baseline_q2=baseline_q2,
+                        generation=generation,
+                        token=token,
+                        next_trial_id=trial_id,
+                    )
+                    measurement = self._run_plant_calibration_trial(
+                        config=config,
+                        generation=generation,
+                        token=token,
+                        trial_id=trial_id,
+                        channel="validation",
+                        direction=direction,
+                        baseline_q1=baseline_q1,
+                        baseline_q2=baseline_q2,
+                        commanded_q1=q1,
+                        commanded_q2=q2,
+                        actuator_step=direction * validation_base_step,
+                    )
+                    measurements.append(measurement)
+                    completed += 1
+                    self._update_plant_calibration_experiment(
+                        completed_trials=completed,
+                        measurement_count=len(measurements),
+                    )
+
+            result = build_plant_calibration_result(
+                config=config,
+                measurements=measurements,
+                session_id=token.session_id,
+                started_at=started_at,
+                q1_min=float(self.pid_config.q1_min),
+                q1_max=float(self.pid_config.q1_max),
+                q2_min=float(self.pid_config.q2_min),
+                q2_max=float(self.pid_config.q2_max),
+                total_flow_max=float(self.pid_config.total_flow_max),
+                min_q1_q2_gap=float(self.pid_config.min_q1_q2_gap),
+            )
+            result.require_accepted()
         except Exception as exc:
             failure = exc
         finally:
@@ -1585,7 +1585,7 @@ class OrchestratorService:
                     validation_failed = isinstance(failure, CalibrationValidationError) and stopped
                     self._update_plant_calibration_experiment(
                         status="validation_failed" if validation_failed else "insufficient_response" if insufficient else "failed",
-                        phase="已达重试上限，独立验证未通过" if validation_failed else "响应不足，需要重测" if insufficient else "failed",
+                        phase="独立验证未通过，已停止；请检查原因后手动重测" if validation_failed else "响应不足，需要重测" if insufficient else "failed",
                         reason=reason,
                     )
                     if insufficient:
@@ -1616,7 +1616,8 @@ class OrchestratorService:
                 except OSError as exc:
                     reason += f"\n测量记录保存失败：{exc}"
                 else:
-                    reason += f"\n测量数据已保存：{saved_path}\n此文件仅用于诊断，不能作为闭环标定加载。"
+                    training_path = Path(saved_path).with_name(f"{Path(saved_path).stem}.mpc-training.json")
+                    reason += f"\n测量数据已保存：{saved_path}\nMPC 建模数据：{training_path}\n未通过的记录不能作为闭环标定加载。"
                     self._update_plant_calibration_experiment(measurements_path=saved_path)
                 self._update_plant_calibration_experiment(reason=reason)
                 failure.args = (reason,)
@@ -1777,9 +1778,28 @@ class OrchestratorService:
             set_camera_parameters = getattr(self.vision_service, "set_camera_parameters", None)
             if callable(set_camera_parameters):
                 set_camera_parameters(dict(getattr(cfg, "camera_parameters", {}) or {}))
+            # 定位模式与 ROI 几何**分开**提交：模式经显式接口（会被记录），几何经 ROI。
+            # 混在同一个字典里会让几何更新把严格定位静默关掉（2026-09-24 修复的缺陷）。
+            saved_roi = dict(getattr(cfg, "recognition_roi", {}) or {})
+            roi_config = dict(saved_roi)
+            for mode_key in ("localization_enabled", "strict_detection_localization"):
+                roi_config.pop(mode_key, None)
             set_roi = getattr(self.vision_service, "set_recognition_roi", None)
             if callable(set_roi):
-                set_roi(dict(getattr(cfg, "recognition_roi", {}) or {}))
+                set_roi(roi_config)
+            set_mode = getattr(self.vision_service, "set_localization_mode", None)
+            if callable(set_mode):
+                live_source = str(getattr(cfg, "video_source_type", "")).lower() in {
+                    "camera", "realtime", "real_time", "live", "usb", "opencv",
+                    "hikrobot", "hikrobot_industrial_camera", "industrial_camera", "usb_camera",
+                }
+                declared_strict = bool(saved_roi.get("strict_detection_localization", False))
+                declared_enabled = bool(saved_roi.get("localization_enabled", False))
+                strict = bool(live_source or declared_strict)
+                set_mode(strict=strict,
+                         enabled=bool(strict or declared_enabled),
+                         reason=("prepare_video:video_source_type="
+                                 f"{getattr(cfg, 'video_source_type', '')!r}"))
             set_calibration = getattr(self.vision_service, "set_calibration_metadata", None)
             if callable(set_calibration):
                 set_calibration(dict(getattr(cfg, "calibration", {}) or {}))
@@ -1835,7 +1855,10 @@ class OrchestratorService:
                 SystemState.STOPPED,
             }:
                 raise RuntimeError("运行或标定过程中不能更改生成区几何参数")
+            # 几何更新只提交几何：定位模式不在本方法的作用域内，绝不因它而改变。
             roi = dict(self._cfg.recognition_roi or {})
+            for mode_key in ("localization_enabled", "strict_detection_localization"):
+                roi.pop(mode_key, None)
             roi.update(
                 {
                     "channel_width_um": values[1],
@@ -1848,6 +1871,27 @@ class OrchestratorService:
         setter = getattr(self.vision_service, "set_recognition_roi", None)
         if callable(setter):
             setter(roi)
+
+    def set_detection_localization_mode(self, *, strict: bool, enabled: bool | None = None,
+                                       reason: str = "") -> dict:
+        """显式切换当前帧定位模式。**这是唯一能改变定位模式的服务层接口。**
+
+        运行或标定过程中禁止切换；几何参数更新不得隐式改变定位模式。
+        返回切换后的模式状态（含最近一次变更），供前端与审计查询。
+        """
+        with self._lock:
+            state = self._state
+        if state in {SystemState.RUNNING, SystemState.CALIBRATING}:
+            raise RuntimeError("运行或标定过程中不能更改定位模式")
+        setter = getattr(self.vision_service, "set_localization_mode", None)
+        if not callable(setter):
+            raise AttributeError("vision_service 不支持显式定位模式切换")
+        return dict(setter(strict=strict, enabled=enabled, reason=reason) or {})
+
+    def detection_localization_mode(self) -> dict:
+        """查询当前定位模式与最近一次变更。"""
+        getter = getattr(self.vision_service, "localization_mode_state", None)
+        return dict(getter() or {}) if callable(getter) else {}
 
     def discover_cameras(self) -> dict[str, Any]:
         self._log("[CAMERA][CALLCHAIN] frontend -> orchestrator -> vision_service -> CameraManager")
@@ -4241,8 +4285,8 @@ class OrchestratorService:
             raise RuntimeError("BO pump command superseded by lifecycle transition")
         if not result.ok:
             raise RuntimeError(f"BO pump update failed: {result.reason or result.error}")
-        q1_actual = self._flow_from_channel_params(result.verified_q1) or float(q1)
-        q2_actual = self._flow_from_channel_params(result.verified_q2) or float(q2)
+        q1_actual = self._verified_flow_actual(result.verified_q1, q1)
+        q2_actual = self._verified_flow_actual(result.verified_q2, q2)
         ok1, reason1 = self._flow_matches("Q1", q1, q1_actual)
         ok2, reason2 = self._flow_matches("Q2", q2, q2_actual)
         if not (ok1 and ok2):
