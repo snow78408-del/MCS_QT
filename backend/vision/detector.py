@@ -8,14 +8,14 @@ import numpy as np
 
 try:
     from .config import DebugConfig, DetectorConfig
-    from .capsule_profile import (bounded_shoulder_intervals, capsule_intervals,
+    from .capsule_profile import (bounded_shoulder_intervals, calibrated_phase_intervals, capsule_intervals,
                                   dark_body_intervals, raw_outline_contrast,
                                   transverse_body_intervals,
                                   shoulder_phase_intervals)
     from .plug_geometry import equivalent_sphere_diameter_px
 except ImportError:
     from config import DebugConfig, DetectorConfig
-    from capsule_profile import (bounded_shoulder_intervals, capsule_intervals,
+    from capsule_profile import (bounded_shoulder_intervals, calibrated_phase_intervals, capsule_intervals,
                                  dark_body_intervals, raw_outline_contrast,
                                  transverse_body_intervals,
                                  shoulder_phase_intervals)
@@ -40,6 +40,12 @@ class DropletDetector:
         if not np.isfinite(config.generation_min_raw_outline_contrast) or not 0 < config.generation_min_raw_outline_contrast <= 255:
             raise ValueError("generation_min_raw_outline_contrast must be in (0, 255]")
         self._config = config
+        if config.generation_phase_mode not in {"auto", "transverse_bounded"}:
+            raise ValueError("unknown generation phase mode")
+        if (not np.isfinite(config.generation_phase_support_fraction)
+                or not 0 < config.generation_phase_support_fraction < .5):
+            raise ValueError("phase support fraction must be finite and in (0, .5)")
+        self._phase_length_history: list[float] = []
         self._debug = debug
         self._circle_offset_cache: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
         self._runtime_min_radius = max(1.0, float(config.min_radius))
@@ -233,7 +239,13 @@ class DropletDetector:
             int(round(reference_width_px * float(self._config.generation_min_edge_separation_ratio))),
         )
         peak_indices = self._local_profile_peaks(gradient, threshold, min_peak_gap)
-        min_length = reference_width_px * float(self._config.generation_min_length_ratio)
+        # This generation regime only accepts elongated plugs.  A contour
+        # fragment shorter than the observed transverse channel height cannot
+        # be reported as a complete droplet, even when a saved ratio is lower.
+        min_length = max(
+            reference_width_px,
+            reference_width_px * float(self._config.generation_min_length_ratio),
+        )
         max_length = reference_width_px * float(self._config.generation_max_length_ratio)
         profile_sigma = max(1.0, float(np.std(profile)))
         transverse_gradient = np.abs(np.gradient(corrected_float, axis=0))
@@ -284,11 +296,16 @@ class DropletDetector:
             if body_intervals is None else body_intervals
         )
         candidates: list[tuple[float, int, int, float, float]] = []
+        short_intervals_rejected: list[tuple[int, int, float]] = []
         for interval_index, (left, right) in enumerate(interval_pairs):
             if left <= 0 or right >= axial_size - 1:
                 continue
             length_px = float(right - left)
-            if length_px < min_length or length_px > max_length:
+            if length_px <= min_length:
+                if trace is not None:
+                    short_intervals_rejected.append((left, right, length_px))
+                continue
+            if length_px > max_length:
                 continue
             # Envelope intervals are ordered and disjoint. Exclude all nearby
             # bodies before size filtering so even partial neighbours cannot
@@ -423,18 +440,66 @@ class DropletDetector:
             selected = [(left, right, float(right - left))
                         for left, right in dark_selected]
             selected_outline_support = []
+        calibrated_phase = self._config.generation_phase_mode == "transverse_bounded"
+        phase_diagnostics: dict = {}
         transverse_selected = (transverse_body_intervals(working, reference_width_px)
                                if not dark_selected and flow_axis_source == "explicit"
                                and channel_width_px is not None else [])
+        if calibrated_phase:
+            # User-reviewed water/carrier ordering is authoritative. Never
+            # let centre brightness join two water bodies across a carrier gap,
+            # or let the generic contour fallback measure an unbroken thread.
+            transverse_selected = (calibrated_phase_intervals(
+                working, reference_width_px,
+                support_fraction=self._config.generation_phase_support_fraction,
+                diagnostics=phase_diagnostics)
+                if flow_axis_source == "explicit" and channel_width_px is not None else [])
+            dark_selected = []
+            shoulder_selected = []
+            selected = []
+            selected_outline_support = []
+            # A stable droplet train supplies a local size reference. A jump
+            # beyond the user's factor-of-two bound is unresolved, not a new
+            # size measurement or proof of absence. Do not learn from it.
+            phase_size_rejected = []
+            if self._phase_length_history:
+                reference = float(np.median(self._phase_length_history))
+                phase_size_rejected = [(a, b) for a, b in transverse_selected
+                                       if not .5 * reference <= b - a <= 2 * reference]
+                transverse_selected = [pair for pair in transverse_selected
+                                       if pair not in phase_size_rejected]
+            elif len(transverse_selected) < 2:
+                phase_size_rejected = list(transverse_selected)
+                transverse_selected = []
+            else:
+                lengths = [b - a for a, b in transverse_selected]
+                if max(lengths) > 2 * min(lengths):
+                    phase_size_rejected = list(transverse_selected)
+                    transverse_selected = []
+            self._phase_length_history.extend(b - a for a, b in transverse_selected)
+            self._phase_length_history = self._phase_length_history[-32:]
+        else:
+            phase_size_rejected = []
         if transverse_selected:
             selected = [(left, right, float(right - left))
                         for left, right in transverse_selected]
             selected_outline_support = []
 
+        short_intervals_rejected.extend(
+            interval for interval in selected if interval[2] <= min_length
+        )
+        if selected_outline_support:
+            selected_outline_support = [
+                support for interval, support in zip(selected, selected_outline_support)
+                if interval[2] > min_length
+            ]
+        selected = [interval for interval in selected if interval[2] > min_length]
+
         if trace is not None:
             trace.update(
                 {
                     "flow_axis": flow_axis,
+                    "phase_support_fraction": self._config.generation_phase_support_fraction,
                     "flow_axis_source": flow_axis_source,
                     "working": working,
                     "corrected": corrected,
@@ -445,12 +510,18 @@ class DropletDetector:
                     "gradient_threshold": threshold,
                     "peak_indices": peak_indices,
                     "selected_intervals": list(selected),
+                    "short_intervals_rejected": short_intervals_rejected,
                     "interval_source": ("dark_body_between_carrier_gaps" if dark_selected
+                                        else "calibrated_phase_outer_endpoints"
+                                        if calibrated_phase and transverse_selected
                                         else "transverse_body_between_carrier_gaps"
                                         if transverse_selected
+                                        else "transverse_phase_unresolved" if calibrated_phase
                                         else "bounded_raw_shoulders" if shoulder_selected
                                         else "generation_outline"),
                     "dark_body_intervals": dark_selected,
+                    "phase_size_rejected": phase_size_rejected,
+                    "phase_diagnostics": phase_diagnostics,
                     "outer_observation_used": bool(outer_observation is not None),
                     "reference_width_px": reference_width_px,
                     "reference_width_source": reference_width_source,

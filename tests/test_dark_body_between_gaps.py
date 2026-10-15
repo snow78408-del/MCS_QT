@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
+import backend.vision.detector as detector_module
 
 from backend.vision.capsule_profile import (dark_body_intervals,
                                            transverse_body_intervals)
@@ -84,3 +85,51 @@ def test_transverse_reversal_rejects_shared_illumination_stripes() -> None:
     x = np.arange(600, dtype=np.float32)
     image = np.uint8(np.tile(90.0 + 12.0 * np.sin(x / 25.0), (28, 1)))
     assert transverse_body_intervals(image, 27.0) == []
+
+
+def test_generation_rejects_intervals_no_longer_than_channel_height(monkeypatch) -> None:
+    frame = np.full((32, 220), 90, dtype=np.uint8)
+    monkeypatch.setattr(detector_module, "dark_body_intervals",
+                        lambda _frame, _width: [(20, 38), (80, 140)])
+    detector = DropletDetector(DetectorConfig(measurement_mode="generation_plug"),
+                               DebugConfig())
+    result, trace = detect_rectified_generation_plugs(frame, detector=detector)
+    assert trace["minimum_length_px"] == 31.0
+    assert trace["short_intervals_rejected"] == [(20, 38, 18.0)]
+    assert trace["selected_intervals"] == [(80, 140, 60.0)]
+    assert result.plug_lengths_px == [60.0]
+
+
+def test_user_review_frames_do_not_merge_droplets_or_measure_continuous_phase():
+    from pathlib import Path
+    root = Path(__file__).parent / "fixtures" / "phase_review"
+    detector = DropletDetector(DetectorConfig(
+        measurement_mode="generation_plug", generation_phase_mode="transverse_bounded"), DebugConfig())
+    # User-corrected outer menisci replace the former core-only 39--41 px
+    # expectations. Matching old algorithm output was not a validity test.
+    for index, expected in [(109, [(81, 148), (175, 241), (264, 330)]),
+                            (121, [(91, 149), (177, 245), (268, 336)]),
+                            (129, [(90, 154), (176, 240), (265, 329)])]:
+        frame = cv2.imread(str(root / f"channel_{index}.png"), cv2.IMREAD_GRAYSCALE)
+        result, trace = detect_rectified_generation_plugs(frame, detector=detector)
+        assert len(trace["selected_intervals"]) == len(expected)
+        for (a, b, _), (left, right) in zip(trace["selected_intervals"], expected):
+            assert abs(a - left) <= 10 and abs(b - right) <= 10
+            assert abs((b - a) - (right - left)) <= 10
+        assert trace["interval_source"] == "calibrated_phase_outer_endpoints"
+    for index in (188, 190, 195, 425):
+        frame = cv2.imread(str(root / f"channel_{index}.png"), cv2.IMREAD_GRAYSCALE)
+        result, trace = detect_rectified_generation_plugs(frame, detector=detector)
+        assert result.plug_lengths_px == []
+        assert trace["interval_source"] == "transverse_phase_unresolved"
+    assert detector._phase_length_history and max(detector._phase_length_history) < 90
+
+
+def test_calibrated_phase_does_not_fall_back_to_wrong_brightness_pairs(monkeypatch):
+    frame = np.full((28, 220), 90, dtype=np.uint8)
+    monkeypatch.setattr(detector_module, "dark_body_intervals", lambda *_: [(20, 180)])
+    detector = DropletDetector(DetectorConfig(
+        measurement_mode="generation_plug", generation_phase_mode="transverse_bounded"), DebugConfig())
+    result, trace = detect_rectified_generation_plugs(frame, detector=detector)
+    assert result.plug_lengths_px == []
+    assert trace["interval_source"] == "transverse_phase_unresolved"

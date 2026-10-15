@@ -4,6 +4,104 @@ import cv2
 import numpy as np
 
 
+def calibrated_phase_intervals(
+    gray: np.ndarray,
+    reference_width_px: float,
+    *,
+    support_fraction: float = .02,
+    diagnostics: dict | None = None,
+) -> list[tuple[int, int]]:
+    """Measure weak outer menisci for the user-calibrated imaging phase.
+
+    A zero crossing measures only the high-contrast body core. Recover the
+    outer support relative to each local carrier plateau instead. Both sides
+    must return to carrier; a strong centre/shoulder curvature in a flank is
+    evidence of a connected thread, not an isolated droplet endpoint.
+
+    Constants were calibrated on reviewed images, not per-frame coordinates.
+    This profile assumes the reviewed upper/lower phase ordering. Other
+    illumination or optics require new calibration; it is not phase agnostic.
+    """
+    if diagnostics is not None:
+        diagnostics.update(status="geometry_unusable", offset_gray=0.0)
+    if not np.isfinite(support_fraction) or not 0 < support_fraction < .5:
+        raise ValueError("phase support fraction must be finite and in (0, .5)")
+    if gray.ndim != 2:
+        raise ValueError("calibrated phase input must be grayscale")
+    height, width = gray.shape
+    channel = float(reference_width_px)
+    if (height < 18 or width < max(100, height * 3)
+            or not np.isfinite(channel) or not 14 <= channel <= height):
+        return []
+    upper = np.mean(gray[max(1, int(height * .08)):int(height * .25)], axis=0)
+    lower = np.mean(gray[int(height * .76):int(height * .94)], axis=0)
+    centre = np.mean(gray[int(height * .35):int(height * .65)], axis=0)
+    curvature = centre - (upper + lower) / 2
+    signal = cv2.GaussianBlur(
+        (lower - upper).astype(np.float32).reshape(1, -1), (0, 0), 2.0
+    ).ravel()
+    # A negative transverse illumination bias can hide otherwise resolved
+    # menisci below the absolute peak gate. Correct that bias without scaling
+    # contrast or moving relative-support endpoints. Do not centre positive
+    # offsets: a connected water thread can dominate the field and centring
+    # it would turn internal texture into artificial carrier gaps.
+    low, high = np.percentile(signal, [10, 90])
+    offset = min(0.0, float((low + high) / 2))
+    if diagnostics is not None:
+        diagnostics.update(status="phase_contrast_unresolved",
+                           contrast_span_gray=float(high - low), offset_gray=offset)
+    if high - low < 15.0:
+        return []
+    signal = signal - offset
+    # An unbroken jet can occupy most of the field while detached droplets
+    # coexist downstream. Establish carrier evidence around each candidate;
+    # the global phase occupancy does not locate the pinch-off boundary.
+    maxima = np.flatnonzero((signal[1:-1] >= signal[:-2])
+                           & (signal[1:-1] > signal[2:])
+                           & (signal[1:-1] > 8.0)) + 1
+    peaks: list[int] = []
+    for peak in sorted(maxima, key=lambda k: signal[k], reverse=True):
+        if all(abs(peak - previous) >= channel for previous in peaks):
+            peaks.append(int(peak))
+    peaks.sort()
+    intervals: list[tuple[int, int]] = []
+    reach = int(channel * 2.4)
+    for index, peak in enumerate(peaks):
+        lo = max(0, peak - reach,
+                 (peaks[index - 1] + peak) // 2 if index else 0)
+        hi = min(width - 1, peak + reach,
+                 (peaks[index + 1] + peak) // 2
+                 if index + 1 < len(peaks) else width - 1)
+        if lo >= peak or hi <= peak:
+            continue
+        left_floor = float(np.percentile(signal[lo:peak], 15))
+        right_floor = float(np.percentile(signal[peak + 1:hi + 1], 15))
+        if (max(left_floor, right_floor) > -5.0
+                or min(signal[peak] - left_floor, signal[peak] - right_floor) < 15.0):
+            continue
+        left, right = peak, peak
+        left_level = left_floor + support_fraction * (signal[peak] - left_floor)
+        right_level = right_floor + support_fraction * (signal[peak] - right_floor)
+        while left > lo and signal[left] > left_level:
+            left -= 1
+        while right < hi and signal[right] > right_level:
+            right += 1
+        # Require room to observe carrier on both sides, regardless of flow
+        # direction. This is an evidence margin, not a fixed formation zone.
+        flank_margin = max(3, int(np.ceil(channel * .2)))
+        if (left < flank_margin or right >= width - flank_margin
+                or left == lo or right == hi or not channel < right - left < channel * 4):
+            continue
+        if max(abs(float(np.median(curvature[max(0, left - 10):left]))),
+               abs(float(np.median(curvature[right:min(width, right + 10)])))) > 12.0:
+            continue
+        intervals.append((left, right))
+    if diagnostics is not None:
+        diagnostics.update(status="bounded_candidates" if intervals else "bounded_phase_unresolved",
+                           seed_count=len(peaks), bounded_count=len(intervals))
+    return intervals
+
+
 def dark_body_intervals(
     gray: np.ndarray,
     reference_width_px: float,
@@ -93,6 +191,8 @@ def dark_body_intervals(
 def transverse_body_intervals(
     gray: np.ndarray,
     reference_width_px: float,
+    *,
+    minimum_body_fraction: float = .65,
 ) -> list[tuple[int, int]]:
     """Find complete plugs when their centre has too little axial contrast.
 
@@ -129,7 +229,7 @@ def transverse_body_intervals(
             continue
         body = contrast[left:right]
         if (float(np.median(body)) > 8.0
-                and float(np.mean(body > 3.0)) >= .65):
+                and float(np.mean(body > 3.0)) >= minimum_body_fraction):
             intervals.append((left, right))
     return intervals
 

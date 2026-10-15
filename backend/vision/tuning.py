@@ -253,9 +253,10 @@ def _inspect_generation_frame(
                 flow_axis=flow_axis,
                 intervals=intervals,
             ),
-            parameters=("双肩原灰度判据；有限端点延伸；管宽仍取内壁间距"
+            parameters=("双肩原灰度判据；有限端点延伸；长度必须大于本帧管高"
                         if raw_shoulders else (
-                f"长度 {config.generation_min_length_ratio:g}–{config.generation_max_length_ratio:g}×管宽；"
+                f"长度 > max(本帧管高, {config.generation_min_length_ratio:g}×管宽)，"
+                f"且 ≤ {config.generation_max_length_ratio:g}×管宽；"
                 f"对比 ≥ {config.generation_min_profile_contrast_sigma:g}σ；"
                 f"弯月面支撑 ≥ {config.generation_min_meniscus_support_ratio:g}；"
                 f"上下胶囊边缘覆盖 ≥ {config.generation_min_capsule_outline_ratio:g}；"

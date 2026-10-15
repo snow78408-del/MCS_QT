@@ -66,6 +66,7 @@ MID_OFFSET_TOLERANCE_PX = 6.0
 """复用几何与当前画面中线位置的允许绝对偏差（像素）。"""
 
 TRACE_SUMMARY_KEYS = (
+    "phase_support_fraction",
     "flow_axis",
     "reference_width_px",
     "reference_width_source",
@@ -78,6 +79,8 @@ TRACE_SUMMARY_KEYS = (
     "body_intervals",
     "raw_outline_contrast_checks",
     "minimum_raw_outline_contrast",
+    "phase_diagnostics",
+    "phase_size_rejected",
 )
 """可从 trace 落盘的判据量。其余键含 numpy 数组，只供进程内诊断。"""
 

@@ -84,12 +84,20 @@ class DetectorConfig:
     generation_volume_correction: float = 1.0
     generation_center_band_ratio: float = 0.60
     generation_edge_mad_multiplier: float = 3.0
-    # Short complete plugs are valid candidates; outline checks reject texture.
+    # An observed channel-height floor still applies to generation plugs;
+    # this ratio can impose a stricter bound for a particular chip.
     generation_min_length_ratio: float = 0.50
     generation_max_length_ratio: float = 12.0
     generation_min_edge_separation_ratio: float = 0.12
     generation_min_profile_contrast_sigma: float = 0.35
     generation_polarity: Literal["brighter", "darker", "either"] = "either"
+    # Select only after checking which transverse contrast belongs to water.
+    # This calibrated mode abstains instead of switching phase or falling back
+    # to arbitrary contour pairs when a detached body is not resolved.
+    generation_phase_mode: Literal["auto", "transverse_bounded"] = "auto"
+    # Relative to each local carrier plateau; recalibrate after optics change.
+    # Preserve the old labelled-data setting until a new image review accepts it.
+    generation_phase_support_fraction: float = .02
     generation_min_meniscus_support_ratio: float = 0.12
     # A C-regime plug is not just two axial transitions: its upper and lower
     # capsule edges must persist between the menisci. This rejects the carrier

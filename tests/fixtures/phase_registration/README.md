@@ -1,0 +1,1 @@
+Small raw grayscale rectifications from recent A6/A7 and V2 frames. A6/A7 variants shift the supplied walls by -2/0/+2 pixels; V2 variants use prior-reference versus own-tail wall fits on the same image. These fixtures test registration sensitivity and unresolved long structures, not independent endpoint truth. No resize or contrast enhancement.
