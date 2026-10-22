@@ -9,6 +9,7 @@ def calibrated_phase_intervals(
     reference_width_px: float,
     *,
     support_fraction: float = .02,
+    endpoint_support_fraction: float = .03,
     diagnostics: dict | None = None,
 ) -> list[tuple[int, int]]:
     """Measure weak outer menisci for the user-calibrated imaging phase.
@@ -26,6 +27,8 @@ def calibrated_phase_intervals(
         diagnostics.update(status="geometry_unusable", offset_gray=0.0)
     if not np.isfinite(support_fraction) or not 0 < support_fraction < .5:
         raise ValueError("phase support fraction must be finite and in (0, .5)")
+    if not np.isfinite(endpoint_support_fraction) or not 0 < endpoint_support_fraction < .5:
+        raise ValueError("endpoint support fraction must be finite and in (0, .5)")
     if gray.ndim != 2:
         raise ValueError("calibrated phase input must be grayscale")
     height, width = gray.shape
@@ -64,6 +67,16 @@ def calibrated_phase_intervals(
         if all(abs(peak - previous) >= channel for previous in peaks):
             peaks.append(int(peak))
     peaks.sort()
+    # Internal intensity maxima without an intervening carrier phase are
+    # one body seed, not two droplets. Keep the stronger maximum.
+    grouped: list[int] = []
+    for peak in peaks:
+        if grouped and np.min(signal[grouped[-1]:peak + 1]) > 0:
+            if signal[peak] > signal[grouped[-1]]:
+                grouped[-1] = peak
+        else:
+            grouped.append(peak)
+    peaks = grouped
     intervals: list[tuple[int, int]] = []
     reach = int(channel * 2.4)
     for index, peak in enumerate(peaks):
@@ -82,10 +95,10 @@ def calibrated_phase_intervals(
         left, right = peak, peak
         left_level = left_floor + support_fraction * (signal[peak] - left_floor)
         right_level = right_floor + support_fraction * (signal[peak] - right_floor)
-        while left > lo and signal[left] > left_level:
-            left -= 1
-        while right < hi and signal[right] > right_level:
-            right += 1
+        left_crossings = np.flatnonzero(signal[lo:peak + 1] <= left_level)
+        right_crossings = np.flatnonzero(signal[peak:hi + 1] <= right_level)
+        left = lo + int(left_crossings[-1]) if left_crossings.size else lo
+        right = peak + int(right_crossings[0]) if right_crossings.size else hi
         # Require room to observe carrier on both sides, regardless of flow
         # direction. This is an evidence margin, not a fixed formation zone.
         flank_margin = max(3, int(np.ceil(channel * .2)))
@@ -95,10 +108,24 @@ def calibrated_phase_intervals(
         if max(abs(float(np.median(curvature[max(0, left - 10):left]))),
                abs(float(np.median(curvature[right:min(width, right + 10)])))) > 12.0:
             continue
+        # Tighten weak optical tails only AFTER the original carrier and
+        # completeness gates. Raising the candidate threshold itself creates
+        # additional false positives in the reviewed development images.
+        fraction = max(support_fraction, endpoint_support_fraction)
+        if fraction > support_fraction:
+            lc = np.flatnonzero(signal[left:peak + 1] <= left_floor + fraction * (signal[peak] - left_floor))
+            rc = np.flatnonzero(signal[peak:right + 1] <= right_floor + fraction * (signal[peak] - right_floor))
+            a = left + int(lc[-1]) if lc.size else left
+            b = peak + int(rc[0]) if rc.size else right
+            if (max(a - left, right - b) <= channel * .25 and b - a > channel
+                    and max(abs(float(np.median(curvature[max(0, a - 10):a]))),
+                            abs(float(np.median(curvature[b:min(width, b + 10)])))) <= 12.):
+                left, right = a, b
         intervals.append((left, right))
     if diagnostics is not None:
         diagnostics.update(status="bounded_candidates" if intervals else "bounded_phase_unresolved",
-                           seed_count=len(peaks), bounded_count=len(intervals))
+                           seed_count=len(peaks), bounded_count=len(intervals),
+                           endpoint_support_fraction=endpoint_support_fraction)
     return intervals
 
 

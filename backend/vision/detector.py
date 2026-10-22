@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Optional, Protocol, Tuple
 
 import cv2
 import numpy as np
@@ -33,13 +33,20 @@ class DetectionResult:
     equivalent_diameters_px: List[float] = field(default_factory=list)
 
 
+class PhaseEndpointRefiner(Protocol):
+    """Return raw strip-coordinate proposals for shadow evaluation only."""
+
+    def refine(self, gray: np.ndarray, existing: list[tuple[int,int]], reference_width_px: float) -> list[tuple[float,float]]: ...
+
+
 class DropletDetector:
     """Detect droplets using illumination correction and one Hough transform."""
 
-    def __init__(self, config: DetectorConfig, debug: DebugConfig) -> None:
+    def __init__(self, config: DetectorConfig, debug: DebugConfig, *, phase_refiner: PhaseEndpointRefiner | None = None) -> None:
         if not np.isfinite(config.generation_min_raw_outline_contrast) or not 0 < config.generation_min_raw_outline_contrast <= 255:
             raise ValueError("generation_min_raw_outline_contrast must be in (0, 255]")
         self._config = config
+        self._phase_refiner = phase_refiner
         if config.generation_phase_mode not in {"auto", "transverse_bounded"}:
             raise ValueError("unknown generation phase mode")
         if (not np.isfinite(config.generation_phase_support_fraction)
@@ -135,7 +142,8 @@ class DropletDetector:
                channel_width_px: float | None = None,
                flow_axis: str | None = None,
                outer_observation: np.ndarray | None = None,
-               trace: dict | None = None) -> DetectionResult:
+               trace: dict | None = None,
+               profile_diagnostics: bool = True) -> DetectionResult:
         """Detect droplets or generation-zone plugs.
 
         ``channel_width_px`` 是**本帧**扶正后的横向**索引跨度**（像素个数 − 1），
@@ -150,6 +158,8 @@ class DropletDetector:
 
         ``trace`` 为可选输出字典：给出时写入本次检测的中间量（参考宽度及其来源、
         轴向来源、候选区间、轮廓检查等），供诊断与审计使用。
+        ``profile_diagnostics=False`` 在标定相位模式跳过未参与判定的增强图和
+        梯度诊断（相应 trace 值为 None），不影响候选和测量。调参默认保留完整诊断。
 
         ``outer_observation`` 是与扶正内壁图同轴、同宽的原灰度外侧观察带。它只
         用于弱边界液柱的轴向端点判定；物理截面和等效直径仍来自内壁图与配置。
@@ -159,7 +169,8 @@ class DropletDetector:
         if selected_mode == "generation_plug":
             return self._detect_generation_plugs(gray, trace, channel_width_px=channel_width_px,
                                                 flow_axis=flow_axis,
-                                                outer_observation=outer_observation)
+                                                outer_observation=outer_observation,
+                                                profile_diagnostics=profile_diagnostics)
         corrected = self._preprocess(gray)
         centers, radii = self._detect_hough_candidates(corrected)
         diameter_valid = [
@@ -182,6 +193,7 @@ class DropletDetector:
         channel_width_px: float | None = None,
         flow_axis: str | None = None,
         outer_observation: np.ndarray | None = None,
+        profile_diagnostics: bool = True,
     ) -> DetectionResult:
         """Measure detached C-regime plugs from paired menisci.
 
@@ -206,22 +218,29 @@ class DropletDetector:
             flow_axis_source = "explicit"
         working = gray if flow_axis == "x" else gray.T
         cross_size, axial_size = working.shape
+        calibrated_phase = self._config.generation_phase_mode == "transverse_bounded"
         band_ratio = min(0.90, max(0.20, float(self._config.generation_center_band_ratio)))
         band_size = max(3, int(round(cross_size * band_ratio)))
         band_start = max(0, (cross_size - band_size) // 2)
         band = working[band_start : band_start + band_size]
-        corrected = self._preprocess(working)
-        corrected_band = corrected[band_start : band_start + band_size]
-        profile = np.median(corrected_band.astype(np.float32), axis=0)
-        profile = cv2.GaussianBlur(profile.reshape(1, -1), (0, 0), 1.2).reshape(-1)
-        gradient = np.abs(np.gradient(profile))
-        median_energy = float(np.median(gradient))
-        mad = float(np.median(np.abs(gradient - median_energy)))
-        robust_sigma = max(0.25, 1.4826 * mad)
-        threshold = median_energy + float(self._config.generation_edge_mad_multiplier) * robust_sigma
-        corrected_float = corrected.astype(np.float32)
-        edge_2d = np.abs(np.gradient(corrected_float, axis=1))
-
+        # The calibrated rule uses raw transverse contrast. Generic enhanced
+        # profiles are diagnostic-only here; the live pipeline requests the
+        # compact trace while tuning tools retain their full profile arrays.
+        compact_phase = calibrated_phase and not profile_diagnostics
+        corrected = profile = gradient = corrected_float = edge_2d = None
+        threshold = None
+        if not compact_phase:
+            corrected = self._preprocess(working)
+            corrected_band = corrected[band_start : band_start + band_size]
+            profile = np.median(corrected_band.astype(np.float32), axis=0)
+            profile = cv2.GaussianBlur(profile.reshape(1, -1), (0, 0), 1.2).reshape(-1)
+            gradient = np.abs(np.gradient(profile))
+            median_energy = float(np.median(gradient))
+            mad = float(np.median(np.abs(gradient - median_energy)))
+            robust_sigma = max(0.25, 1.4826 * mad)
+            threshold = median_energy + float(self._config.generation_edge_mad_multiplier) * robust_sigma
+            corrected_float = corrected.astype(np.float32)
+            edge_2d = np.abs(np.gradient(corrected_float, axis=1))
         scale = max(1e-9, float(self._pixel_to_micron))
         channel_h_px = float(self._config.generation_channel_height_um) / scale
         channel_w_px = float(self._config.generation_channel_width_um) / scale
@@ -238,7 +257,8 @@ class DropletDetector:
             2,
             int(round(reference_width_px * float(self._config.generation_min_edge_separation_ratio))),
         )
-        peak_indices = self._local_profile_peaks(gradient, threshold, min_peak_gap)
+        peak_indices = ([] if compact_phase else
+                        self._local_profile_peaks(gradient, threshold, min_peak_gap))
         # This generation regime only accepts elongated plugs.  A contour
         # fragment shorter than the observed transverse channel height cannot
         # be reported as a complete droplet, even when a saved ratio is lower.
@@ -247,39 +267,48 @@ class DropletDetector:
             reference_width_px * float(self._config.generation_min_length_ratio),
         )
         max_length = reference_width_px * float(self._config.generation_max_length_ratio)
-        profile_sigma = max(1.0, float(np.std(profile)))
-        transverse_gradient = np.abs(np.gradient(corrected_float, axis=0))
-        transverse_margin = max(
-            2,
-            min(
-                max(1, cross_size // 4),
-                max(
-                    int(round(reference_width_px * 0.08)),
-                    int(round(cross_size * 0.12)),
+        profile_sigma = transverse_threshold = None
+        transverse_gradient = None
+        transverse_margin = 0
+        if not compact_phase:
+            profile_sigma = max(1.0, float(np.std(profile)))
+            transverse_gradient = np.abs(np.gradient(corrected_float, axis=0))
+            transverse_margin = max(
+                2,
+                min(
+                    max(1, cross_size // 4),
+                    max(
+                        int(round(reference_width_px * 0.08)),
+                        int(round(cross_size * 0.12)),
+                    ),
                 ),
-            ),
-        )
-        transverse_inner = transverse_gradient[
-            transverse_margin : max(transverse_margin + 1, cross_size - transverse_margin)
-        ]
-        transverse_threshold = max(
-            1.0,
-            float(np.percentile(transverse_inner, 80.0)),
-        )
+            )
+            transverse_inner = transverse_gradient[
+                transverse_margin : max(transverse_margin + 1, cross_size - transverse_margin)
+            ]
+            transverse_threshold = max(
+                1.0,
+                float(np.percentile(transverse_inner, 80.0)),
+            )
         minimum_outline_ratio = min(
             1.0,
             max(0.0, float(self._config.generation_min_capsule_outline_ratio)),
         )
 
-        phase_intervals = shoulder_phase_intervals(working)
-        body_intervals = capsule_intervals(working) if phase_intervals is None else phase_intervals
-        raw_smoothed = cv2.GaussianBlur(working.astype(np.float32), (0, 0), 0.8)
+        # The calibrated branch is authoritative and discards every contour,
+        # shoulder and generic phase candidate below. Do not spend frame time
+        # calculating those unused fallbacks; its own evidence gates still run.
+        phase_intervals = None if calibrated_phase else shoulder_phase_intervals(working)
+        body_intervals = ([] if calibrated_phase else
+                          capsule_intervals(working) if phase_intervals is None else phase_intervals)
+        raw_smoothed = (None if calibrated_phase else
+                        cv2.GaussianBlur(working.astype(np.float32), (0, 0), 0.8))
         raw_minimum = float(self._config.generation_min_raw_outline_contrast)
         if phase_intervals is not None:
             noise = float(np.median(np.abs(working.astype(np.float32) - raw_smoothed)))
             raw_minimum = min(raw_minimum, max(3.0, 6.0 * noise))
         raw_contrast_checks: list[tuple[int, int, float]] = []
-        if body_intervals is not None:
+        if body_intervals:
             # Enhancement can erase a broad, weak boundary or amplify the
             # background enough to reject it. Check envelope candidates in the
             # same original intensity domain from which they were obtained.
@@ -422,7 +451,7 @@ class DropletDetector:
             if shoulder_image.shape[1] != axial_size:
                 raise ValueError("outer observation must share the rectified axial coordinates")
             shoulder_width = float(shoulder_image.shape[0] - 1)
-        shoulder_selected = bounded_shoulder_intervals(shoulder_image, shoulder_width)
+        shoulder_selected = ([] if calibrated_phase else bounded_shoulder_intervals(shoulder_image, shoulder_width))
         if shoulder_selected:
             selected = [(left, right, float(right - left))
                         for left, right in shoulder_selected]
@@ -434,16 +463,15 @@ class DropletDetector:
         # axis and a frame-derived channel width. Other detector callers keep
         # their established polarity-independent contour behavior.
         dark_selected = (dark_body_intervals(working, reference_width_px)
-                         if flow_axis_source == "explicit" and channel_width_px is not None
+                         if not calibrated_phase and flow_axis_source == "explicit" and channel_width_px is not None
                          else [])
         if dark_selected:
             selected = [(left, right, float(right - left))
                         for left, right in dark_selected]
             selected_outline_support = []
-        calibrated_phase = self._config.generation_phase_mode == "transverse_bounded"
         phase_diagnostics: dict = {}
         transverse_selected = (transverse_body_intervals(working, reference_width_px)
-                               if not dark_selected and flow_axis_source == "explicit"
+                               if not calibrated_phase and not dark_selected and flow_axis_source == "explicit"
                                and channel_width_px is not None else [])
         if calibrated_phase:
             # User-reviewed water/carrier ordering is authoritative. Never
@@ -454,6 +482,21 @@ class DropletDetector:
                 support_fraction=self._config.generation_phase_support_fraction,
                 diagnostics=phase_diagnostics)
                 if flow_axis_source == "explicit" and channel_width_px is not None else [])
+            if transverse_selected and self._phase_refiner is not None:
+                original_phase = list(transverse_selected)
+                suggestions = self._phase_refiner.refine(working.copy(), list(original_phase), reference_width_px)
+                # Recheck proposals for diagnostics only; preserve the rule
+                # measurements and history even when a correction is bounded.
+                try:
+                    from .learned_phase import refine_existing_intervals
+                except ImportError:
+                    from learned_phase import refine_existing_intervals
+                shadow_refined = refine_existing_intervals(working, original_phase, suggestions, reference_width_px)
+                phase_diagnostics['learned_endpoint_refinement'] = {
+                    'mode': 'shadow', 'original': original_phase, 'proposed': suggestions,
+                    'refined': shadow_refined,
+                    'changed_count': sum(a != b for a,b in zip(original_phase,shadow_refined)),
+                }
             dark_selected = []
             shoulder_selected = []
             selected = []
@@ -522,6 +565,8 @@ class DropletDetector:
                     "dark_body_intervals": dark_selected,
                     "phase_size_rejected": phase_size_rejected,
                     "phase_diagnostics": phase_diagnostics,
+                    "unused_contour_paths_skipped": calibrated_phase,
+                    "profile_diagnostics_computed": not compact_phase,
                     "outer_observation_used": bool(outer_observation is not None),
                     "reference_width_px": reference_width_px,
                     "reference_width_source": reference_width_source,

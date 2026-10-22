@@ -11,7 +11,7 @@ try:
     from .bead_counter import BeadCounter, BeadResult
     from .channel_region import ChannelRegionDetector, ChannelRegionResult
     from .config import ChannelRegionConfig, DetectorConfig, PipelineConfig
-    from .detector import DetectionResult, DropletDetector
+    from .detector import DetectionResult, DropletDetector, PhaseEndpointRefiner
     from .kalman_tracker import KalmanTracker
     from .metrics import MetricsCalculator, MetricsResult
     from .nearest_tracker import NearestTracker
@@ -22,7 +22,7 @@ except ImportError:
     from bead_counter import BeadCounter, BeadResult
     from channel_region import ChannelRegionDetector, ChannelRegionResult
     from config import ChannelRegionConfig, DetectorConfig, PipelineConfig
-    from detector import DetectionResult, DropletDetector
+    from detector import DetectionResult, DropletDetector, PhaseEndpointRefiner
     from kalman_tracker import KalmanTracker
     from metrics import MetricsCalculator, MetricsResult
     from nearest_tracker import NearestTracker
@@ -41,6 +41,7 @@ DETECTION_TRACE_KEYS = (
     "selected_intervals",
     "interval_source",
     "outer_observation_used",
+    "phase_diagnostics",
 )
 """从检测 trace 里取出的 JSON 安全判据量（trace 其余键含 numpy 数组）。"""
 
@@ -60,11 +61,15 @@ class VisionResult:
 
 
 class VisionPipeline:
-    def __init__(self, config: PipelineConfig, logger: Callable[[str], None] | None = None) -> None:
+    def __init__(self, config: PipelineConfig, logger: Callable[[str], None] | None = None, *,
+                 phase_refiner: PhaseEndpointRefiner | None = None) -> None:
+        # Research suggestions are recorded only in phase diagnostics. They
+        # cannot change detector measurements, size history or tracker inputs.
         self.config = config
         self._log = logger or (lambda _msg: None)
         self.channel_region_detector = ChannelRegionDetector(config.channel_region)
-        self.detector = DropletDetector(config.detector, config.debug)
+        self._phase_refiner = phase_refiner
+        self.detector = DropletDetector(config.detector, config.debug, phase_refiner=phase_refiner)
         self.bead_counter = BeadCounter(config.beads, config.debug)
         self.metrics = MetricsCalculator(config.metrics, logger=self._log)
         self.tracker: BaseTracker = self._build_tracker(config)
@@ -85,7 +90,7 @@ class VisionPipeline:
         channel_region = ChannelRegionConfig(**vars(channel_region_config))
         # Build the detector before publishing it so invalid input cannot leave
         # the live pipeline half-updated.
-        replacement_detector = DropletDetector(detector, self.config.debug)
+        replacement_detector = DropletDetector(detector, self.config.debug, phase_refiner=self._phase_refiner)
         self.config.detector = detector
         self.config.channel_region = channel_region
         self.detector = replacement_detector
@@ -178,7 +183,7 @@ class VisionPipeline:
                 channel_width_px=detection_geometry["channel_width_px"],
                 flow_axis=detection_geometry["flow_axis"],
                 outer_observation=outer_gray,
-                trace=detection_geometry["trace"])
+                trace=detection_geometry["trace"], profile_diagnostics=False)
         tracking = self.tracker.update(detections.centers, detections.radii, timestamp=timestamp)
         self._align_tracks_to_current_detections(tracking, detections)
         confirmed_observed_tracks = [
