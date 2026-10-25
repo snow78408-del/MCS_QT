@@ -17,6 +17,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+offline-analysis = [
+    "matplotlib>=3.7",
+]
 industrial-camera = [
     "harvesters>=1.4",
 ]
