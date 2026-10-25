@@ -31,6 +31,9 @@ feedforward compensation itself.
 
 Supported modes:
 
+- `MPC`: qualified FOPDT diameter model, locally linear constrained optimization
+  of both pump flows and a scalar output-disturbance observer. See
+  [diameter MPC](../../docs/diameter_mpc.md) for selection, limits and validation.
 - `CLASSIC_PID`: fixed base `kp/ki/kd`.
 - `ADAPTIVE_PID`: bounded, interval-based `kp/ki/kd` adaptation.
 - `ADAPTIVE_PID_WITH_FEEDFORWARD`: legacy combined selection, retained for old
@@ -139,6 +142,8 @@ Accepted export writes the loadable JSON and `.measurements.json`, plus
 `validated_for_mpc` without authorizing deployment. Training and held-out validation trials
 remain separate with flows, times, observations, conditions and units. Readback
 flows are device parameters, not independent physical measurements. This dataset
-supports subsequent MPC training, not deployment of an already trained controller.
+supports subsequent MPC training. The separate online MPC controller requires
+the formal schema-v3 record with independent MPC qualification; a dataset alone
+does not authorize its use.
 Formal JSON is written last. Failures retain non-loadable diagnostic measurements;
 they do not automatically restart or become a deployable PID calibration.

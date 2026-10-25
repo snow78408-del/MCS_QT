@@ -62,6 +62,9 @@ class PIDCommand:
     requested_output: float = 0.0
     realized_output: float = 0.0
     control_owner: str = "PID"
+    mpc_prediction_um: tuple[float, ...] = ()
+    mpc_horizon_s: float = 0.0
+    mpc_offset_um: float = 0.0
 
 
 @dataclass(slots=True)

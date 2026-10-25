@@ -13,6 +13,7 @@ from .calibration_experiment import (
     save_plant_calibration_result,
 )
 from .diameter_pid import DiameterPIDController
+from .mpc import DiameterMPCController, MPCSettings
 from .identification import PumpDirectionIdentification, identify_pump_control_directions
 from .models import AdaptivePIDState, FeedforwardResult, PIDCommand, PIDInput, PumpState, TargetParams, VisionMetrics
 from .service import build_controller, reset_controller, run_feedback_step
@@ -31,6 +32,8 @@ __all__ = [
     "identify_channel_log_sensitivities",
     "save_plant_calibration_result",
     "DiameterPIDController",
+    "DiameterMPCController",
+    "MPCSettings",
     "VisionMetrics",
     "TargetParams",
     "PumpState",

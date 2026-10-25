@@ -5,10 +5,10 @@ from pathlib import Path
 from backend import runtime_paths
 
 
-def test_windows_runtime_data_defaults_to_d_drive(monkeypatch):
+def test_windows_runtime_data_defaults_to_e_drive(monkeypatch):
     monkeypatch.delenv("MCS_DATA_DIR", raising=False)
     monkeypatch.setattr(runtime_paths.sys, "platform", "win32")
-    assert runtime_paths.user_data_dir() == Path("D:/MCS_QT_Data")
+    assert runtime_paths.user_data_dir() == Path("E:/MCS_QT_Data")
 
 
 def test_explicit_runtime_override_and_subdirectory(monkeypatch, tmp_path):

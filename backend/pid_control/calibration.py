@@ -262,6 +262,11 @@ class PlantCalibrationRecord:
     def authorized_for_pi(self) -> bool:
         return bool(int(self.schema_version) >= 3 and self.validated_for_pi)
 
+    @property
+    def authorized_for_mpc(self) -> bool:
+        return bool(int(self.schema_version) >= 3
+                    and self.validated_for_pi is True and self.validated_for_mpc is True)
+
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "PlantCalibrationRecord":
         allowed = set(cls.__dataclass_fields__)

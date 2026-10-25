@@ -15,7 +15,7 @@ validity statements instead of a loadable calibration.
 Usage::
 
     .venv/Scripts/python.exe tools/fit_plant_history_model.py \
-        --history D:/MCS_QT_Data/calibrations --output output/history-model
+        --history E:/MCS_QT_Data/calibrations --output output/history-model
 """
 from __future__ import annotations
 

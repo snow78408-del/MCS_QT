@@ -22,6 +22,7 @@ from backend.provenance import wall_binding_from_file
 from backend.pump_hardware.config import SerialConfig
 from backend.pump_hardware.service import PumpHardwareService
 from backend.vision.cameras.adapters.hikrobot_camera import HikrobotCameraAdapter
+from tools.regime_survey import survey_records
 from tools.plant_flow_transient_capture import (
     CaptureLifecycleError,
     ChannelWriteError,
@@ -39,6 +40,38 @@ from tools.plant_flow_transient_capture import (
 
 
 CAMPAIGN_PROFILES = {
+    "requested_model_validation_group8_20261013": [
+        ("C_baseline", 70.0, 20.0, False),
+        ("S90_R2_5", 450.0 / 7.0, 180.0 / 7.0, True),
+    ],
+    "requested_model_validation_group7_20261013": [
+        ("C_baseline", 70.0, 20.0, False),
+        ("S70_R4_5", 630.0 / 11.0, 140.0 / 11.0, True),
+    ],
+    "requested_model_validation_group6_20261013": [
+        ("C_baseline", 70.0, 20.0, False),
+        ("S110_R3_5", 770.0 / 9.0, 220.0 / 9.0, True),
+    ],
+    "requested_model_validation_group5_20261013": [
+        ("C_baseline", 70.0, 20.0, False),
+        ("S90_R4_5", 810.0 / 11.0, 180.0 / 11.0, True),
+    ],
+    "requested_model_validation_group4_20261013": [
+        ("C_baseline", 70.0, 20.0, False),
+        ("S110_R2_5", 550.0 / 7.0, 220.0 / 7.0, True),
+    ],
+    "requested_model_validation_group3_20261013": [
+        ("C_baseline", 70.0, 20.0, False),
+        ("S70_R3_5", 490.0 / 9.0, 140.0 / 9.0, True),
+    ],
+    "requested_model_validation_group2_20261013": [
+        ("C_baseline", 70.0, 20.0, False),
+        ("S110_R4_5", 90.0, 20.0, True),
+    ],
+    "requested_model_validation_group1_20261013": [
+        ("C_baseline", 70.0, 20.0, False),
+        ("S70_R2_5", 50.0, 20.0, True),
+    ],
     "r1_front4": [
         ("C_baseline", 70.0, 20.0, False),
         ("C_same_value_write", 70.0, 20.0, True),
@@ -81,6 +114,43 @@ CAMPAIGN_PROFILES = {
         ("Q1_80", 80.0, 20.0, True),
         ("Q1_90", 90.0, 20.0, True),
     ],
+    "requested_q1_50_60_70_20260928": [
+        ("Q1_50", 50.0, 20.0, False),
+        ("Q1_60", 60.0, 20.0, True),
+        ("Q1_70", 70.0, 20.0, True),
+    ],
+    "requested_q1_80_90_20260928": [
+        ("Q1_80", 80.0, 20.0, False),
+        ("Q1_90", 90.0, 20.0, True),
+    ],
+    "requested_q1_70_80_20261002": [
+        ("Q1_70", 70.0, 20.0, False),
+        ("Q1_80", 80.0, 20.0, True),
+    ],
+    "requested_q1_90_100_20261002": [
+        ("Q1_90", 90.0, 20.0, False),
+        ("Q1_100", 100.0, 20.0, True),
+    ],
+    "requested_q1_50_70_20261008": [
+        ("Q1_50", 50.0, 20.0, False),
+        ("Q1_70", 70.0, 20.0, True),
+    ],
+    "requested_q1_90_70_20261008": [
+        ("Q1_90", 90.0, 20.0, False),
+        ("Q1_70", 70.0, 20.0, True),
+    ],
+    "requested_q1_50_only_20261008": [
+        ("Q1_50", 50.0, 20.0, False),
+    ],
+    "requested_q1_60_50_20261008": [
+        ("Q1_60", 60.0, 20.0, False),
+        ("Q1_50", 50.0, 20.0, True),
+    ],
+    "requested_total70_ratios_20261008": [
+        ("S70_R2_5", 50.0, 20.0, False),
+        ("S70_R3", 52.5, 17.5, True),
+        ("S70_R3_5", 490.0 / 9.0, 140.0 / 9.0, True),
+    ],
 }
 
 
@@ -111,6 +181,13 @@ class R1FrontFourSession(LiveCaptureSession):
             self._close_sink()
         payload = self.report()
         payload["segments"] = list(self.segment_records)
+        payload["regime_survey"] = {
+            "schema_version": 1,
+            "records": survey_records(self.segment_records),
+            "phase_mapping": self.plan.get("regime_exploration", {}).get("phase_mapping"),
+            "transition_brackets": [],
+            "status": "pending_evidence_review",
+        }
         payload["measurement_chain_status"] = {
             "physical_scale_validated": False,
             "ten_point_automatic_detection_passed": False,
@@ -277,6 +354,24 @@ class R1FrontFourSession(LiveCaptureSession):
             command_started = None
             command_finished = None
             if requires_write:
+                review_path = self.plan["flow_plan"].get("transition_review_file")
+                if review_path:
+                    # Refill batches may require a current visual review before
+                    # increasing flow; missing or mismatched evidence stops safely.
+                    try:
+                        review = json.loads(Path(review_path).read_text(encoding="utf-8"))
+                        approved = (
+                            review.get("session_id") == self.plan.get("session_id")
+                            and review.get("next_segment_index") == index
+                            and review.get("proceed") is True
+                            and Path(str(review.get("evidence_image") or "")).is_file()
+                        )
+                    except (OSError, ValueError, TypeError, AttributeError):
+                        approved = False
+                    if not approved:
+                        raise CaptureLifecycleError(
+                            f"segment {index} withheld: current visual transition review not approved"
+                        )
                 result = self.pump.update_flow_while_running(q1, q2)
                 command_started = getattr(result, "command_started_monotonic", None)
                 command_finished = getattr(result, "readback_completed_monotonic", None)
@@ -410,6 +505,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--plan", required=True)
     parser.add_argument("--preflight-only", action="store_true")
+    parser.add_argument("--sample-interval-s", type=float,
+                        help="Save and detect sparse PNG frames instead of continuous video")
     parser.add_argument("--provenance-dir", type=Path,
                         help="追溯目录；缺省为 <plan 输出目录>/provenance。写入失败即在动设备前拒绝启动")
     args = parser.parse_args()
@@ -441,11 +538,18 @@ def main() -> int:
         DeviceLock(normalize_port_key(serial.port)),
         DeviceLock(camera_lock_key(apparatus["camera_unique_id"])),
     ]
-    sink = LosslessFrameFactsRecorder(
-        directory=output,
-        requested_fps=float(plan["capture_plan"]["requested_fps"]),
-        max_backlog=int(plan["capture_plan"]["max_backlog_frames"]),
-    )
+    if args.sample_interval_s is not None:
+        from tools.sampled_frame_recorder import SampledFrameRecorder
+        _, sampling_walls = wall_binding_from_file(
+            Path(apparatus["wall_proposal"]), source_label="preacquisition_visual_review")
+        sink = SampledFrameRecorder(directory=output, interval_s=args.sample_interval_s,
+                                    walls=sampling_walls)
+    else:
+        sink = LosslessFrameFactsRecorder(
+            directory=output,
+            requested_fps=float(plan["capture_plan"]["requested_fps"]),
+            max_backlog=int(plan["capture_plan"]["max_backlog_frames"]),
+        )
     profile = str(plan["flow_plan"].get("campaign_profile", "r1_front4"))
     wall_source = "current_frame_localized"
     wall_block = None

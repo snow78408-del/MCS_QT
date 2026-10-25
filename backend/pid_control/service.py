@@ -4,6 +4,7 @@ from contextvars import ContextVar
 
 from .base import BaseDiameterController
 from .config import PIDConfig
+from .calibration import PlantCalibrationRecord
 from .diameter_pid import DiameterPIDController
 from .models import PIDCommand, PIDInput, PumpState, TargetParams, VisionMetrics
 
@@ -12,8 +13,18 @@ _controller_var: ContextVar[BaseDiameterController | None] = ContextVar(
 )
 
 
-def build_controller(config: PIDConfig | None = None) -> BaseDiameterController:
-    controller = DiameterPIDController(config=config)
+def build_controller(
+    config: PIDConfig | None = None, *, calibration: PlantCalibrationRecord | None = None,
+    sample_period_s: float = 7.5,
+) -> BaseDiameterController:
+    if config is not None and config.control_mode == "MPC":
+        from .mpc import DiameterMPCController
+
+        if calibration is None:
+            raise ValueError("MPC requires a validated plant calibration")
+        controller = DiameterMPCController(config, calibration, sample_period_s)
+    else:
+        controller = DiameterPIDController(config=config)
     _controller_var.set(controller)
     return controller
 

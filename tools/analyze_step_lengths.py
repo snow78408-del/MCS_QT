@@ -41,7 +41,8 @@ def frame_times(path: Path) -> tuple[np.ndarray, list[int]]:
     return values, identifiers
 
 
-def stage_walls(video: Path, stamps: np.ndarray, segments: list[dict]) -> list[dict]:
+def stage_walls(video: Path, stamps: np.ndarray, segments: list[dict], *,
+                wall_top: int = 225, wall_bot: int = 280) -> list[dict]:
     cap = cv2.VideoCapture(str(video))
     if not cap.isOpened():
         raise RuntimeError("cannot open raw video")
@@ -60,7 +61,7 @@ def stage_walls(video: Path, stamps: np.ndarray, segments: list[dict]) -> list[d
                     if not ok:
                         raise RuntimeError(f"cannot read wall reference frame {index}")
                     images.append(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))
-                fit = duct_walls(np.stack(images), top=225, bot=280, reach=12,
+                fit = duct_walls(np.stack(images), top=wall_top, bot=wall_bot, reach=12,
                                  min_gap=12, x_lo=120, x_hi=720)
                 if fit.ok and fit.gap_sd_px <= 1.5:
                     candidates.append((fit.gap_sd_px, indices, fit))
@@ -87,13 +88,20 @@ def draw_review(image: np.ndarray, intervals: list[tuple[int, int, float]]) -> n
                  (0, 0, 255), 1)
         cv2.line(marked, (int(right), 0), (int(right), image.shape[0] - 1),
                  (0, 255, 0), 1)
-    return cv2.resize(marked, None, fx=2, fy=5, interpolation=cv2.INTER_NEAREST)
+    # Preserve geometry so reviewers can compare axial length and channel height.
+    return cv2.resize(marked, None, fx=2, fy=2, interpolation=cv2.INTER_NEAREST)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("session_dir", type=Path)
+    parser.add_argument("--wall-top", type=int, default=225)
+    parser.add_argument("--wall-bot", type=int, default=280)
+    parser.add_argument("--walls-proposal", type=Path,
+                        help="Visually reviewed same-session wall lines; reuse only after raw-frame review")
     args = parser.parse_args()
+    if not 0 <= args.wall_top < args.wall_bot <= 540:
+        parser.error("wall search bounds must satisfy 0 <= top < bot <= 540")
     out = args.session_dir.resolve()
     session = json.loads((out / "session_summary.json").read_text(encoding="utf-8"))
     segments = session["segments"]
@@ -105,7 +113,19 @@ def main() -> None:
     if len(stamps) != session["frame_facts"]["raw_frames"]:
         raise RuntimeError("frame facts and video frame count differ")
     video = out / "raw_frames.mkv"
-    geometries = stage_walls(video, stamps, segments)
+    if args.walls_proposal is not None:
+        proposal = json.loads(args.walls_proposal.read_text(encoding="utf-8"))
+        if (proposal.get("status") != "visually_reviewed_inner_channel_walls_pixel_geometry"
+                or len(proposal.get("walls", [])) != 2
+                or not proposal.get("fit", {}).get("ok")):
+            raise RuntimeError("wall proposal lacks reviewed geometry")
+        geometries = [{"stage": stage, "source": "visually_reviewed_same_session_proposal",
+                       "source_frame_indices": [], "fit": proposal["fit"],
+                       "walls": proposal["walls"]}
+                      for stage in range(1, len(segments) + 1)]
+    else:
+        geometries = stage_walls(video, stamps, segments,
+                                wall_top=args.wall_top, wall_bot=args.wall_bot)
     (out / "analysis_geometry.json").write_text(
         json.dumps(geometries, ensure_ascii=False, indent=2), encoding="utf-8")
     detectors = [DropletDetector(DetectorConfig(measurement_mode="generation_plug"),

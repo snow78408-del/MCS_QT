@@ -1,4 +1,5 @@
 numpy>=1.23
+scipy>=1.10
 opencv-python>=4.8
 pyserial>=3.5
 harvesters>=1.4

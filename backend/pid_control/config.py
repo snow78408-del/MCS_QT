@@ -14,6 +14,7 @@ except ImportError:  # Python 3.10 compatibility
 
 
 class PIDControlMode(StrEnum):
+    MPC = "MPC"
     CLASSIC_PID = "CLASSIC_PID"
     ADAPTIVE_PID = "ADAPTIVE_PID"
     ADAPTIVE_PID_WITH_FEEDFORWARD = "ADAPTIVE_PID_WITH_FEEDFORWARD"

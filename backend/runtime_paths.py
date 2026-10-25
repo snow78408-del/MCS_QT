@@ -15,7 +15,7 @@ def user_data_dir() -> Path:
     if sys.platform == "win32":
         # Keep application state separate from the source checkout. An explicit
         # deployment/test override still takes priority; do not silently write C:.
-        return Path("D:/MCS_QT_Data")
+        return Path("E:/MCS_QT_Data")
     elif sys.platform == "darwin":
         base = Path.home() / "Library" / "Application Support"
     else:

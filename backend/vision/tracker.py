@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 
 @dataclass
@@ -104,45 +105,50 @@ def radius_gated_match(
     distance_radius_ratio: float,
     radius_match_ratio: float,
 ) -> Tuple[List[Tuple[int, int]], List[int], List[int]]:
-    """Match by position while rejecting implausible size jumps."""
+    """Maximize gated matches, then minimize position/size cost globally.
+
+    Dummy columns allow missed observations without ever matching across a
+    distance/size gate. Uncontested pairs bypass the assignment solver.
+    """
     if not track_positions or not detections:
         return [], list(range(len(track_positions))), list(range(len(detections)))
 
-    candidates: List[Tuple[float, int, int]] = []
-    for track_idx, track_pos in enumerate(track_positions):
-        track_radius = max(1.0, float(track_radii[track_idx]))
-        for det_idx, det in enumerate(detections):
-            det_radius = max(1.0, float(detection_radii[det_idx]))
-            larger_radius = max(track_radius, det_radius)
-            radius_delta = abs(track_radius - det_radius) / larger_radius
-            if radius_delta > float(radius_match_ratio):
-                continue
-
-            pair_radius = (track_radius + det_radius) * 0.5
-            distance_limit = max(
-                float(min_distance),
-                pair_radius * float(distance_radius_ratio),
-            )
-            distance_limit = min(float(max_distance), distance_limit)
-            distance = float(np.linalg.norm(det - track_pos))
-            if distance > distance_limit:
-                continue
-
-            # Prefer a slightly farther detection with a consistent radius over
-            # a nearby fragment whose apparent radius changes abruptly.
-            cost = distance + radius_delta * distance_limit * 0.35
-            candidates.append((cost, track_idx, det_idx))
-
-    candidates.sort(key=lambda item: item[0])
-    used_tracks: set[int] = set()
-    used_dets: set[int] = set()
-    matches: List[Tuple[int, int]] = []
-    for _, track_idx, det_idx in candidates:
-        if track_idx in used_tracks or det_idx in used_dets:
-            continue
-        used_tracks.add(track_idx)
-        used_dets.add(det_idx)
-        matches.append((track_idx, det_idx))
+    positions = np.asarray(track_positions, dtype=np.float64)
+    points = np.asarray(detections, dtype=np.float64)
+    raw_track_radii = np.asarray(track_radii, dtype=np.float64)[:, None]
+    raw_det_radii = np.asarray(detection_radii, dtype=np.float64)[None, :]
+    track_radius = np.maximum(1.0, raw_track_radii)
+    det_radius = np.maximum(1.0, raw_det_radii)
+    with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
+        radius_delta = np.abs(track_radius - det_radius) / np.maximum(track_radius, det_radius)
+        distance_limit = np.minimum(
+            float(max_distance),
+            np.maximum(float(min_distance), (track_radius + det_radius) * 0.5 * float(distance_radius_ratio)),
+        )
+        distance = np.linalg.norm(points[None, :, :] - positions[:, None, :], axis=2)
+        costs = distance + radius_delta * distance_limit * 0.35
+    allowed = (
+        (radius_delta <= float(radius_match_ratio))
+        & (distance <= distance_limit)
+        & np.isfinite(costs)
+        & np.isfinite(raw_track_radii)
+        & np.isfinite(raw_det_radii)
+    )
+    rows, cols = np.nonzero(allowed)
+    if len(rows) and (np.any(allowed.sum(axis=0) > 1) or np.any(allowed.sum(axis=1) > 1)):
+        count = len(track_positions)
+        # All valid normalized costs are <= 1. Losing one match costs more
+        # than the largest possible change in total real-edge cost.
+        penalty = float(count + 1)
+        assignment = np.full((count, len(detections) + count), penalty)
+        assignment[:, :len(detections)] = np.inf
+        assignment[rows, cols] = costs[rows, cols] / max(1.0, float(costs[rows, cols].max()))
+        rows, cols = linear_sum_assignment(assignment)
+        real = cols < len(detections)
+        rows, cols = rows[real], cols[real]
+    matches = [(int(row), int(col)) for row, col in zip(rows, cols)]
+    used_tracks = set(rows.tolist())
+    used_dets = set(cols.tolist())
 
     unmatched_tracks = [idx for idx in range(len(track_positions)) if idx not in used_tracks]
     unmatched_dets = [idx for idx in range(len(detections)) if idx not in used_dets]

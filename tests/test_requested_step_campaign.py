@@ -116,6 +116,114 @@ def test_q1_four_stage_plan_is_frozen_and_covers_delivery_budget():
     assert any("cumulative delivery limit" in issue for issue in validate_r1_plan(short))
 
 
+@pytest.mark.parametrize("profile,flows", [
+    ("requested_model_validation_group2_20261013", [70, 90]),
+    ("requested_model_validation_group1_20261013", [70, 50]),
+    ("requested_q1_50_60_70_20260928", [50, 60, 70]),
+    ("requested_q1_80_90_20260928", [80, 90]),
+    ("requested_q1_70_80_20261002", [70, 80]),
+    ("requested_q1_90_100_20261002", [90, 100]),
+])
+def test_split_q1_profiles_enforce_order_and_budget(profile, flows):
+    plan = json.loads(Q1_FOUR_PLAN.read_text(encoding="utf-8"))
+    plan["flow_plan"]["campaign_profile"] = profile
+    plan["flow_plan"]["steps"] = [
+        {"label": ("C_baseline" if index == 0 else "S70_R2_5")
+         if profile == "requested_model_validation_group1_20261013"
+         else ("C_baseline" if index == 0 else "S110_R4_5")
+         if profile == "requested_model_validation_group2_20261013" else f"Q1_{q1}",
+         "q1_ul_min": q1, "q2_ul_min": 20.0,
+         "duration_s": 300.0} for index, q1 in enumerate(flows)]
+    plan["flow_plan"]["max_cumulative_delivery_each_ul"] = sum(flows) * 5
+    assert validate_r1_plan(plan) == []
+    plan["flow_plan"]["max_cumulative_delivery_each_ul"] -= 1
+    assert any("cumulative delivery limit" in issue for issue in validate_r1_plan(plan))
+    plan["flow_plan"]["max_cumulative_delivery_each_ul"] += 1
+    plan["flow_plan"]["steps"][1]["q1_ul_min"] += 10
+    assert any("does not match frozen" in issue for issue in validate_r1_plan(plan))
+
+
+@pytest.mark.parametrize("profile,validation,ratio,total,short_budget", [
+    ("requested_model_validation_group3_20261013",
+     ("S70_R3_5", 490.0 / 9.0, 140.0 / 9.0, True), 3.5, 70.0, 620.0),
+    ("requested_model_validation_group4_20261013",
+     ("S110_R2_5", 550.0 / 7.0, 220.0 / 7.0, True), 2.5, 110.0, 740.0),
+    ("requested_model_validation_group5_20261013",
+     ("S90_R4_5", 810.0 / 11.0, 180.0 / 11.0, True), 4.5, 90.0, 715.0),
+    ("requested_model_validation_group6_20261013",
+     ("S110_R3_5", 770.0 / 9.0, 220.0 / 9.0, True), 3.5, 110.0, 775.0),
+    ("requested_model_validation_group7_20261013",
+     ("S70_R4_5", 630.0 / 11.0, 140.0 / 11.0, True), 4.5, 70.0, 635.0),
+    ("requested_model_validation_group8_20261013",
+     ("S90_R2_5", 450.0 / 7.0, 180.0 / 7.0, True), 2.5, 90.0, 670.0),
+])
+def test_model_validation_profiles_preserve_ratio_total_and_delivery_budget(
+    profile, validation, ratio, total, short_budget,
+):
+    from tools.run_r1_front4_live import CAMPAIGN_PROFILES
+
+    plan = json.loads(Q1_FOUR_PLAN.read_text(encoding="utf-8"))
+    expected = CAMPAIGN_PROFILES[profile]
+    assert expected == [("C_baseline", 70.0, 20.0, False), validation]
+    plan["flow_plan"].update(
+        campaign_profile=profile, max_cumulative_delivery_each_ul=900.0,
+        steps=[{"label": label, "q1_ul_min": q1, "q2_ul_min": q2,
+                "duration_s": 300.0} for label, q1, q2, _ in expected])
+    assert validate_r1_plan(plan) == []
+    q1, q2 = expected[1][1:3]
+    assert q1 / q2 == pytest.approx(ratio)
+    assert q1 + q2 == pytest.approx(total)
+    plan["flow_plan"]["max_cumulative_delivery_each_ul"] = short_budget
+    assert any("cumulative delivery limit" in issue for issue in validate_r1_plan(plan))
+    plan["flow_plan"]["max_cumulative_delivery_each_ul"] = 900.0
+    plan["flow_plan"]["steps"][1]["q2_ul_min"] = 20.0
+    assert any("does not match frozen" in issue for issue in validate_r1_plan(plan))
+
+
+def test_total70_campaign_preserves_ratios_budget_and_verified_transitions():
+    from tools.run_r1_front4_live import CAMPAIGN_PROFILES
+
+    plan = json.loads(Q1_FOUR_PLAN.read_text(encoding="utf-8"))
+    profile = "requested_total70_ratios_20261008"
+    expected = CAMPAIGN_PROFILES[profile]
+    plan["flow_plan"]["campaign_profile"] = profile
+    plan["flow_plan"]["steps"] = [
+        {"label": label, "q1_ul_min": q1, "q2_ul_min": q2, "duration_s": 300.0}
+        for label, q1, q2, _ in expected]
+    oil_budget = sum(q1 * 5 for _, q1, _, _ in expected)
+    assert oil_budget == pytest.approx(784.7222222222)
+    assert [q1 / q2 for _, q1, q2, _ in expected] == pytest.approx([2.5, 3, 3.5])
+    assert [q1 + q2 for _, q1, q2, _ in expected] == pytest.approx([70, 70, 70])
+    plan["flow_plan"]["max_cumulative_delivery_each_ul"] = 900.0
+    assert validate_r1_plan(plan) == []
+    short = copy.deepcopy(plan)
+    short["flow_plan"]["max_cumulative_delivery_each_ul"] = oil_budget - 1
+    assert any("cumulative delivery limit" in issue for issue in validate_r1_plan(short))
+    wrong = copy.deepcopy(plan)
+    wrong["flow_plan"]["steps"][1]["q2_ul_min"] = 20
+    assert any("does not match frozen" in issue for issue in validate_r1_plan(wrong))
+    pump = PumpStub()
+    calls = []
+    def update(q1, q2):
+        calls.append((q1, q2))
+        return SimpleNamespace(ok=True, still_running=True,
+                               stop_verified_before_write=True, restart_verified=True)
+    pump.update_flow_while_running = update
+    session = make_session(pump, plan)
+    durations = []
+    session._wait_segment = durations.append
+    session._run_segments()
+    assert calls == [(52.5, 17.5), (490.0 / 9.0, 140.0 / 9.0)]
+    assert durations == [300, 300, 300]
+    assert session.run_finished
+    pump.update_flow_while_running = lambda *_: SimpleNamespace(
+        ok=True, still_running=True, stop_verified_before_write=True, restart_verified=False)
+    session = make_session(pump, plan)
+    session._wait_segment = lambda _: None
+    with pytest.raises(CaptureLifecycleError, match="segment 2"):
+        session._run_segments()
+
+
 def test_stopped_20_20_is_preconditioned_q1_first_before_normal_write():
     plan = json.loads(PLAN.read_text(encoding="utf-8"))
     pump = PumpStub()

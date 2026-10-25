@@ -32,8 +32,11 @@ class SystemConfig:
     control_analysis_frames: int = 5
     target_feedforward_enabled: bool = False
     disturbance_feedforward_enabled: bool = False
+    feedback_controller: str = "PID"
 
     def __post_init__(self) -> None:
+        if self.feedback_controller not in {"PID", "MPC"}:
+            raise ValueError("feedback_controller must be PID or MPC")
         for name in ("target_feedforward_enabled", "disturbance_feedforward_enabled"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be boolean")
@@ -254,6 +257,9 @@ class ControlSnapshot:
     feedforward_active: bool = False
     feedforward_reason: str = ""
     control_mode: str = "CLASSIC_PID"
+    mpc_prediction_um: tuple[float, ...] = ()
+    mpc_horizon_s: float = 0.0
+    mpc_offset_um: float = 0.0
     q1_output_gain: float = 1.0
     q2_output_gain: float = 1.0
     frame_id: int = 0

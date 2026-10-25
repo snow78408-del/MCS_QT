@@ -31,6 +31,7 @@ from ..pid_control import (
     save_plant_calibration_result,
 )
 from ..pump_hardware import ChannelParams, PumpHardwareService
+from ..pid_control.mpc import DiameterMPCController
 from ..pump_hardware.models import FlowUpdateResult
 from ..pump_hardware.service import FlowReadbackUnavailableError
 from ..pump_hardware.invariants import effective_q1_q2_gap, q1_is_strictly_above_q2
@@ -1666,6 +1667,10 @@ class OrchestratorService:
             if system_config.plant_calibration
             else None
         )
+        if system_config.feedback_controller == "MPC" and (
+            plant_calibration is None or not plant_calibration.authorized_for_mpc
+        ):
+            raise ValueError("MPC 需要通过独立动态验证的 schema-v3 标定；仅有训练数据包不能启用")
         interval = int(system_config.control_interval_ms)
         if not self.runtime.min_control_interval_ms <= interval <= self.runtime.max_control_interval_ms:
             raise ValueError(
@@ -1688,6 +1693,13 @@ class OrchestratorService:
         self.pid_config.target_feedforward_enabled = system_config.target_feedforward_enabled
         self.pid_config.disturbance_feedforward_enabled = system_config.disturbance_feedforward_enabled
         self._require_valid_phase_flows(system_config.initial_q1, system_config.initial_q2)
+        if system_config.feedback_controller == "MPC":
+            self.pid_config.control_mode = PIDControlMode.MPC.value
+            self._pid_controller = DiameterMPCController(
+                self.pid_config, plant_calibration, interval / 1000.0,
+            )
+        else:
+            self._pid_controller = DiameterPIDController(self.pid_config)
 
         with self._lock:
             self._cfg = system_config
@@ -3224,6 +3236,9 @@ class OrchestratorService:
 
     def _update_control_snapshot(self, ctrl: ControlSnapshot) -> None:
         with self._control_condition:
+            if isinstance(getattr(self, "_pid_controller", None), DiameterMPCController) and ctrl.control_owner == "PID":
+                ctrl.control_mode = "MPC"
+                ctrl.control_owner = "MPC"
             self._control = ctrl
             rec = self._recognition
             cfg = self._cfg
@@ -3857,7 +3872,8 @@ class OrchestratorService:
                 candidate_controller.config.max_flow_change_per_cycle,
                 self.runtime.response_guard_retry_step,
             )
-            candidate_controller.config.control_mode = "CLASSIC_PID"
+            if not isinstance(candidate_controller, DiameterMPCController):
+                candidate_controller.config.control_mode = "CLASSIC_PID"
         cmd = candidate_controller.update_input(pid_input)
         candidate_controller.config = self.pid_config
         requested_flow_change = abs(float(cmd.q1) - ps.q1) + abs(float(cmd.q2) - ps.q2)
@@ -3901,6 +3917,9 @@ class OrchestratorService:
             feedforward_active=bool(cmd.feedforward_active),
             feedforward_reason=str(cmd.feedforward_reason or ""),
             control_mode=str(cmd.control_mode),
+            mpc_prediction_um=cmd.mpc_prediction_um,
+            mpc_horizon_s=cmd.mpc_horizon_s,
+            mpc_offset_um=cmd.mpc_offset_um,
             q1_output_gain=float(cmd.q1_output_gain),
             q2_output_gain=float(cmd.q2_output_gain),
             frame_id=int(cmd.frame_id),
@@ -3919,7 +3938,7 @@ class OrchestratorService:
             realized_output=float(cmd.realized_output),
         )
 
-        if cmd.freeze_feedback:
+        if cmd.freeze_feedback and not cmd.suggested_stop:
             if not ctrl.reason:
                 ctrl.reason = "PID frozen; keep current infusion, no new pump command"
             elif "keep current infusion" not in ctrl.reason:

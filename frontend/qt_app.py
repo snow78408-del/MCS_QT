@@ -482,12 +482,27 @@ class ParameterPage(Page):
         self.batch_button = QPushButton("PID 采集／分析帧数…")
         self.batch_button.clicked.connect(lambda: ControlBatchDialog(app, self).exec())
         form.addRow("按帧批次控制", self.batch_button)
+        self.feedback_controller = QComboBox()
+        self.feedback_controller.addItem("PI / PID 反馈", "PID")
+        self.feedback_controller.addItem("MPC 液滴尺寸预测控制", "MPC")
+        self.feedback_controller.setCurrentIndex(1 if cfg.get("feedback_controller") == "MPC" else 0)
+        form.addRow("反馈控制器", self.feedback_controller)
+        mpc_hint = QLabel("MPC 使用已通过独立动态验证的标定，联合规划两路流量；保存并重新初始化后生效。")
+        mpc_hint.setWordWrap(True)
+        mpc_hint.setObjectName("formHint")
+        form.addRow("", mpc_hint)
         self.target_feedforward = QCheckBox("启用目标前馈（使用局部标定模型）")
         self.target_feedforward.setChecked(bool(cfg.get("target_feedforward_enabled", False)))
         self.disturbance_feedforward = QCheckBox("请求启用扰动前馈（需独立验证）")
         self.disturbance_feedforward.setChecked(bool(cfg.get("disturbance_feedforward_enabled", False)))
         form.addRow("前馈独立设置", self.target_feedforward)
         form.addRow("", self.disturbance_feedforward)
+        def refresh_feedforward_selection():
+            enabled = self.feedback_controller.currentData() == "PID"
+            self.target_feedforward.setEnabled(enabled)
+            self.disturbance_feedforward.setEnabled(enabled)
+        self.feedback_controller.currentIndexChanged.connect(refresh_feedforward_selection)
+        refresh_feedforward_selection()
         ff_hint = QLabel("保存并重新初始化后生效；与固定／自适应反馈模式独立。目标前馈仅用于标定范围内。\n"
                          "当前生成区尚无匹配输出单位的扰动前馈标定，勾选也不会绕过验证。")
         ff_hint.setWordWrap(True)
@@ -561,6 +576,7 @@ class ParameterPage(Page):
         except (ValueError,OSError) as exc: return self.app.error("参数错误", str(exc))
         self.app.save(target_diameter=target, magnification=mag, camera_pixel_size_um=pixel,
                       pixel_to_micron=scale, control_interval_ms=interval,
+                      feedback_controller=self.feedback_controller.currentData(),
                       target_feedforward_enabled=self.target_feedforward.isChecked(),
                       disturbance_feedforward_enabled=self.disturbance_feedforward.isChecked(),
                       calibration_path=calibration_path,calibration=calibration,
@@ -1227,7 +1243,7 @@ class PlantCalibrationExperimentDialog(QDialog):
             self,"标定文件已保存",
             f"可加载标定：\n{saved['path']}\n\n原始阶跃测量：\n{saved['measurements_path']}\n\n"
             f"MPC 训练数据：\n{saved.get('mpc_training_path') or '本次未导出'}\n\n"
-            "已自动选入标定参数。请点击“初始化”加载，通过设备检查后可开始闭环 PID。MPC 数据包保留训练/验证分组，MPC 控制器部署仍需另外验证。",
+            "已自动选入标定参数。请点击“初始化”加载，通过设备检查后可开始闭环。参数页可选择 PI/PID 或 MPC；MPC 要求正式标定通过独立动态验证，训练数据包不能直接启用。",
         )
 
     def refresh_status(self):
@@ -2237,6 +2253,9 @@ class MonitorPage(Page):
             f"执行器饱和：{yes(getattr(ctrl,'actuator_saturated',False))}",
             f"控制权所有者：{getattr(ctrl,'control_owner','--')}",
             f"控制模式：{getattr(ctrl,'control_mode','--')}",
+            f"MPC 预测时域：{number(getattr(ctrl,'mpc_horizon_s',0),1)} s；末端尺寸："
+            f"{number((getattr(ctrl,'mpc_prediction_um',()) or [None])[-1],2)} μm；"
+            f"模型偏差估计：{number(getattr(ctrl,'mpc_offset_um',0),2)} μm",
             f"自适应状态：{adaptive_status}",
             f"自适应说明：{getattr(ctrl,'adaptive_reason','') or '无'}",
             f"Kp / Ki / Kd：{number(getattr(ctrl,'kp',None),6)} / {number(getattr(ctrl,'ki',None),6)} / {number(getattr(ctrl,'kd',None),6)}",
@@ -2546,7 +2565,7 @@ class FrontendApp(QMainWindow):
     def build_system_config(self):
         cfg=self.frontend_config; required=("target_diameter","pixel_to_micron","video_source_type","video_source","initial_q1","initial_q2","control_interval_ms"); missing=[k for k in required if k not in cfg]
         if missing: raise ValueError(f"缺少配置字段: {', '.join(missing)}")
-        return SystemConfig(target_diameter=float(cfg["target_diameter"]),pixel_to_micron=float(cfg["pixel_to_micron"]),video_source_type=str(cfg["video_source_type"]),video_source=str(cfg["video_source"]),initial_q1=float(cfg["initial_q1"]),initial_q2=float(cfg["initial_q2"]),control_interval_ms=int(cfg["control_interval_ms"]),target_feedforward_enabled=bool(cfg.get("target_feedforward_enabled",False)),disturbance_feedforward_enabled=bool(cfg.get("disturbance_feedforward_enabled",False)),control_batch_enabled=bool(cfg.get("control_batch_enabled",False)),control_capture_frames=int(cfg.get("control_capture_frames",5)),control_analysis_frames=int(cfg.get("control_analysis_frames",5)),pump_port=str(cfg.get("pump_port","")),pump_address=int(cfg.get("pump_address",1)),pump_baudrate=int(cfg.get("pump_baudrate",1200)),pump_parity=str(cfg.get("pump_parity","E")),mvs_sdk_path=str(cfg.get("mvs_sdk_path","")),camera_backend=str(cfg.get("camera_backend","")),camera_parameters=dict(cfg.get("camera_parameters",{}) or {}),recognition_roi=dict(cfg.get("recognition_roi",{}) or {}),calibration=dict(cfg.get("calibration",{}) or {}),plant_calibration=dict(cfg.get("plant_calibration",{}) or {}))
+        return SystemConfig(feedback_controller=str(cfg.get("feedback_controller","PID")),target_diameter=float(cfg["target_diameter"]),pixel_to_micron=float(cfg["pixel_to_micron"]),video_source_type=str(cfg["video_source_type"]),video_source=str(cfg["video_source"]),initial_q1=float(cfg["initial_q1"]),initial_q2=float(cfg["initial_q2"]),control_interval_ms=int(cfg["control_interval_ms"]),target_feedforward_enabled=bool(cfg.get("target_feedforward_enabled",False)),disturbance_feedforward_enabled=bool(cfg.get("disturbance_feedforward_enabled",False)),control_batch_enabled=bool(cfg.get("control_batch_enabled",False)),control_capture_frames=int(cfg.get("control_capture_frames",5)),control_analysis_frames=int(cfg.get("control_analysis_frames",5)),pump_port=str(cfg.get("pump_port","")),pump_address=int(cfg.get("pump_address",1)),pump_baudrate=int(cfg.get("pump_baudrate",1200)),pump_parity=str(cfg.get("pump_parity","E")),mvs_sdk_path=str(cfg.get("mvs_sdk_path","")),camera_backend=str(cfg.get("camera_backend","")),camera_parameters=dict(cfg.get("camera_parameters",{}) or {}),recognition_roi=dict(cfg.get("recognition_roi",{}) or {}),calibration=dict(cfg.get("calibration",{}) or {}),plant_calibration=dict(cfg.get("plant_calibration",{}) or {}))
     def configure_prepare_initialize(self):
         cfg=self.build_system_config(); self.orchestrator.configure(cfg); self.orchestrator.prepare_video(); self.orchestrator.initialize_system()
     def task(self,task,on_success=None,on_error=None,disable=None):
