@@ -35,6 +35,9 @@
 减水块`q2_70_20_to70_18_20261016`为70/20→70/18，各300秒。与加水块对照，切换全过程仍按20.5μL/min水相上界累计，读回核验后再用18.5μL/min。两平台、30秒切换及10μL保留量预算为油750.25μL、水215.25μL，另加实际启动累计；每针累计上限仍为900μL。
 # Explicit raw-only acquisition
 
+2026-10-26新计划可启用[人工正式起点与切换前预测检查点](q2_capture_gates.md)。
+验证块要求登记几何，不能选择raw-only；历史计划保持原计时行为，预检明确显示是否启用检查点。
+
 `capture_plan.raw_only=true` with `detector_executed=false` records the fixed
 two-stage profile without registering walls or stopping on geometry correlation.
 Use only when explicitly requested for raw data collection. No geometry or

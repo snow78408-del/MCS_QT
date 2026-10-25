@@ -14,6 +14,7 @@ from tools import run_r1_front4_live as live
 from tools.run_q1_response import ResponseRecorder,ResponseSession
 from tools.run_a_first_three import AFirstThreeSession
 from tools.plant_flow_transient_capture import CaptureLifecycleError,live_effective_config,declared
+from tools.q2_capture_gates import Q2GateMixin, validate_gates
 
 PROFILE='q2_70_20_to70_25_20261016'
 STAGES=[dict(label='B1_70_20',q1_ul_min=70.,q2_ul_min=20.,duration_s=300.),
@@ -54,7 +55,7 @@ class LabRecorder(ResponseRecorder):
         return super().full_rate(name,elapsed)
 
 
-class Q2LabSession(ResponseSession):
+class Q2LabSession(Q2GateMixin, ResponseSession):
     @property
     def raw_only(self)->bool:
         return self.plan.get('capture_plan',{}).get('raw_only') is True
@@ -92,13 +93,20 @@ class Q2LabSession(ResponseSession):
 
     def _run_segments(self)->None:
         if not self.raw_only and not self._geometry_registered:raise CaptureLifecycleError('No current geometry registration')
+        self._await_operator_ready()
         baseline=self._begin_lab_stage(0)
         self._wait_segment(300.);self._end_segment(baseline)
+        transition_started=self._clock()
         self._update_delivery();self._check_geometry()
         current=tuple(self.stages[0][key] for key in ['q1_ul_min','q2_ul_min'])
         target_q=tuple(self.stages[1][key] for key in ['q1_ul_min','q2_ul_min'])
         if not target_reserve(self._delivery_ul,self._delivery_limit_ul,current,target_q):
             raise CaptureLifecycleError('Insufficient same-stroke target reserve')
+        self._save_prediction_before_switch(baseline,transition_started)
+        if 'stage_gates' in self.plan:
+            self._gate_poll(0.)
+            self._gate_reserve(transition_started=transition_started)
+        self._verify_prediction_seal()
         self.sink.set_phase('transition',self._clock())
         # Charge the whole transaction at each channel's larger platform
         # rate, including any uncertain stop/write/readback/restart time.
@@ -117,14 +125,23 @@ class Q2LabSession(ResponseSession):
             raise CaptureLifecycleError('Target readback out of range')
         self._upper_rates=tuple(q+.5 for q in target_q)
         self._check_geometry()
+        if 'stage_gates' in self.plan:
+            self._gate_poll(0.)
+            self._gate_reserve(transition_started=transition_started)
         if any(u+rate*5+10>self._delivery_limit_ul for u,rate in zip(self._delivery_ul,self._upper_rates)):
             raise CaptureLifecycleError('Target reserve invalid after transaction')
         target=self._begin_lab_stage(1,command)
+        if getattr(self,'_prediction_hash',None):
+            self._write_json('prediction_observation_binding.json',dict(
+                prediction_sha256=self._prediction_hash,
+                observation_started_monotonic=target['observation_started_monotonic'],
+                command_readback_monotonic=target['command_readback_monotonic']))
         self._wait_segment(300.);self._end_segment(target);self.run_finished=True
 
 
 def validate(plan:dict)->list[str]:
     errors=live.validate_session_plan(plan);flow=plan.get('flow_plan',{})
+    errors.extend(validate_gates(plan))
     block=BLOCKS.get(flow.get('campaign_profile'))
     if block is None:errors.append('Unknown fixed lab profile');block=STAGES
     current=tuple(block[0][key] for key in ['q1_ul_min','q2_ul_min'])
@@ -155,11 +172,20 @@ def main()->int:
     output=Path(plan['capture_plan']['output_directory'])
     if output.exists():errors.append('Output exists')
     if shutil.disk_usage(output.parent).free<plan['capture_plan']['required_free_space_bytes']:errors.append('Insufficient storage')
-    print(json.dumps(dict(preflight_gaps=errors,hardware_requested=args.live)),flush=True)
+    gates=plan.get('stage_gates')
+    gates=gates if isinstance(gates,dict) else {}
+    readiness=gates.get('readiness');prediction=gates.get('prediction')
+    readiness=readiness if isinstance(readiness,dict) else {}
+    prediction=prediction if isinstance(prediction,dict) else {}
+    print(json.dumps(dict(preflight_gaps=errors,hardware_requested=args.live,
+        stage_gates_enabled='stage_gates' in plan,
+        readiness_mode=readiness.get('mode','legacy_automatic'),
+        prediction_required=prediction.get('required',False))),flush=True)
     if errors:return 2
     if not args.live:return 0
     output.mkdir(parents=True)
-    identity={str(p):hashlib.sha256(p.read_bytes()).hexdigest() for p in [Path(__file__),Path(__file__).with_name('run_q1_response.py'),Path(args.plan)]}
+    identity={str(p):hashlib.sha256(p.read_bytes()).hexdigest() for p in [Path(__file__),Path(__file__).with_name('run_q1_response.py'),
+        Path(__file__).with_name('q2_capture_gates.py'),Path(__file__).with_name('q2_prediction_gate.py'),Path(args.plan)]}
     (output/'explicit_source_identity.json').write_text(json.dumps(identity,indent=2),encoding='utf-8')
     a=plan['apparatus'];serial=live.SerialConfig(port=a['pump_port'],address=a['pump_address'],baudrate=a['pump_baudrate'],parity=a['pump_parity'])
     pump=live.PumpHardwareService(serial_config=serial,logger=lambda m:print(m,flush=True));camera=live.HikrobotCameraAdapter(logger=lambda m:print(m,flush=True))
